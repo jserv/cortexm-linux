@@ -1,0 +1,108 @@
+From d62e43aacbbdba1a39ba22bf2e3647b757156262 Mon Sep 17 00:00:00 2001
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Date: Mon, 20 Apr 2026 04:59:55 +0800
+Subject: [PATCH] tiny: optional CRC32 lookup tables
+
+Add CONFIG_CRC32_TABLES to make CRC32 precomputed lookup tables
+optional. When disabled, falls back to byte-at-a-time calculation
+using the standard CRC polynomials, saving ~3KB.
+
+Reworked from linux-tiny for Linux v7.0.
+
+diff --git a/init/Kconfig b/init/Kconfig
+index 46502750d..63915d36f 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1811,6 +1811,14 @@ config MAX_SWAPFILES_SHIFT
+ 	  Controls the maximum number of swap files (2^n). Set to 0 for
+ 	  a single swap file on memory-constrained systems.
+ 
++config CRC32_TABLES
++	bool "Use CRC32 lookup tables" if EXPERT
++	depends on CRC32
++	default y
++	help
++	  Use precomputed tables for CRC32. Disabling saves ~3KB but
++	  CRC calculations will be slower (byte-at-a-time).
++
+ config FUTEX
+ 	bool "Enable futex support" if EXPERT
+ 	depends on !(SPARC32 && SMP)
+diff --git a/lib/crc/Makefile b/lib/crc/Makefile
+index 7543ad295..0488f6ce3 100644
+--- a/lib/crc/Makefile
++++ b/lib/crc/Makefile
+@@ -47,7 +47,9 @@ obj-y += tests/
+ hostprogs := gen_crc32table gen_crc64table
+ clean-files := crc32table.h crc64table.h
+ 
++ifeq ($(CONFIG_CRC32_TABLES),y)
+ $(obj)/crc32-main.o: $(obj)/crc32table.h
++endif
+ $(obj)/crc64-main.o: $(obj)/crc64table.h
+ 
+ quiet_cmd_crc32 = GEN     $@
+diff --git a/lib/crc/crc32-main.c b/lib/crc/crc32-main.c
+index fbb90c900..0944eb555 100644
+--- a/lib/crc/crc32-main.c
++++ b/lib/crc/crc32-main.c
+@@ -29,8 +29,48 @@
+ #include <linux/module.h>
+ #include <linux/types.h>
+ 
++#ifdef CONFIG_CRC32_TABLES
+ #include "crc32table.h"
++#endif
++
++#ifndef CONFIG_CRC32_TABLES
++/* Byte-at-a-time CRC without lookup tables */
++static inline u32 __maybe_unused
++crc32_le_base(u32 crc, const u8 *p, size_t len)
++{
++	int i;
++	while (len--) {
++		crc ^= *p++;
++		for (i = 0; i < 8; i++)
++			crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
++	}
++	return crc;
++}
++
++static inline u32 __maybe_unused
++crc32_be_base(u32 crc, const u8 *p, size_t len)
++{
++	int i;
++	while (len--) {
++		crc ^= (u32)*p++ << 24;
++		for (i = 0; i < 8; i++)
++			crc = (crc << 1) ^ ((crc & 0x80000000) ? 0x04c11db7 : 0);
++	}
++	return crc;
++}
+ 
++static inline u32 __maybe_unused
++crc32c_base(u32 crc, const u8 *p, size_t len)
++{
++	int i;
++	while (len--) {
++		crc ^= *p++;
++		for (i = 0; i < 8; i++)
++			crc = (crc >> 1) ^ ((crc & 1) ? 0x82f63b78 : 0);
++	}
++	return crc;
++}
++#else /* CONFIG_CRC32_TABLES */
+ static inline u32 __maybe_unused
+ crc32_le_base(u32 crc, const u8 *p, size_t len)
+ {
+@@ -54,6 +94,7 @@ crc32c_base(u32 crc, const u8 *p, size_t len)
+ 		crc = (crc >> 8) ^ crc32ctable_le[(crc & 255) ^ *p++];
+ 	return crc;
+ }
++#endif /* CONFIG_CRC32_TABLES */
+ 
+ #ifdef CONFIG_CRC32_ARCH
+ #include "crc32.h" /* $(SRCARCH)/crc32.h */
+-- 
+2.43.0
+

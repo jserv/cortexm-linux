@@ -1,0 +1,86 @@
+From 68bb4b84121ff3ef06d3598c3f8c01d992182fb7 Mon Sep 17 00:00:00 2001
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Date: Mon, 20 Apr 2026 04:59:41 +0800
+Subject: [PATCH] tiny: configurable MAX_SWAPFILES_SHIFT
+
+Make the maximum number of swap files configurable via Kconfig.
+Setting to 0 allows a single swap file with simplified swap entry
+encoding that avoids undefined shift behavior.
+
+Reworked from linux-tiny for Linux v7.0.
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 62fc7499b..3619421d9 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -46,7 +46,7 @@ static inline int current_is_kswapd(void)
+  * on 32-bit-pgoff_t architectures.  And that assumes that the architecture packs
+  * the type/offset into the pte as 5/27 as well.
+  */
+-#define MAX_SWAPFILES_SHIFT	5
++#define MAX_SWAPFILES_SHIFT	CONFIG_MAX_SWAPFILES_SHIFT
+ 
+ /*
+  * Use some of the swap files numbers for other purposes. This
+diff --git a/include/linux/swapops.h b/include/linux/swapops.h
+index 8cfc966ea..acf5692a1 100644
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@ -81,6 +81,7 @@ static inline pte_t pte_swp_clear_flags(pte_t pte)
+ /*
+  * Store a type+offset into a swp_entry_t in an arch-independent format
+  */
++#if MAX_SWAPFILES_SHIFT > 0
+ static inline swp_entry_t swp_entry(unsigned long type, pgoff_t offset)
+ {
+ 	swp_entry_t ret;
+@@ -107,6 +108,27 @@ static inline pgoff_t swp_offset(swp_entry_t entry)
+ 	return entry.val & SWP_OFFSET_MASK;
+ }
+ 
++#else /* MAX_SWAPFILES_SHIFT == 0 */
++
++static inline swp_entry_t swp_entry(unsigned long type, pgoff_t offset)
++{
++	swp_entry_t ret;
++	ret.val = offset;
++	return ret;
++}
++
++static inline unsigned swp_type(swp_entry_t entry)
++{
++	return 0;
++}
++
++static inline pgoff_t swp_offset(swp_entry_t entry)
++{
++	return entry.val;
++}
++
++#endif /* MAX_SWAPFILES_SHIFT */
++
+ /*
+  * Convert the arch-independent representation of a swp_entry_t into the
+  * arch-dependent pte representation.
+diff --git a/init/Kconfig b/init/Kconfig
+index 73b4f515c..46502750d 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1803,6 +1803,14 @@ config NET_SMALL
+ 	help
+ 	  This reduces the size of miscellaneous networking data structures.
+ 
++config MAX_SWAPFILES_SHIFT
++	int "Maximum swapfiles shift (2^n swapfiles)" if EXPERT
++	range 0 5
++	default 5
++	help
++	  Controls the maximum number of swap files (2^n). Set to 0 for
++	  a single swap file on memory-constrained systems.
++
+ config FUTEX
+ 	bool "Enable futex support" if EXPERT
+ 	depends on !(SPARC32 && SMP)
+-- 
+2.43.0
+

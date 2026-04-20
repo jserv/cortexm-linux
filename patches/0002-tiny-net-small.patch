@@ -1,0 +1,85 @@
+From 03567c6967706a1f21730fc9e4c3579007be8b1c Mon Sep 17 00:00:00 2001
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Date: Mon, 20 Apr 2026 04:59:26 +0800
+Subject: [PATCH] tiny: add CONFIG_NET_SMALL to reduce networking data
+ structures
+
+Introduce CONFIG_NET_SMALL and use it to shrink:
+- sunrpc cache_defer_hash from PAGE_SIZE to 512 bytes
+- MAX_INET_PROTOS from 256 to 32
+- UNIX_HASH_SIZE from 512 to 32 (with consistent MOD and BITS)
+
+Reworked from linux-tiny for Linux v7.0.
+
+diff --git a/include/net/protocol.h b/include/net/protocol.h
+index b2499f88f..77f7da3cf 100644
+--- a/include/net/protocol.h
++++ b/include/net/protocol.h
+@@ -31,7 +31,11 @@
+  * found in an ipv4 or ipv6 header.  Since in both cases the protocol
+  * value is presented in a __u8, this is defined to be 256.
+  */
++#ifdef CONFIG_NET_SMALL
++#define MAX_INET_PROTOS		32
++#else
+ #define MAX_INET_PROTOS		256
++#endif
+ 
+ /* This is used to register protocols. */
+ struct net_protocol {
+diff --git a/init/Kconfig b/init/Kconfig
+index 7484cd703..73b4f515c 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1797,6 +1797,12 @@ config BASE_SMALL
+ 	  kernel data structures. This saves memory on small machines,
+ 	  but may reduce performance.
+ 
++config NET_SMALL
++	default n
++	bool "Enable various size reductions for networking" if EXPERT
++	help
++	  This reduces the size of miscellaneous networking data structures.
++
+ config FUTEX
+ 	bool "Enable futex support" if EXPERT
+ 	depends on !(SPARC32 && SMP)
+diff --git a/net/sunrpc/cache.c b/net/sunrpc/cache.c
+index ef8b7e8b1..c47705e8b 100644
+--- a/net/sunrpc/cache.c
++++ b/net/sunrpc/cache.c
+@@ -585,7 +585,11 @@ EXPORT_SYMBOL_GPL(cache_purge);
+  * it to be revisited when cache info is available
+  */
+ 
++#ifdef CONFIG_NET_SMALL
++#define	DFR_HASHSIZE	(512/sizeof(struct list_head))
++#else
+ #define	DFR_HASHSIZE	(PAGE_SIZE/sizeof(struct list_head))
++#endif
+ #define	DFR_HASH(item)	((((long)item)>>4 ^ (((long)item)>>13)) % DFR_HASHSIZE)
+ 
+ #define	DFR_MAX	300	/* ??? */
+diff --git a/net/unix/af_unix.h b/net/unix/af_unix.h
+index 8119dbeef..b37b4fcca 100644
+--- a/net/unix/af_unix.h
++++ b/net/unix/af_unix.h
+@@ -4,9 +4,15 @@
+ 
+ #include <linux/uidgid.h>
+ 
++#ifdef CONFIG_NET_SMALL
++#define UNIX_HASH_MOD	(16 - 1)
++#define UNIX_HASH_SIZE	(16 * 2)
++#define UNIX_HASH_BITS	4
++#else
+ #define UNIX_HASH_MOD	(256 - 1)
+ #define UNIX_HASH_SIZE	(256 * 2)
+ #define UNIX_HASH_BITS	8
++#endif
+ 
+ struct sock *unix_peer_get(struct sock *sk);
+ 
+-- 
+2.43.0
+

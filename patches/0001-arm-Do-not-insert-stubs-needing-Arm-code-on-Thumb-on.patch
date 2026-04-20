@@ -1,0 +1,374 @@
+From 31ed3a9d691493486f6e32357d89a55229dbdc0a Mon Sep 17 00:00:00 2001
+From: Christophe Lyon <christophe.lyon@linaro.org>
+Date: Wed, 19 Jun 2024 12:35:30 +0000
+Subject: [PATCH] arm: Do not insert stubs needing Arm code on Thumb-only
+ cores.
+
+We recently fixed a bug in libgcc
+(https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115360)
+where a symbol was missing a %function .type decoration.
+
+This meant the linker would silently pick the wrong type of 'farcall
+stub', involving Arm-mode instructions on Thumb-only CPUs.
+
+This patch emits an error instead, and warns in some other cases, to
+encourage users to add the missing '.type foo,%function' directive.
+
+In practice: in arm_type_of_stub() we no longer try to infer which
+stub to use if the destination is of unknown type and the CPU is
+Thumb-only; so we won't lie to elf32_arm_size_stubs() which does not
+check branch_type.
+
+If branch_type is ST_BRANCH_TO_ARM but the CPU is Thumb-only, we now
+convert it to ST_BRANCH_TO_THUMB only if the destination is of
+absolute type.  This is to support the case where the destination of
+the branch is defined by the linker script (see thumb-b-lks-sym.s and
+thumb-bl-lks-sym.s testcases for instance).
+
+The motivating case is covered by the new farcall-missing-type
+testcase, where we now emit an error message.  We do not emit an error
+when branch_type is ST_BRANCH_UNKNOWN and the CPU supports Arm-mode: a
+lot of legacy code (e.g. newlib's crt0.S) lacks the corresponding
+'.type foo, %function' directives and even a (too verbose) warning
+could be perceived as a nuisance.
+
+Existing testcases where such a warning would trigger:
+arm-static-app.s (app_func, app_func2)
+arm-rel32.s (foo)
+arm-app.s (app_func)
+rel32-reject.s () main)
+fix-arm1176.s (func_to_branch_to)
+but this list is not exhaustive.
+
+For the sake of clarity, the patch replaces occurrences of
+sym.st_target_internal = 0; with
+sym.st_target_internal = ST_BRANCH_TO_ARM;
+
+enum arm_st_branch_type is defined in include/elf/arm.h, and relies on
+ST_BRANCH_TO_ARM==0, as sym.st_target_internal is also initialized to
+0 in other target-independent parts of BFD code.  (For instance,
+swapping the ST_BRANCH_TO_ARM and ST_BRANCH_TO_THUMB entries in the
+enum definition leads to 'interesting' results...)
+
+Regarding the testsuite:
+* new expected warning for thumb-b-lks-sym and thumb-bl-lks-sym
+* new testcase farcall-missing-type to check the new error case
+* attr-merge-arch-2b.s, branch-futures (and bfs-1.s) updated to avoid
+  a diagnostic
+
+Tested on arm-eabi and arm-pe with no regression.
+---
+ bfd/elf32-arm.c                               | 99 ++++++++++++++++---
+ ld/testsuite/ld-arm/arm-elf.exp               |  5 +-
+ ld/testsuite/ld-arm/attr-merge-arch-2b.s      |  1 +
+ ld/testsuite/ld-arm/bfs-1.s                   |  1 +
+ ld/testsuite/ld-arm/branch-futures.d          | 10 +-
+ .../ld-arm/farcall-missing-type-bad.s         |  7 ++
+ .../ld-arm/farcall-missing-type-main.s        |  9 ++
+ ld/testsuite/ld-arm/farcall-missing-type.d    |  5 +
+ ld/testsuite/ld-arm/farcall-missing-type.ld   | 23 +++++
+ ld/testsuite/ld-arm/thumb-b-lks-sym.output    |  1 +
+ ld/testsuite/ld-arm/thumb-bl-lks-sym.output   |  1 +
+ 11 files changed, 143 insertions(+), 19 deletions(-)
+ create mode 100644 ld/testsuite/ld-arm/farcall-missing-type-bad.s
+ create mode 100644 ld/testsuite/ld-arm/farcall-missing-type-main.s
+ create mode 100644 ld/testsuite/ld-arm/farcall-missing-type.d
+ create mode 100644 ld/testsuite/ld-arm/farcall-missing-type.ld
+ create mode 100644 ld/testsuite/ld-arm/thumb-b-lks-sym.output
+ create mode 100644 ld/testsuite/ld-arm/thumb-bl-lks-sym.output
+
+diff --git a/bfd/elf32-arm.c b/bfd/elf32-arm.c
+--- a/bfd/elf32-arm.c
++++ b/bfd/elf32-arm.c
+@@ -4226,12 +4226,33 @@ arm_type_of_stub (struct bfd_link_info *
+ 
+   r_type = ELF32_R_TYPE (rel->r_info);
+ 
++  /* Don't pretend we know what stub to use (if any) when we target a
++     Thumb-only target and we don't know the actual destination
++     type.  */
++  if (branch_type == ST_BRANCH_UNKNOWN && thumb_only)
++    return stub_type;
++
+   /* ST_BRANCH_TO_ARM is nonsense to thumb-only targets when we
+      are considering a function call relocation.  */
+   if (thumb_only && (r_type == R_ARM_THM_CALL || r_type == R_ARM_THM_JUMP24
+ 		     || r_type == R_ARM_THM_JUMP19)
+       && branch_type == ST_BRANCH_TO_ARM)
+-    branch_type = ST_BRANCH_TO_THUMB;
++    {
++      if (sym_sec == bfd_abs_section_ptr)
++	/* As an exception, assume that absolute symbols are of the
++	   right kind (Thumb).  They are presumably defined in the
++	   linker script, where it is not possible to declare them as
++	   Thumb (and thus are seen as Arm mode). We'll inform the
++	   user with a warning, though, in
++	   elf32_arm_final_link_relocate. */
++	branch_type = ST_BRANCH_TO_THUMB;
++      else
++	/* Otherwise do not silently build a stub, and let the users
++	   know they have to fix their code.  Indeed, we could decide
++	   to insert a stub involving Arm code and/or BLX, leading to
++	   a run-time crash.  */
++	return stub_type;
++    }
+ 
+   /* For TLS call relocs, it is the caller's responsibility to provide
+      the address of the appropriate trampoline.  */
+@@ -10383,14 +10404,6 @@ elf32_arm_final_link_relocate (reloc_how
+   else
+     addend = signed_addend = rel->r_addend;
+ 
+-  /* ST_BRANCH_TO_ARM is nonsense to thumb-only targets when we
+-     are resolving a function call relocation.  */
+-  if (using_thumb_only (globals)
+-      && (r_type == R_ARM_THM_CALL
+-	  || r_type == R_ARM_THM_JUMP24)
+-      && branch_type == ST_BRANCH_TO_ARM)
+-    branch_type = ST_BRANCH_TO_THUMB;
+-
+   /* Record the symbol information that should be used in dynamic
+      relocations.  */
+   dynreloc_st_type = st_type;
+@@ -10453,6 +10466,73 @@ elf32_arm_final_link_relocate (reloc_how
+       gotplt_offset = (bfd_vma) -1;
+     }
+ 
++  /* ST_BRANCH_TO_ARM is nonsense to thumb-only targets when we are
++     resolving a function call relocation.  We want to inform the user
++     that something is wrong.  */
++  if (using_thumb_only (globals)
++      && (r_type == R_ARM_THM_CALL
++	  || r_type == R_ARM_THM_JUMP24)
++      && branch_type == ST_BRANCH_TO_ARM
++      /* Calls through a PLT are special: the assembly source code
++	 cannot be annotated with '.type foo(PLT), %function', and
++	 they handled specifically below anyway. */
++      && splt == NULL)
++    {
++      if (sym_sec == bfd_abs_section_ptr)
++	{
++	/* As an exception, assume that absolute symbols are of the
++	   right kind (Thumb).  They are presumably defined in the
++	   linker script, where it is not possible to declare them as
++	   Thumb (and thus are seen as Arm mode). Inform the user with
++	   a warning, though. */
++	  branch_type = ST_BRANCH_TO_THUMB;
++
++	  if (sym_sec->owner)
++	    _bfd_error_handler
++	      (_("warning: %pB(%s): Forcing bramch to absolute symbol in Thumb mode (Thumb-only CPU)"
++		 " in %pB"),
++	       sym_sec->owner, sym_name, input_bfd);
++	  else
++	    _bfd_error_handler
++	      (_("warning: (%s): Forcing branch to absolute symbol in Thumb mode (Thumb-only CPU)"
++		 " in %pB"),
++	       sym_name, input_bfd);
++	}
++      else
++	/* Otherwise do not silently build a stub, and let the users
++	   know they have to fix their code.  Indeed, we could decide
++	   to insert a stub involving Arm code and/or BLX, leading to
++	   a run-time crash.  */
++	branch_type = ST_BRANCH_UNKNOWN;
++    }
++
++  /* Fail early if branch_type is ST_BRANCH_UNKNOWN and we target a
++     Thumb-only CPU.  We could emit a warning on Arm-capable targets
++     too, but that would be too verbose (a lot of legacy code does not
++     use the .type foo, %function directive).  */
++  if (using_thumb_only (globals)
++      && (r_type == R_ARM_THM_CALL
++	  || r_type == R_ARM_THM_JUMP24)
++      && branch_type == ST_BRANCH_UNKNOWN
++      /* Exception to the rule above: a branch to an undefined weak
++	 symbol is turned into a jump to the next instruction unless a
++	 PLT entry will be created (see below).  */
++      && !(h && h->root.type == bfd_link_hash_undefweak
++	   && plt_offset == (bfd_vma) -1))
++    {
++      if (sym_sec != NULL
++	  && sym_sec->owner != NULL)
++	_bfd_error_handler
++	  (_("%pB(%s): Unknown destination type (ARM/Thumb) in %pB"),
++	   sym_sec->owner, sym_name, input_bfd);
++      else
++	_bfd_error_handler
++	  (_("(%s): Unknown destination type (ARM/Thumb) in %pB"),
++	   sym_name, input_bfd);
++
++      return bfd_reloc_notsupported;
++    }
++
+   resolved_to_zero = (h != NULL
+ 		      && UNDEFWEAK_NO_DYNAMIC_RELOC (info, h));
+ 
+@@ -17841,7 +17921,7 @@ elf32_arm_output_map_sym (output_arch_sy
+   sym.st_other = 0;
+   sym.st_info = ELF_ST_INFO (STB_LOCAL, STT_NOTYPE);
+   sym.st_shndx = osi->sec_shndx;
+-  sym.st_target_internal = 0;
++  sym.st_target_internal = ST_BRANCH_TO_ARM;
+   elf32_arm_section_map_add (osi->sec, names[type][1], offset);
+   return osi->func (osi->flaginfo, names[type], &sym, osi->sec, NULL) == 1;
+ }
+@@ -17998,7 +18078,7 @@ elf32_arm_output_stub_sym (output_arch_s
+   sym.st_other = 0;
+   sym.st_info = ELF_ST_INFO (STB_LOCAL, STT_FUNC);
+   sym.st_shndx = osi->sec_shndx;
+-  sym.st_target_internal = 0;
++  sym.st_target_internal = ST_BRANCH_TO_ARM;
+   return osi->func (osi->flaginfo, name, &sym, osi->sec, NULL) == 1;
+ }
+ 
+@@ -19743,7 +19823,7 @@ elf32_arm_swap_symbol_in (bfd * abfd,
+ {
+   if (!bfd_elf32_swap_symbol_in (abfd, psrc, pshn, dst))
+     return false;
+-  dst->st_target_internal = 0;
++  dst->st_target_internal = ST_BRANCH_TO_ARM;
+ 
+   /* New EABI objects mark thumb function symbols by setting the low bit of
+      the address.  */
+diff --git a/ld/testsuite/ld-arm/arm-elf.exp b/ld/testsuite/ld-arm/arm-elf.exp
+--- a/ld/testsuite/ld-arm/arm-elf.exp	2025-12-13 17:14:50.381188152 +1000
++++ b/ld/testsuite/ld-arm/arm-elf.exp	2025-11-10 10:00:00.000000000 +1000
+@@ -656,10 +656,10 @@ set armeabitests_nonacl {
+      {{objdump -d thumb2-bl-bad.d}}
+      "thumb2-bl-bad"}
+     {"Branch to linker script symbol with BL for thumb-only target" "-T branch-lks-sym.ld" "" "" {thumb-bl-lks-sym.s}
+-     {{objdump -d thumb-bl-lks-sym.d}}
++     {{ld thumb-bl-lks-sym.output} {objdump -d thumb-bl-lks-sym.d}}
+      "thumb-bl-lks-sym"}
+     {"Branch to linker script symbol with B for thumb-only target" "-T branch-lks-sym.ld" "" "" {thumb-b-lks-sym.s}
+-     {{objdump -d thumb-b-lks-sym.d}}
++     {{ld thumb-b-lks-sym.output} {objdump -d thumb-b-lks-sym.d}}
+      "thumb-b-lks-sym"}
+ 
+     {"erratum 760522 fix (default for v6z)" "--section-start=.foo=0x2001014" ""
+@@ -1210,6 +1210,8 @@ run_dump_test "attr-merge-wchar-40-nowar
+ run_dump_test "attr-merge-wchar-42-nowarn"
+ run_dump_test "attr-merge-wchar-44-nowarn"
+ run_dump_test "farcall-section"
++run_dump_test "farcall-missing-type"
++run_dump_test "farcall-missing-type-undefweak"
+ run_dump_test "attr-merge-unknown-1"
+ run_dump_test "attr-merge-unknown-2"
+ run_dump_test "attr-merge-unknown-2r"
+diff --git a/ld/testsuite/ld-arm/attr-merge-arch-2b.s b/ld/testsuite/ld-arm/attr-merge-arch-2b.s
+--- a/ld/testsuite/ld-arm/attr-merge-arch-2b.s
++++ b/ld/testsuite/ld-arm/attr-merge-arch-2b.s
+@@ -4,5 +4,6 @@
+         .align  2
+         .global foo
+         .type   foo, %function
++	.thumb_func
+ foo:
+         bx      lr
+diff --git a/ld/testsuite/ld-arm/bfs-1.s b/ld/testsuite/ld-arm/bfs-1.s
+--- a/ld/testsuite/ld-arm/bfs-1.s
++++ b/ld/testsuite/ld-arm/bfs-1.s
+@@ -4,6 +4,7 @@
+ .thumb
+ .global _start
+ .global target
++.type target, %function
+ _start:
+ target:
+ 	add	r0, r0, r1
+diff --git a/ld/testsuite/ld-arm/branch-futures.d b/ld/testsuite/ld-arm/branch-futures.d
+--- a/ld/testsuite/ld-arm/branch-futures.d
++++ b/ld/testsuite/ld-arm/branch-futures.d
+@@ -5,13 +5,13 @@
+ Disassembly of section .text:
+ 
+ 0[0-9a-f]+ <future>:
+-    [0-9a-f]+:	f2c0 e807 	bf	a, 8012 <_start>
+-    [0-9a-f]+:	f182 e805 	bfcsel	6, 8012 <_start>, a, eq
+-    [0-9a-f]+:	f080 c803 	bfl	2, 8012 <_start>
++    [0-9a-f]+:	f2c0 e807 	bf	a, 8012 <target>
++    [0-9a-f]+:	f182 e805 	bfcsel	6, 8012 <target>, a, eq
++    [0-9a-f]+:	f080 c803 	bfl	2, 8012 <target>
+     [0-9a-f]+:	4408      	add	r0, r1
+ 
+ 0[0-9a-f]+ <branch>:
+-    [0-9a-f]+:	f000 b800 	b.w	8012 <_start>
++    [0-9a-f]+:	f000 b800 	b.w	8012 <target>
+ 
+-0[0-9a-f]+ <_start>:
++0[0-9a-f]+ <target>:
+     [0-9a-f]+:	4408      	add	r0, r1
+diff --git a/ld/testsuite/ld-arm/farcall-missing-type-bad.s b/ld/testsuite/ld-arm/farcall-missing-type-bad.s
+--- a/ld/testsuite/ld-arm/farcall-missing-type-bad.s
++++ b/ld/testsuite/ld-arm/farcall-missing-type-bad.s
+@@ -0,0 +1,7 @@
++	.thumb
++	.cpu cortex-m33
++	.syntax unified
++	.section .text.bar
++	.global bad @ untyped
++#	.type bad, function
++bad:	bx lr
+diff --git a/ld/testsuite/ld-arm/farcall-missing-type.d b/ld/testsuite/ld-arm/farcall-missing-type.d
+--- a/ld/testsuite/ld-arm/farcall-missing-type.d
++++ b/ld/testsuite/ld-arm/farcall-missing-type.d
+@@ -0,0 +1,5 @@
++#source: farcall-missing-type-main.s
++#source: farcall-missing-type-bad.s
++#as:
++#ld:-T farcall-missing-type.ld
++#error: .* .*/farcall-missing-type-bad.o\(bad\): Unknown destination type \(ARM/Thumb\) in .*/farcall-missing-type-main.o
+diff --git a/ld/testsuite/ld-arm/farcall-missing-type.ld b/ld/testsuite/ld-arm/farcall-missing-type.ld
+--- a/ld/testsuite/ld-arm/farcall-missing-type.ld
++++ b/ld/testsuite/ld-arm/farcall-missing-type.ld
+@@ -0,0 +1,23 @@
++/* Linker script to configure memory regions. */
++MEMORY
++{
++  FLASH (rx) : ORIGIN = 0x00000000, LENGTH = 0x40000   /* 256k */
++  FLASH2 (rx) : ORIGIN = 0x200001e0, LENGTH = 0x4000
++}
++
++ENTRY(__start)
++
++SECTIONS
++{
++	.far_away_section :
++	{
++	  *(.text.bar)
++	} > FLASH2
++
++	.text :
++	{
++		*(.text*)
++
++	} > FLASH
++
++}
+diff --git a/ld/testsuite/ld-arm/farcall-missing-type-main.s b/ld/testsuite/ld-arm/farcall-missing-type-main.s
+--- a/ld/testsuite/ld-arm/farcall-missing-type-main.s
++++ b/ld/testsuite/ld-arm/farcall-missing-type-main.s
+@@ -0,0 +1,9 @@
++	.thumb
++	.cpu cortex-m33
++	.syntax unified
++	.global __start
++	.type __start, function
++__start:
++	push	{r4, lr}
++	bl	bad
++	pop	{r4, pc}
+diff --git a/ld/testsuite/ld-arm/thumb-b-lks-sym.output b/ld/testsuite/ld-arm/thumb-b-lks-sym.output
+--- a/ld/testsuite/ld-arm/thumb-b-lks-sym.output
++++ b/ld/testsuite/ld-arm/thumb-b-lks-sym.output
+@@ -0,0 +1 @@
++.* \(extFunc\): Forcing branch to absolute symbol in Thumb mode \(Thumb-only CPU\) in tmpdir/thumb-b-lks-sym.o
+diff --git a/ld/testsuite/ld-arm/thumb-bl-lks-sym.output b/ld/testsuite/ld-arm/thumb-bl-lks-sym.output
+--- a/ld/testsuite/ld-arm/thumb-bl-lks-sym.output
++++ b/ld/testsuite/ld-arm/thumb-bl-lks-sym.output
+@@ -0,0 +1 @@
++.* \(extFunc\): Forcing branch to absolute symbol in Thumb mode \(Thumb-only CPU\) in tmpdir/thumb-bl-lks-sym.o
+-- 
+2.52.0
+

@@ -1,0 +1,382 @@
+--- a/elf2flt.c
++++ b/elf2flt.c
+@@ -348,6 +348,249 @@
+ }
+ #endif
+ 
++/*
++ * Thumb-2 MOVW/MOVT helper functions.
++ *
++ * On Cortex-M (Thumb-2 only) targets, GCC generates MOVW/MOVT instruction
++ * pairs to load 32-bit absolute addresses.  The FLAT binary format cannot
++ * represent these scattered-bit-field relocations because the kernel's FLAT
++ * loader only patches 32-bit data words.
++ *
++ * To handle this, we rewrite each MOVW/MOVT pair: the MOVW becomes a
++ * LDR.W Rd,[PC,#offset] that loads from a literal pool entry placed in
++ * existing text padding before data, and the MOVT becomes two 16-bit NOPs.
++ * The literal pool entry is a standard 32-bit data word that the FLAT loader
++ * can relocate.
++ *
++ * See: https://github.com/uclinux-dev/elf2flt/issues/11
++ */
++#if defined(TARGET_arm)
++
++static int arm_movwt_relocations_rewritten;
++
++/* Decode the 16-bit immediate from a Thumb-2 MOVW/MOVT instruction.
++   The instruction is stored as two little-endian halfwords. */
++static uint32_t
++thumb2_movwt_imm16(const unsigned char *p)
++{
++	uint16_t hw0 = p[0] | (p[1] << 8);
++	uint16_t hw1 = p[2] | (p[3] << 8);
++
++	return ((hw0 & 0x000f) << 12)   /* imm4  -> [15:12] */
++	     | ((hw0 & 0x0400) << 1)    /* i     -> [11]    */
++	     | ((hw1 & 0x7000) >> 4)    /* imm3  -> [10:8]  */
++	     | (hw1 & 0x00ff);          /* imm8  -> [7:0]   */
++}
++
++/* Extract the destination register (Rd) from a Thumb-2 MOVW/MOVT. */
++static int
++thumb2_movwt_rd(const unsigned char *p)
++{
++	uint16_t hw1 = p[2] | (p[3] << 8);
++	return (hw1 >> 8) & 0x0f;
++}
++
++/* Encode a Thumb-2 LDR.W Rd,[PC,#imm12] (T2 literal encoding).
++   Writes the 32-bit instruction as two little-endian halfwords. */
++static void
++thumb2_encode_ldr_pc(unsigned char *p, int rd, int32_t offset)
++{
++	uint16_t hw0, hw1;
++	int u_bit;
++
++	if (offset >= 0) {
++		u_bit = 1;
++	} else {
++		u_bit = 0;
++		offset = -offset;
++	}
++
++	/* T2 literal encoding: 1111 1000 U101 1111 | Rt:4 imm12:12 */
++	hw0 = 0xf85f | (u_bit << 7);
++	hw1 = ((rd & 0xf) << 12) | (offset & 0xfff);
++
++	p[0] = hw0 & 0xff;
++	p[1] = (hw0 >> 8) & 0xff;
++	p[2] = hw1 & 0xff;
++	p[3] = (hw1 >> 8) & 0xff;
++}
++
++/* Encode two 16-bit Thumb NOPs (0xbf00) into 4 bytes. */
++static void
++thumb2_encode_dual_nop(unsigned char *p)
++{
++	p[0] = 0x00; p[1] = 0xbf;  /* NOP */
++	p[2] = 0x00; p[3] = 0xbf;  /* NOP */
++}
++
++/*
++ * Rewrite Thumb-2 MOVW/MOVT in the text section.
++ *
++ * For each R_ARM_THM_MOVW_ABS_NC relocation:
++ *   - Find the matching R_ARM_THM_MOVT_ABS (same Rd), if any.
++ *   - Combine immediates into a 32-bit address (standalone MOVW uses 0
++ *     for the upper 16 bits -- valid for addresses < 0x10000).
++ *   - Replace the MOVW with LDR.W Rd,[PC,#offset] pointing to a
++ *     literal pool entry placed in existing text padding before data.
++ *   - Replace the MOVT (if present) with NOP; NOP.
++ *   - Append the 32-bit address to the literal pool in network byte
++ *     order (ready for FLAT relocation).
++ *
++ * The literal pool is 4-byte aligned and must fit in the already reserved
++ * text span.  Returns 0 on success, -1 on error.
++ */
++static int
++rewrite_arm_movwt(bfd *rel_bfd, asymbol **symbols,
++		  void *text, uint32_t text_len, uint32_t text_vma,
++		  uint32_t text_code_len, int *pool_countp)
++{
++	asection *s;
++	unsigned char *text_bytes = text;
++	int pool_count = 0;
++
++	/* Find MOVW/MOVT pairs, extract addresses, rewrite. */
++	for (s = rel_bfd->sections; s != NULL; s = s->next) {
++		arelent **relpp, **p;
++		long relcount, relsize;
++
++		if ((s->flags & SEC_RELOC) == 0)
++			continue;
++		relsize = bfd_get_reloc_upper_bound(rel_bfd, s);
++		if (relsize <= 0)
++			continue;
++		relpp = xmalloc(relsize);
++		relcount = bfd_canonicalize_reloc(rel_bfd, s, relpp,
++						  symbols);
++		if (relcount < 0) {
++			free(relpp);
++			continue;
++		}
++
++		for (p = relpp; relcount && *p; p++, relcount--) {
++			arelent *q = *p;
++			unsigned char *r_mem;
++			uint32_t movw_off, movt_off;
++			uint16_t lo16, hi16;
++			uint32_t addr;
++			int rd_w, rd_t;
++			int32_t ldr_offset;
++			uint32_t pool_text_off;
++			int have_movt = 0;
++
++			if (q->howto->type != R_ARM_THM_MOVW_ABS_NC)
++				continue;
++
++			movw_off = q->address;
++			if (movw_off + 4 > text_len) {
++				printf("ERROR: MOVW reloc at 0x%x "
++				       "outside text (len=0x%x)\n",
++				       movw_off, text_len);
++				free(relpp);
++				return -1;
++			}
++			r_mem = text_bytes + movw_off;
++			lo16 = thumb2_movwt_imm16(r_mem);
++			rd_w = thumb2_movwt_rd(r_mem);
++
++			/* Find the matching MOVT for the same Rd.
++			   A standalone MOVW (no MOVT) is valid when
++			   the target address fits in 16 bits. */
++			{
++				arelent **pp;
++				long rc2 = relcount - 1;
++
++				movt_off = 0;
++				for (pp = p + 1; rc2 && *pp; pp++, rc2--) {
++					if ((*pp)->howto->type ==
++					    R_ARM_THM_MOVT_ABS) {
++						uint32_t cand = (*pp)->address;
++						if (cand + 4 > text_len)
++							continue;
++						rd_t = thumb2_movwt_rd(
++							text_bytes + cand);
++						if (rd_t == rd_w) {
++							movt_off = cand;
++							have_movt = 1;
++							break;
++						}
++					}
++				}
++			}
++
++			if (have_movt) {
++				hi16 = thumb2_movwt_imm16(text_bytes + movt_off);
++				addr = ((uint32_t)hi16 << 16) | lo16;
++			} else {
++				/* Standalone MOVW: upper 16 bits are zero. */
++				addr = lo16;
++			}
++
++			/* Literal pool entry offset in text.
++			   Align pool start to 4 bytes for LDR.W. */
++			pool_text_off = ((text_code_len + 3) & ~3u)
++				      + pool_count * 4;
++			if (pool_text_off + 4 > text_len) {
++				printf("ERROR: MOVW/MOVT literal pool at 0x%x "
++				       "does not fit before data at 0x%x\n",
++				       pool_text_off, text_len);
++				free(relpp);
++				return -1;
++			}
++
++			/* LDR.W PC-relative offset calculation.
++			   Thumb PC = (instruction_address + 4) & ~3 */
++			ldr_offset = (int32_t)(pool_text_off + text_vma)
++				   - (int32_t)((movw_off + text_vma + 4) & ~3u);
++
++			if (ldr_offset < -4095 || ldr_offset > 4095) {
++				printf("ERROR: MOVW/MOVT at 0x%x: literal "
++				       "pool offset %d exceeds LDR.W range "
++				       "(+/-4095); consider -mno-movt\n",
++				       movw_off, ldr_offset);
++				free(relpp);
++				return -1;
++			}
++
++			if (verbose)
++				printf("MOVW%s r%d at 0x%x%s: "
++				       "addr=0x%08x -> LDR.W + pool[%d] "
++				       "(offset=%d)\n",
++				       have_movt ? "/MOVT" : "",
++				       rd_w, movw_off,
++				       have_movt ? "" : " (standalone)",
++				       addr, pool_count, ldr_offset);
++
++			/* Rewrite MOVW -> LDR.W Rd,[PC,#offset] */
++			thumb2_encode_ldr_pc(r_mem, rd_w, ldr_offset);
++
++			/* Rewrite MOVT -> NOP; NOP (if present) */
++			if (have_movt)
++				thumb2_encode_dual_nop(text_bytes + movt_off);
++
++			/* Write the pool entry in network byte order
++			   (FLAT relocation format for 32-bit words). */
++			r_mem = text_bytes + pool_text_off;
++			r_mem[0] = (addr >> 24) & 0xff;
++			r_mem[1] = (addr >> 16) & 0xff;
++			r_mem[2] = (addr >> 8) & 0xff;
++			r_mem[3] = addr & 0xff;
++			pool_count++;
++		}
++		free(relpp);
++	}
++
++	if (pool_count > 0) {
++		if (verbose)
++			printf("MOVW/MOVT: wrote %d literal pool entries "
++			       "(%d bytes) to text\n",
++			       pool_count, pool_count * 4);
++	}
++
++	*pool_countp = pool_count;
++	return 0;
++}
++#endif /* TARGET_arm */
++
+ static uint32_t *
+ output_relocs (
+   bfd *abs_bfd,
+@@ -673,6 +916,23 @@
+ 				case R_ARM_ABS32:
+ 					relocation_needed = 1;
+ 					break;
++				case R_ARM_THM_MOVW_ABS_NC:
++				case R_ARM_THM_MOVT_ABS:
++					if (!arm_movwt_relocations_rewritten)
++						goto bad_resolved_reloc;
++					/*
++					 * Rewritten by rewrite_arm_movwt()
++					 * into LDR.W + literal pool.  No
++					 * runtime relocation needed here;
++					 * pool entries are relocated below.
++					 */
++					relocation_needed = 0;
++					continue;
++				case R_ARM_MOVW_ABS_NC:
++				case R_ARM_MOVT_ABS:
++					/* ARM-mode MOVW/MOVT not supported
++					   (Cortex-M is Thumb-2 only). */
++					goto bad_resolved_reloc;
+ 				case R_ARM_REL32:
+ 				case R_ARM_JUMP24:
+ 				case R_ARM_CALL:
+@@ -950,6 +1210,19 @@
+ 					sym_vma = elf2flt_bfd_section_vma(sym_section);
+ 					sym_addr += sym_vma + q->addend;
+ 					break;
++				case R_ARM_THM_MOVW_ABS_NC:
++				case R_ARM_THM_MOVT_ABS:
++					if (!arm_movwt_relocations_rewritten)
++					{
++						printf("ERROR: bad reloc type (%s)%d\n",
++						       q->howto->name,
++						       (*p)->howto->type);
++						bad_relocs++;
++						continue;
++					}
++					/* Rewritten by rewrite_arm_movwt(),
++					   literal pool handles relocation. */
++					continue;
+ 				case R_ARM_GOT32:
+ 				case R_ARM_GOTPC:
+ 					/* Should be fine as is */
+@@ -1785,6 +2058,7 @@
+   uint32_t data_len = 0;
+   uint32_t bss_len = 0;
+   uint32_t text_len = 0;
++  uint32_t text_code_len = 0;
+   uint32_t reloc_len;
+ 
+   uint32_t data_vma = ~0;
+@@ -1963,6 +2237,7 @@
+   if (verbose)
+     printf("DATA -> vma=0x%x len=0x%x\n", data_vma, data_len);
+ 
++  text_code_len = text_len;
+   if ((text_vma + text_len) != data_vma) {
+     if ((text_vma + text_len) > data_vma)
+       fatal("ERROR: text=0x%x overlaps data=0x%x ?", text_len, data_vma);
+@@ -1971,6 +2246,15 @@
+ 	  		data_vma, text_len);
+     text_len = data_vma - text_vma;
+   }
++  if (text_len != text_code_len) {
++    unsigned char *new_text;
++
++    new_text = realloc(text, text_len);
++    if (!new_text)
++      fatal("realloc text padding");
++    text = new_text;
++    memset(text + text_code_len, 0, text_len - text_code_len);
++  }
+ 
+   /* Read in all data sections.  */
+   for (s = abs_bfd->sections; s != NULL; s = s->next)
+@@ -2001,11 +2285,51 @@
+     data_len = bss_vma - data_vma;
+   }
+ 
++#if defined(TARGET_arm)
++  /*
++   * Rewrite Thumb-2 MOVW/MOVT pairs before relocation processing.
++   * The literal pool is placed in existing text padding before data so
++   * the FLAT text/data layout remains unchanged.
++   */
++  {
++    int movwt_pool_count = 0;
++
++    if (use_resolved && rel_bfd) {
++      if (rewrite_arm_movwt(rel_bfd, symbol_table, text, text_len,
++			    text_vma, text_code_len, &movwt_pool_count) < 0)
++        fatal("failed to rewrite MOVW/MOVT relocations");
++      arm_movwt_relocations_rewritten = movwt_pool_count > 0;
++    }
++
++    reloc = (uint32_t *)
++      output_relocs(abs_bfd, symbol_table, number_of_symbols, &reloc_len,
++		    text, text_len, text_vma, data, data_len, data_vma, rel_bfd);
++
++    /* Append FLAT relocations for the literal pool entries. */
++    if (movwt_pool_count > 0) {
++      int i;
++      reloc = realloc(reloc, (reloc_len + movwt_pool_count)
++		      * sizeof(uint32_t));
++      if (!reloc)
++        fatal("realloc reloc for MOVW/MOVT pool");
++      for (i = 0; i < movwt_pool_count; i++) {
++        uint32_t pool_off = ((text_code_len + 3) & ~3u) + i * 4;
++        reloc[reloc_len + i] = pool_off;
++        if (verbose)
++          printf("  RELOC[%d]: MOVW/MOVT pool entry at text+0x%x\n",
++                 reloc_len + i, pool_off);
++      }
++      reloc_len += movwt_pool_count;
++      text_has_relocs = 1;
++    }
++  }
++#else
+   reloc = (uint32_t *)
+     output_relocs(abs_bfd, symbol_table, number_of_symbols, &reloc_len,
+-		  text, text_len, text_vma, data, data_len, data_vma, rel_bfd);
++                  text, text_len, text_vma, data, data_len, data_vma, rel_bfd);
++#endif
+ 
+-  if (reloc == NULL && verbose)
++  if (reloc == NULL && reloc_len == 0 && verbose)
+     printf("No relocations in code!\n");
+ 
+   text_offs = real_address_bits(text_vma);

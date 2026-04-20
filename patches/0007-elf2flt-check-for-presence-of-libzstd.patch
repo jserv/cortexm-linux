@@ -1,0 +1,103 @@
+From e6ccd3ae814b4661ea66d544b4998fda522365d0 Mon Sep 17 00:00:00 2001
+From: Greg Ungerer <gerg@kernel.org>
+Date: Mon, 17 Apr 2023 08:36:33 +1000
+Subject: [PATCH] elf2flt: check for presence of libzstd
+
+Binutils-2.40 introduced support for libzstd compressed bfd sections.
+By default binutils configure will check for and use the system libzstd
+library if it is present.
+
+Now when compiling elf2flt using the bfd library from a
+binutils-2.40 and a system present libzstd you will get link errors:
+
+    /usr/bin/ld: ..//binutils-2.40/bfd/libbfd.a(compress.o): in function `decompress_contents':
+    ../binutils-2.40/bfd/compress.c:517: undefined reference to `ZSTD_decompress'
+    /usr/bin/ld: ../binutils-2.40/bfd/compress.c:519: undefined reference to `ZSTD_isError'
+    /usr/bin/ld: ../binutils-2.40/bfd/libbfd.a(compress.o): in function `bfd_compress_section_contents':
+    ../binutils-2.40/bfd/compress.c:656: undefined reference to `ZSTD_compress'
+    /usr/bin/ld: ../binutils-2.40/bfd/compress.c:661: undefined reference to `ZSTD_isError'
+
+Add a library check to the elf2flt configure for libzstd presence.
+When present link using it.
+
+There is no real problem when linking with -lzstd if compiling with
+bfd libraries from older binutils, it just won't be needed. So there
+is no need to make this check selective on binutils version.
+
+Signed-off-by: Greg Ungerer <gerg@kernel.org>
+---
+ configure    | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ configure.ac |  1 +
+ 2 files changed, 46 insertions(+)
+
+diff --git a/configure b/configure
+index aab5e7f..d5aab07 100755
+--- a/configure
++++ b/configure
+@@ -3893,6 +3893,51 @@ fi
+ else
+   LIBS="-L$ac_zlib_prefix/lib -lz $LIBS"
+ fi
++{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for ZSTD_decompress in -lzstd" >&5
++$as_echo_n "checking for ZSTD_decompress in -lzstd... " >&6; }
++if ${ac_cv_lib_zstd_ZSTD_decompress+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++  ac_check_lib_save_LIBS=$LIBS
++LIBS="-lzstd  $LIBS"
++cat confdefs.h - <<_ACEOF >conftest.$ac_ext
++/* end confdefs.h.  */
++
++/* Override any GCC internal prototype to avoid an error.
++   Use char because int might match the return type of a GCC
++   builtin and then its argument prototype would still apply.  */
++#ifdef __cplusplus
++extern "C"
++#endif
++char ZSTD_decompress ();
++int
++main ()
++{
++return ZSTD_decompress ();
++  ;
++  return 0;
++}
++_ACEOF
++if ac_fn_c_try_link "$LINENO"; then :
++  ac_cv_lib_zstd_ZSTD_decompress=yes
++else
++  ac_cv_lib_zstd_ZSTD_decompress=no
++fi
++rm -f core conftest.err conftest.$ac_objext \
++    conftest$ac_exeext conftest.$ac_ext
++LIBS=$ac_check_lib_save_LIBS
++fi
++{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_zstd_ZSTD_decompress" >&5
++$as_echo "$ac_cv_lib_zstd_ZSTD_decompress" >&6; }
++if test "x$ac_cv_lib_zstd_ZSTD_decompress" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_LIBZSTD 1
++_ACEOF
++
++  LIBS="-lzstd $LIBS"
++
++fi
++
+ if test "$ac_libiberty" = "NONE"; then
+   { $as_echo "$as_me:${as_lineno-$LINENO}: checking for objalloc_create in -liberty" >&5
+ $as_echo_n "checking for objalloc_create in -liberty... " >&6; }
+diff --git a/configure.ac b/configure.ac
+index f0fa1bf..3a7607a 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -124,6 +124,7 @@ if test "$ac_zlib_prefix" = "NONE"; then
+ else
+   LIBS="-L$ac_zlib_prefix/lib -lz $LIBS"
+ fi
++AC_CHECK_LIB(zstd, ZSTD_decompress)
+ if test "$ac_libiberty" = "NONE"; then
+   AC_CHECK_LIB(iberty, objalloc_create)
+   ac_libiberty=auto
+-- 
+2.50.1 (Apple Git-155)
+

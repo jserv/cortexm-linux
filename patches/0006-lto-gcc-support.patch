@@ -1,0 +1,674 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] arm: add GCC Link Time Optimization (LTO) support
+
+Add CONFIG_LTO_GCC to enable GCC link-time optimization for ARM.
+The implementation routes the final link through a gcc-ld wrapper so
+GCC can perform whole-program optimization across translation units,
+then emit native code in a single LTO pass.
+
+Measured on MPS2-AN386 (Cortex-M4, Thumb-2, nommu) with GCC 15.2.0
+and Linux 7.0, comparing mps2_defconfig builds with and without LTO:
+
+  Section      Baseline       LTO      Delta
+  .text       2,087,552  1,993,384   -94,168  (-4.5%)
+  .rodata       684,000    304,464  -379,536  (-55.5%)
+  .data         296,032    295,808      -224  (-0.1%)
+  .bss          106,940    106,872       -68  (~0%)
+  Image (raw) 3,351,648  2,868,096  -483,552  (-14.4%)
+
+The text reduction comes from cross-TU dead code elimination and
+inlining.  The large rodata drop is from unreferenced string and
+table elimination that per-TU compilation cannot detect.
+
+Six ARM/Thumb-2-specific issues required workarounds:
+
+1. Top-level Kbuild: the original patch used KBUILD_CFLAGS to
+   disable LTO for bounds.s generation, but KBUILD_CFLAGS is
+   exported and the -fno-lto leaked into every sub-make, silently
+   canceling LTO project-wide.  Use per-target CFLAGS_bounds.s
+   and CFLAGS_devicetable-offsets.s instead.
+
+2. Arch flags in LTO link: GCC LTO defaults to armv4t when the
+   architecture is not explicitly passed to the link step.
+   ARMv4T only supports Thumb-1 (immediates 0-255), so the
+   assembler rejects valid Thumb-2 constants with "invalid
+   constant after fixup".  Propagate $(CFLAGS_ABI), $(CFLAGS_ISA),
+   and $(arch-y) through lto-flags-y.
+
+3. Boot decompressor: arch/arm/boot/compressed/ is a standalone
+   stub that runs before the kernel.  It must be compiled without
+   LTO because it is linked with plain ld, which cannot process
+   LTO bitcode objects.
+
+4. Function-name ambiguity: GCC LTO disambiguates static symbols
+   by appending "file.c.HASH" to their names.  When the source
+   file is kernel/exit.c, the resulting symbol "exit.c.9df4f30e"
+   starts with "exit." -- a prefix that scripts/check-function-
+   names.sh rejects to prevent section-name collisions with
+   -ffunction-sections.  The check is a kernel-side script, not a
+   GCC diagnostic.  Suppress it under CONFIG_LTO_GCC and add
+   -fno-function-sections to KBUILD_CFLAGS so GCC does not record
+   function-section metadata in the LTO bytecode.
+
+5. Branch range overflow: LTO merges all .text into a single
+   section, which can push call targets beyond the +-1 MB range
+   of Thumb-2 conditional branches (B<cond>.W / R_ARM_THM_JUMP19).
+   In entry-common.S, "bcs arm_syscall" overflows after LTO code
+   merging.  Restructure as "bcc 1f; b arm_syscall; 1:" -- the
+   short conditional forward branch stays in range while the
+   unconditional B.W has +-16 MB reach.  Also pass
+   -fno-reorder-functions to limit layout churn.
+
+6. Kallsyms instability: LTO-mangled symbol names (.lto_priv.N,
+   file.c.HASH suffixes) change the kallsyms data size between
+   passes, preventing convergence even with KALLSYMS_EXTRA_PASS.
+   Disable CONFIG_KALLSYMS in build.sh (also saves space on this
+   memory-constrained target).
+
+Additional infrastructure ported from the linux-lto project:
+
+- scripts/Makefile.lto: -flto, DISABLE_LTO_GCC, gcc-ar/gcc-nm,
+  LDFINAL via gcc-ld wrapper, TMPDIR override
+- scripts/gcc-ld: translates ld command-line to gcc invocation
+- LDFINAL plumbing in Makefile.vmlinux_o, Makefile.vmlinux,
+  Makefile.build, Makefile.modfinal, link-vmlinux.sh
+- __noreorder on initcalls to stabilize .initcall section order
+- __visible on irq_enter_rcu, irq_exit_rcu,
+  raw_irqentry_exit_cond_resched, __static_call_return0
+  (assembly-referenced, LTO would otherwise internalize them)
+- __flatten disabled under LTO (triggers GCC ICE with
+  whole-program)
+- __visible_on_lto / __global_on_lto helpers
+- DISABLE_LTO_GCC on files that break under LTO: cache.o,
+  string.o, version-timestamp.o, .vmlinux.export.o
+- KASAN: BUILD_BUG() -> break, __used on shadow mem*
+- bloat-o-meter / mksysmap awareness of .lto_priv symbols
+- Livepatch depends on !LTO_GCC
+- CONFIG_LTO guard changed to CONFIG_LTO_CLANG where appropriate
+- delay-objtool keyed on CONFIG_LTO (covers both Clang and GCC)
+- cond_syscall / SYSCALL_ALIAS compat_## aliases for LTO linking
+
+diff -urN a/arch/arm/boot/compressed/Makefile b/arch/arm/boot/compressed/Makefile
+--- a/arch/arm/boot/compressed/Makefile
++++ b/arch/arm/boot/compressed/Makefile
+@@ -22,6 +22,9 @@
+ OBJS		+= hyp-stub.o
+ endif
+
++# The decompressor runs standalone before the kernel; must not use LTO.
++KBUILD_CFLAGS += $(DISABLE_LTO_GCC)
++
+ #
+ # Architecture dependencies
+ #
+
+diff -urN a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
+--- a/arch/arm/kernel/entry-common.S
++++ b/arch/arm/kernel/entry-common.S
+@@ -271,7 +271,13 @@
+
+ 	add	r1, sp, #S_OFF
+ 2:	cmp	scno, #(__ARM_NR_BASE - __NR_SYSCALL_BASE)
+ 	eor	r0, scno, #__NR_SYSCALL_BASE	@ put OS number back
++#ifdef CONFIG_LTO_GCC
++	bcc	1f				@ invert: B.W has +-16MB reach
++	b	arm_syscall
++1:
++#else
+ 	bcs	arm_syscall
++#endif
+ 	mov	why, #0				@ no longer a real syscall
+ 	b	sys_ni_syscall			@ not private func
+diff -urN a/arch/arm/Kconfig b/arch/arm/Kconfig
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -3,6 +3,7 @@
+ 	bool
+ 	default y
+ 	select ARCH_32BIT_OFF_T
++	select ARCH_SUPPORTS_LTO_GCC if LD_IS_BFD
+ 	select ARCH_CORRECT_STACKTRACE_ON_KRETPROBE if HAVE_KRETPROBES && FRAME_POINTER && !ARM_UNWIND
+ 	select ARCH_HAS_BINFMT_FLAT
+ 	select ARCH_HAS_CACHE_LINE_SIZE if OF
+diff -urN a/arch/arm/mm/Makefile b/arch/arm/mm/Makefile
+--- a/arch/arm/mm/Makefile
++++ b/arch/arm/mm/Makefile
+@@ -44,6 +44,7 @@
+ obj-$(CONFIG_CPU_CACHE_FA)	+= cache-fa.o
+ obj-$(CONFIG_CPU_CACHE_NOP)	+= cache-nop.o
+ obj-$(CONFIG_CPU_CACHE_V7M)	+= cache-v7m.o
++CFLAGS_cache.o += $(DISABLE_LTO_GCC)
+ obj-y				+= cache.o
+
+ obj-$(CONFIG_CPU_COPY_V4WT)	+= copypage-v4wt.o
+diff -urN a/arch/Kconfig b/arch/Kconfig
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -799,6 +799,12 @@
+ 	  An architecture should select this option if it can support Clang's
+ 	  ThinLTO mode.
+
++config ARCH_SUPPORTS_LTO_GCC
++	bool
++
++config BAD_AR
++	bool
++
+ config HAS_LTO_CLANG
+ 	def_bool y
+ 	depends on CC_IS_CLANG && LD_IS_LLD && AS_IS_LLVM
+@@ -824,6 +830,18 @@
+ 	  If unsure, select LTO_NONE. Note that LTO is very resource-intensive
+ 	  so it's disabled by default.
+
++config LTO_GCC
++	bool "GCC Link Time Optimization (LTO) (EXPERIMENTAL)"
++	depends on ARCH_SUPPORTS_LTO_GCC
++	depends on CC_IS_GCC
++	depends on !FTRACE_MCOUNT_USE_RECORDMCOUNT
++	depends on !KASAN
++	depends on !GCOV_KERNEL
++	select LTO
++	help
++	  This option enables Link Time Optimization (LTO) for the kernel
++	  using the GCC toolchain.
++
+ config LTO_NONE
+ 	bool "None"
+ 	help
+diff -urN a/include/linux/compiler_attributes.h b/include/linux/compiler_attributes.h
+--- a/include/linux/compiler_attributes.h
++++ b/include/linux/compiler_attributes.h
+@@ -220,9 +220,21 @@
+  * gcc: https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#Common-Function-Attributes
+  * clang: https://clang.llvm.org/docs/AttributeReference.html#flatten
+  */
++#ifdef CONFIG_LTO_GCC
++# define __flatten
++#else
+ # define __flatten			__attribute__((flatten))
++#endif
+
+ /*
++ * Optional: __noreorder to prevent GCC from reordering functions
++ */
++#ifdef CONFIG_LTO_GCC
++# define __noreorder			__attribute__((no_reorder))
++#else
++# define __noreorder
++#endif
++/*
+  * Note the missing underscores.
+  *
+  *   gcc: https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#index-noinline-function-attribute
+diff -urN a/include/linux/compiler.h b/include/linux/compiler.h
+--- a/include/linux/compiler.h
++++ b/include/linux/compiler.h
+@@ -369,6 +369,14 @@
+  */
+ #define prevent_tail_call_optimization()	mb()
+
++#ifdef CONFIG_LTO_GCC
++#define __visible_on_lto __visible
++#define __global_on_lto  "globl"
++#else
++#define __visible_on_lto
++#define __global_on_lto  "local"
++#endif
++
+ #include <asm/rwonce.h>
+
+ #endif /* __LINUX_COMPILER_H */
+diff -urN a/include/linux/init.h b/include/linux/init.h
+--- a/include/linux/init.h
++++ b/include/linux/init.h
+@@ -261,7 +261,7 @@
+ 	static_assert(__same_type(initcall_t, &fn));
+ #else
+ #define ____define_initcall(fn, __unused, __name, __sec)	\
+-	static initcall_t __name __used 			\
++	static initcall_t __name __used __noreorder		\
+ 		__attribute__((__section__(__sec))) = fn;
+ #endif
+
+diff -urN a/include/linux/linkage.h b/include/linux/linkage.h
+--- a/include/linux/linkage.h
++++ b/include/linux/linkage.h
+@@ -26,6 +26,9 @@
+ #define cond_syscall(x)	asm(				\
+ 	".weak " __stringify(x) "\n\t"			\
+ 	".set  " __stringify(x) ","			\
++		 __stringify(sys_ni_syscall) "\n\t"	\
++	".weak " __stringify(compat_##x) "\n\t"		\
++	".set  " __stringify(compat_##x) ","		\
+ 		 __stringify(sys_ni_syscall))
+ #endif
+
+@@ -33,7 +36,10 @@
+ #define SYSCALL_ALIAS(alias, name) asm(			\
+ 	".globl " __stringify(alias) "\n\t"		\
+ 	".set   " __stringify(alias) ","		\
+-		  __stringify(name))
++		  __stringify(name) "\n\t"		\
++	".globl " __stringify(compat_##alias) "\n\t"	\
++	".set   " __stringify(compat_##alias) ","	\
++		  __stringify(compat_##name))
+ #endif
+
+ #define __page_aligned_data	__section(".data..page_aligned") __aligned(PAGE_SIZE)
+diff -urN a/init/Makefile b/init/Makefile
+--- a/init/Makefile
++++ b/init/Makefile
+@@ -60,3 +60,4 @@
+
+ $(obj)/version-timestamp.o: include/generated/utsversion.h
+ CFLAGS_version-timestamp.o := -include include/generated/utsversion.h
++CFLAGS_version-timestamp.o += $(DISABLE_LTO_GCC)
+diff -urN a/Kbuild b/Kbuild
+--- a/Kbuild
++++ b/Kbuild
+@@ -10,6 +10,7 @@
+ bounds-file := include/generated/bounds.h
+
+ targets := kernel/bounds.s
++CFLAGS_bounds.s += $(DISABLE_LTO_GCC)
+
+ $(bounds-file): kernel/bounds.s FORCE
+ 	$(call filechk,offsets,__LINUX_BOUNDS_H__)
+diff -urN a/kernel/entry/common.c b/kernel/entry/common.c
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -185,7 +185,7 @@
+ static inline bool arch_irqentry_exit_need_resched(void) { return true; }
+ #endif
+
+-void raw_irqentry_exit_cond_resched(void)
++__visible void raw_irqentry_exit_cond_resched(void)
+ {
+ 	if (!preempt_count()) {
+ 		/* Sanity check RCU and thread stack */
+diff -urN a/kernel/livepatch/Kconfig b/kernel/livepatch/Kconfig
+--- a/kernel/livepatch/Kconfig
++++ b/kernel/livepatch/Kconfig
+@@ -11,6 +11,7 @@
+ 	depends on SYSFS
+ 	depends on KALLSYMS_ALL
+ 	depends on HAVE_LIVEPATCH
++	depends on !LTO_GCC
+ 	depends on !TRIM_UNUSED_KSYMS
+ 	help
+ 	  Say Y here if you want to support kernel live patching.
+diff -urN a/kernel/softirq.c b/kernel/softirq.c
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -659,7 +659,7 @@
+ /**
+  * irq_enter_rcu - Enter an interrupt context with RCU watching
+  */
+-void irq_enter_rcu(void)
++__visible void irq_enter_rcu(void)
+ {
+ 	__irq_enter_raw();
+
+@@ -734,10 +734,10 @@
+  *
+  * Also processes softirqs if needed and possible.
+  */
+-void irq_exit_rcu(void)
++__visible void irq_exit_rcu(void)
+ {
+ 	__irq_exit_rcu();
+-	 /* must be last! */
++	/* must be last! */
+ 	lockdep_hardirq_exit();
+ }
+
+diff -urN a/kernel/static_call.c b/kernel/static_call.c
+--- a/kernel/static_call.c
++++ b/kernel/static_call.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/static_call.h>
+
+-long __static_call_return0(void)
++__visible long __static_call_return0(void)
+ {
+ 	return 0;
+ }
+diff -urN a/lib/Makefile b/lib/Makefile
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -31,6 +31,7 @@
+ KASAN_SANITIZE_string.o := n
+
+ CFLAGS_string.o += -fno-stack-protector
++CFLAGS_string.o += $(DISABLE_LTO_GCC)
+ endif
+
+ lib-y := ctype.o string.o vsprintf.o cmdline.o \
+diff -urN a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -1044,12 +1044,15 @@
+ KBUILD_LDFLAGS += -mllvm -import-instr-limit=5
+ endif
+
+-ifdef CONFIG_LTO
++ifdef CONFIG_LTO_CLANG
+ KBUILD_CFLAGS	+= -fno-lto $(CC_FLAGS_LTO)
+ KBUILD_AFLAGS	+= -fno-lto
+ export CC_FLAGS_LTO
+ endif
+
++LDFINAL ?= $(LD)
++export LDFINAL
++
+ ifdef CONFIG_CFI
+ CC_FLAGS_CFI	:= -fsanitize=kcfi
+ ifdef CONFIG_CFI_ICALL_NORMALIZE_INTEGERS
+@@ -1134,6 +1137,7 @@
+ include-$(CONFIG_PROPELLER_CLANG)	+= scripts/Makefile.propeller
+ include-$(CONFIG_WARN_CONTEXT_ANALYSIS) += scripts/Makefile.context-analysis
+ include-$(CONFIG_GCC_PLUGINS)	+= scripts/Makefile.gcc-plugins
++include-$(CONFIG_LTO_GCC)	+= scripts/Makefile.lto
+
+ include $(addprefix $(srctree)/, $(include-y))
+
+diff -urN a/mm/kasan/generic.c b/mm/kasan/generic.c
+--- a/mm/kasan/generic.c
++++ b/mm/kasan/generic.c
+@@ -165,15 +165,15 @@
+ 		case 16:
+ 			return memory_is_poisoned_16(addr);
+ 		default:
+-			BUILD_BUG();
++			break;
+ 		}
+ 	}
+
+ 	return memory_is_poisoned_n(addr, size);
+ }
+
+-static __always_inline bool check_region_inline(const void *addr,
+-						size_t size, bool write,
++static __always_inline bool check_region_inline(const void *addr, size_t size,
++						bool write,
+ 						unsigned long ret_ip)
+ {
+ 	if (!kasan_enabled())
+diff -urN a/mm/kasan/shadow.c b/mm/kasan/shadow.c
+--- a/mm/kasan/shadow.c
++++ b/mm/kasan/shadow.c
+@@ -48,7 +48,7 @@
+  * these, so that non-instrumented files can safely consider them as builtins.
+  */
+ #undef memset
+-void *memset(void *addr, int c, size_t len)
++void __used *memset(void *addr, int c, size_t len)
+ {
+ 	if (!kasan_check_range(addr, len, true, _RET_IP_))
+ 		return NULL;
+@@ -58,7 +58,7 @@
+
+ #ifdef __HAVE_ARCH_MEMMOVE
+ #undef memmove
+-void *memmove(void *dest, const void *src, size_t len)
++void __used *memmove(void *dest, const void *src, size_t len)
+ {
+ 	if (!kasan_check_range(src, len, false, _RET_IP_) ||
+ 	    !kasan_check_range(dest, len, true, _RET_IP_))
+@@ -69,7 +69,7 @@
+ #endif
+
+ #undef memcpy
+-void *memcpy(void *dest, const void *src, size_t len)
++void __used *memcpy(void *dest, const void *src, size_t len)
+ {
+ 	if (!kasan_check_range(src, len, false, _RET_IP_) ||
+ 	    !kasan_check_range(dest, len, true, _RET_IP_))
+diff -urN a/scripts/bloat-o-meter b/scripts/bloat-o-meter
+--- a/scripts/bloat-o-meter
++++ b/scripts/bloat-o-meter
+@@ -24,6 +24,7 @@
+ args = parser.parse_args()
+
+ re_NUMBER = re.compile(r'\.[0-9]+')
++re_LTO = re.compile(r'\.lto_priv\.[0-9]+')
+
+ def getsizes(file, format):
+     sym = {}
+@@ -46,6 +47,7 @@
+                 if name == "linux_banner": continue
+                 if name == "vermagic": continue
+                 # statics and some other optimizations adds random .NUMBER
++                name = re_LTO.sub('', name)
+                 name = re_NUMBER.sub('', name)
+                 sym[name] = sym.get(name, 0) + int(size, 16)
+     return sym
+diff -urN a/scripts/gcc-ld b/scripts/gcc-ld
+--- a/scripts/gcc-ld
++++ b/scripts/gcc-ld
+@@ -0,0 +1,40 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0
++# run gcc with ld options
++# used as a wrapper to execute link time optimizations
++# yes virginia, this is not pretty
++
++ARGS="-nostdlib"
++
++for j in "$@" ; do
++	if [ "$j" = -v ] ; then
++		exec `$CC -print-prog-name=ld` -v
++	fi
++done
++
++while [ "$1" != "" ] ; do
++	case "$1" in
++	-save-temps*|-m32|-m64) N="$1" ;;
++	-r) N="$1" ;;
++	-flinker-output*) N="$1" ;;
++	-[Wg]*) N="$1" ;;
++	-[olv]|-[Ofd]*|-nostdlib) N="$1" ;;
++	--end-group|--start-group|--whole-archive|--no-whole-archive|\
++--no-undefined|--hash-style*|--build-id*|--eh-frame-hdr|-Bsymbolic)
++		 N="-Wl,$1" ;;
++	-[RTFGhIezcbyYu]*|\
++--script|--defsym|-init|-Map|--oformat|-rpath|\
++-rpath-link|--sort-section|--section-start|-Tbss|-Tdata|-Ttext|-soname|\
++--version-script|--dynamic-list|--version-exports-symbol|--wrap|-m|-z)
++		A="$1" ; shift ; N="-Wl,$A,$1" ;;
++	-[m]*) N="$1" ;;
++	-*) N="-Wl,$1" ;;
++	*)  N="$1" ;;
++	esac
++	ARGS="$ARGS $N"
++	shift
++done
++
++[ -n "$V" ] && echo >&2 $CC $ARGS
++
++exec $CC $ARGS
+diff -urN a/scripts/link-vmlinux.sh b/scripts/link-vmlinux.sh
+--- a/scripts/link-vmlinux.sh
++++ b/scripts/link-vmlinux.sh
+@@ -32,6 +32,7 @@
+ KBUILD_LDFLAGS="$2"
+ LDFLAGS_vmlinux="$3"
+ VMLINUX="$4"
++LDFINAL="$5"
+
+ is_enabled() {
+ 	grep -q "^$1=y" include/config/auto.conf
+@@ -60,7 +61,7 @@
+ 	# skip output file argument
+ 	shift
+
+-	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT ||
++	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT || is_enabled CONFIG_LTO_GCC ||
+ 	   is_enabled CONFIG_KLP_BUILD; then
+ 		# Use vmlinux.o instead of performing the slow LTO link again.
+ 		objs=vmlinux.o
+diff -urN a/scripts/Makefile.build b/scripts/Makefile.build
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -494,7 +494,7 @@
+ 	$(call if_changed,ar)
+
+ quiet_cmd_ld_multi_m = LD [M]  $@
+-      cmd_ld_multi_m = $(LD) $(ld_flags) -r -o $@ @$< $(cmd_objtool)
++      cmd_ld_multi_m = $(LDFINAL) $(ld_flags) -r -o $@ @$< $(cmd_objtool)
+
+ define rule_ld_multi_m
+ 	$(call cmd_and_savecmd,ld_multi_m)
+diff -urN a/scripts/Makefile.lib b/scripts/Makefile.lib
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -207,7 +207,7 @@
+ 	$(if $(delay-objtool), --link)					\
+ 	$(if $(part-of-module), --module)
+
+-delay-objtool := $(or $(CONFIG_LTO_CLANG),$(CONFIG_X86_KERNEL_IBT),$(CONFIG_KLP_BUILD))
++delay-objtool := $(or $(CONFIG_LTO),$(CONFIG_X86_KERNEL_IBT),$(CONFIG_KLP_BUILD))
+
+ cmd_objtool = $(if $(objtool-enabled), ; $(objtool) $(objtool-args) $@)
+ cmd_gen_objtooldep = $(if $(objtool-enabled), { echo ; echo '$@: $$(wildcard $(objtool))' ; } >> $(dot-target).cmd)
+diff -urN a/scripts/Makefile.lto b/scripts/Makefile.lto
+--- a/scripts/Makefile.lto
++++ b/scripts/Makefile.lto
+@@ -0,0 +1,59 @@
++#
++# Support for gcc link time optimization
++#
++
++DISABLE_LTO_GCC :=
++export DISABLE_LTO_GCC
++
++ifdef CONFIG_LTO_GCC
++	CC_FLAGS_LTO_GCC := -flto
++	DISABLE_LTO_GCC := -fno-lto
++
++	KBUILD_CFLAGS += ${CC_FLAGS_LTO_GCC}
++	# GCC LTO disambiguates statics as "file.c.HASH"; the dots
++	# trigger scripts/check-function-names.sh when the basename
++	# matches a reserved prefix (exit, startup, ...).  Recording
++	# -ffunction-sections in LTO metadata makes it worse, so
++	# suppress both.
++	KBUILD_CFLAGS += -fno-function-sections -fno-data-sections
++
++	CC_FLAGS_LTO := -flto
++	export CC_FLAGS_LTO
++
++	lto-flags-y := -flinker-output=nolto-rel -flto=jobserver
++
++	# ARM: LTO must carry the full arch/ISA/ABI flags to the link
++	# step.  Without these, GCC defaults to armv4t (Thumb-1 only),
++	# causing "invalid constant after fixup" on any Thumb-2
++	# immediate that exceeds the 0-255 Thumb-1 range.
++	lto-flags-y += $(CFLAGS_ABI) $(CFLAGS_ISA) $(arch-y) -msoft-float
++	lto-flags-$(CONFIG_THUMB2_KERNEL) += -mword-relocations
++
++	lto-flags-y += -flto-partition=none
++
++	# Prevent function reordering that causes Thumb-2 conditional
++	# branches (+-1MB R_ARM_THM_JUMP19) to overflow after LTO
++	# merges all .text into a single section.
++	lto-flags-y += -fno-reorder-functions
++
++	lto-flags-$(CONFIG_LTO_CP_CLONE) += -fipa-cp-clone
++
++	# allow extra flags from command line
++	lto-flags-y += ${LTO_EXTRA_CFLAGS}
++
++	# For LTO we need to use gcc to do the linking, not ld
++	# directly. Use a wrapper to convert the ld command line
++	# to gcc
++	LDFINAL := ${CONFIG_SHELL} ${srctree}/scripts/gcc-ld \
++                  ${lto-flags-y}
++
++	# LTO gcc creates a lot of files in TMPDIR, and with /tmp as tmpfs
++	# it's easy to drive the machine OOM. Use the object directory
++	# instead for temporaries.
++	TMPDIR ?= $(objtree)
++	export TMPDIR
++
++	# use plugin aware tools
++	AR = $(CROSS_COMPILE)gcc-ar
++	NM = $(CROSS_COMPILE)gcc-nm
++endif # CONFIG_LTO_GCC
+diff -urN a/scripts/Makefile.modfinal b/scripts/Makefile.modfinal
+--- a/scripts/Makefile.modfinal
++++ b/scripts/Makefile.modfinal
+@@ -34,7 +34,7 @@
+
+ quiet_cmd_ld_ko_o = LD [M]  $@
+       cmd_ld_ko_o =							\
+-	$(LD) -r $(KBUILD_LDFLAGS)					\
++	$(LDFINAL) -r $(KBUILD_LDFLAGS)					\
+ 		$(KBUILD_LDFLAGS_MODULE) $(LDFLAGS_MODULE)		\
+ 		-T $(objtree)/scripts/module.lds -o $@ $(filter %.o, $^)
+
+diff -urN a/scripts/Makefile.vmlinux b/scripts/Makefile.vmlinux
+--- a/scripts/Makefile.vmlinux
++++ b/scripts/Makefile.vmlinux
+@@ -64,9 +64,11 @@
+
+ # Final link of vmlinux with optional arch pass after final link
+ cmd_link_vmlinux =							\
+-	$< "$(LD)" "$(KBUILD_LDFLAGS)" "$(LDFLAGS_vmlinux)" "$@";	\
++	$< "$(LD)" "$(KBUILD_LDFLAGS)" "$(LDFLAGS_vmlinux)" "$@" "$(LDFINAL)";	\
+ 	$(if $(ARCH_POSTLINK), $(MAKE) -f $(ARCH_POSTLINK) $@, true)
+
++CFLAGS_.vmlinux.export.o += $(DISABLE_LTO_GCC)
++
+ targets += vmlinux.unstripped .vmlinux.export.o
+ vmlinux.unstripped: scripts/link-vmlinux.sh vmlinux.o .vmlinux.export.o $(KBUILD_LDS) FORCE
+ 	+$(call if_changed_dep,link_vmlinux)
+diff -urN a/scripts/Makefile.vmlinux_o b/scripts/Makefile.vmlinux_o
+--- a/scripts/Makefile.vmlinux_o
++++ b/scripts/Makefile.vmlinux_o
+@@ -56,7 +56,7 @@
+
+ quiet_cmd_ld_vmlinux.o = LD      $@
+       cmd_ld_vmlinux.o = \
+-	$(LD) ${KBUILD_LDFLAGS} -r -o $@ \
++	$(LDFINAL) ${KBUILD_LDFLAGS} -r -o $@ \
+ 	$(vmlinux-o-ld-args-y) \
+ 	$(addprefix -T , $(initcalls-lds)) \
+ 	--whole-archive vmlinux.a --no-whole-archive \
+@@ -63,3 +63,7 @@
+ 	$(cmd_objtool)
+
++ifdef CONFIG_LTO_GCC
++cmd_check_function_names =
++else
+ cmd_check_function_names = $(srctree)/scripts/check-function-names.sh $@
++endif
+diff -urN a/scripts/mksysmap b/scripts/mksysmap
+--- a/scripts/mksysmap
++++ b/scripts/mksysmap
+@@ -92,3 +92,6 @@
+ # ppc stub
+ /\.long_branch\./d
+ /\.plt_branch\./d
++
++# GCC LTO .c. weak symbols
++/ \.c\./d
+diff -urN a/scripts/mod/Makefile b/scripts/mod/Makefile
+--- a/scripts/mod/Makefile
++++ b/scripts/mod/Makefile
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ CFLAGS_REMOVE_empty.o += $(CC_FLAGS_LTO)
++CFLAGS_empty.o += $(DISABLE_LTO_GCC)
+
+ hostprogs-always-y	+= modpost mk_elfconfig
+ always-y		+= empty.o
+@@ -12,6 +13,7 @@
+ 	$(call filechk,offsets,__DEVICETABLE_OFFSETS_H__)
+
+ targets += $(devicetable-offsets-file) devicetable-offsets.s
++CFLAGS_devicetable-offsets.s += $(DISABLE_LTO_GCC)
+
+ # dependencies on generated files need to be listed explicitly
+
