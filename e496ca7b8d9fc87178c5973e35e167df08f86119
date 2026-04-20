@@ -1,0 +1,39 @@
+TODO.md
+  d4be8e060485a6fc 1-23,25-163
+  8f88dc879c6b6bd8 24
+build.sh
+  8f88dc879c6b6bd8 216,267-270,272-280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "e496ca7b8d9fc87178c5973e35e167df08f86119",
+  "prompts": {
+    "8f88dc879c6b6bd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9bb7e3d2-2676-4ed9-ad97-69b68ccfd0cd",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 57,
+      "total_deletions": 3,
+      "accepted_lines": 57,
+      "overriden_lines": 0
+    },
+    "d4be8e060485a6fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "70a6ccb1-be18-44c2-87af-a26fbec4a3b2",
+        "model": "<synthetic>"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 186,
+      "total_deletions": 23,
+      "accepted_lines": 162,
+      "overriden_lines": 0
+    }
+  }
+}
