@@ -77,6 +77,76 @@ fetch_file() {
     fi
 }
 
+patch_already_applied() {
+    PATCH_NAME=$(basename "$1")
+
+    case "${PATCH_NAME}" in
+    0002-*)
+        grep -q "config NET_SMALL" init/Kconfig &&
+            grep -q "CONFIG_NET_SMALL" include/net/protocol.h &&
+            grep -q "CONFIG_NET_SMALL" net/sunrpc/cache.c &&
+            grep -q "CONFIG_NET_SMALL" net/unix/af_unix.h
+        ;;
+    0003-*)
+        grep -q "config MAX_SWAPFILES_SHIFT" init/Kconfig &&
+            grep -q "CONFIG_MAX_SWAPFILES_SHIFT" include/linux/swap.h &&
+            grep -q "MAX_SWAPFILES_SHIFT == 0" include/linux/swapops.h
+        ;;
+    0004-*)
+        grep -q "config CRC32_TABLES" init/Kconfig &&
+            grep -q "#ifndef CONFIG_CRC32_TABLES" lib/crc/crc32-main.c
+        ;;
+    0005-*)
+        grep -q "config PROC_STRIPPED" fs/proc/Kconfig &&
+            grep -q "CONFIG_PROC_STRIPPED" fs/locks.c
+        ;;
+    0006-*)
+        grep -q "config LTO_GCC" arch/Kconfig &&
+            [ -f scripts/Makefile.lto ]
+        ;;
+    0007-*)
+        grep -q "ZSTD_decompress" configure
+        ;;
+    0008-*)
+        grep -q "PRIx64" elf2flt.c
+        ;;
+    0009-*)
+        grep -q "thumb2_movwt_imm16" elf2flt.c
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+}
+
+apply_patch_once() {
+    PATCH_FILE=$1
+    PATCH_NAME=$(basename "${PATCH_FILE}")
+    STAMP_DIR=.applied-patches
+    STAMP_FILE=${STAMP_DIR}/${PATCH_NAME}
+
+    mkdir -p "${STAMP_DIR}"
+    if [ -f "${STAMP_FILE}" ] && patch_already_applied "${PATCH_FILE}"; then
+        echo "BUILD: skipping ${PATCH_NAME} (stamp verified)"
+        return 0
+    fi
+
+    if patch -p1 -N --dry-run <"${PATCH_FILE}" >/dev/null 2>&1; then
+        echo "BUILD: applying ${PATCH_NAME}"
+        patch -p1 -N <"${PATCH_FILE}"
+        touch "${STAMP_FILE}"
+    elif patch_already_applied "${PATCH_FILE}"; then
+        echo "BUILD: skipping ${PATCH_NAME} (already applied)"
+        touch "${STAMP_FILE}"
+    elif patch -p1 -R --dry-run <"${PATCH_FILE}" >/dev/null 2>&1; then
+        echo "BUILD: skipping ${PATCH_NAME} (already applied)"
+        touch "${STAMP_FILE}"
+    else
+        echo "ERROR: failed to apply ${PATCH_NAME}"
+        exit 1
+    fi
+}
+
 build_binutils() {
     echo "BUILD: building binutils-${BINUTILS_VERSION}"
     fetch_file ${BINUTILS_URL} "${CHECKSUM_binutils}"
@@ -161,15 +231,7 @@ build_elf2flt() {
     # Apply elf2flt patches for newer binutils compatibility
     for p in ../patches/0007-*.patch ../patches/0008-*.patch ../patches/0009-*.patch; do
         [ -f "${p}" ] || continue
-        if patch -p1 -N --dry-run <"${p}" >/dev/null 2>&1; then
-            echo "BUILD: applying $(basename ${p})"
-            patch -p1 -N <"${p}"
-        elif patch -p1 -R --dry-run <"${p}" >/dev/null 2>&1; then
-            echo "BUILD: skipping $(basename ${p}) (already applied)"
-        else
-            echo "ERROR: failed to apply $(basename ${p})"
-            exit 1
-        fi
+        apply_patch_once "${p}"
     done
 
     ./configure --disable-werror \
@@ -209,13 +271,15 @@ build_finalize_rootfs() {
     mkdir -p ${ROOTFS}/etc
     mkdir -p ${ROOTFS}/proc
 
-    echo "::sysinit:/etc/rc" >${ROOTFS}/etc/inittab
+    echo "::sysinit:/bin/sh /etc/rc" >${ROOTFS}/etc/inittab
     echo "::respawn:-/bin/sh" >>${ROOTFS}/etc/inittab
 
     echo "#!/bin/sh" >${ROOTFS}/etc/rc
     echo "mount -t devtmpfs devtmpfs /dev" >>${ROOTFS}/etc/rc
     echo "mount -t proc proc /proc" >>${ROOTFS}/etc/rc
     echo "echo -e \"\\nLinux for Cortex-M\\n\\n\"" >>${ROOTFS}/etc/rc
+    python3 ${ROOTDIR}/tools/optimize-shell.py ${ROOTFS}/etc/rc >${ROOTFS}/etc/rc.optimized
+    mv ${ROOTFS}/etc/rc.optimized ${ROOTFS}/etc/rc
     chmod 755 ${ROOTFS}/etc/rc
 
     ln -sf /sbin/init ${ROOTFS}/init
@@ -229,15 +293,7 @@ build_linux() {
     # Apply linux-tiny patches for reduced memory footprint and LTO support
     for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch; do
         [ -f "${p}" ] || continue
-        if patch -p1 -N --dry-run <"${p}" >/dev/null 2>&1; then
-            echo "BUILD: applying $(basename ${p})"
-            patch -p1 -N <"${p}"
-        elif patch -p1 -R --dry-run <"${p}" >/dev/null 2>&1; then
-            echo "BUILD: skipping $(basename ${p}) (already applied)"
-        else
-            echo "ERROR: failed to apply $(basename ${p})"
-            exit 1
-        fi
+        apply_patch_once "${p}"
     done
 
     make ARCH=${CPU} CROSS_COMPILE=${TARGET}- mps2_defconfig
