@@ -208,14 +208,13 @@ build_finalize_rootfs() {
 
     mkdir -p ${ROOTFS}/etc
     mkdir -p ${ROOTFS}/proc
-    mkdir -p ${ROOTFS}/sys
 
     echo "::sysinit:/etc/rc" >${ROOTFS}/etc/inittab
     echo "::respawn:-/bin/sh" >>${ROOTFS}/etc/inittab
 
     echo "#!/bin/sh" >${ROOTFS}/etc/rc
+    echo "mount -t devtmpfs devtmpfs /dev" >>${ROOTFS}/etc/rc
     echo "mount -t proc proc /proc" >>${ROOTFS}/etc/rc
-    echo "mount -t sysfs sys /sys" >>${ROOTFS}/etc/rc
     echo "echo -e \"\\nLinux for Cortex-M\\n\\n\"" >>${ROOTFS}/etc/rc
     chmod 755 ${ROOTFS}/etc/rc
 
@@ -265,7 +264,20 @@ build_linux() {
     # the LTO patch's -fno-function-sections for kernel objects)
     echo "CONFIG_LD_DEAD_CODE_DATA_ELIMINATION=y" >>.config
 
+    # Disable sysfs: no userspace in this config enumerates /sys,
+    # and the kobject/kset hierarchy is pure dead weight on Cortex-M4
+    echo "# CONFIG_SYSFS is not set" >>.config
+
     make ARCH=${CPU} CROSS_COMPILE=${TARGET}- olddefconfig </dev/null
+
+    # Verify critical config options survived olddefconfig resolution
+    for opt in "# CONFIG_SYSFS is not set" "CONFIG_BLK_DEV_INITRD=y"; do
+        if ! grep -q "^${opt}\$" .config; then
+            echo "ERROR: expected '${opt}' in .config after olddefconfig"
+            exit 1
+        fi
+    done
+
     make -j${NCPU} ARCH=${CPU} CROSS_COMPILE=${TARGET}- KALLSYMS_EXTRA_PASS=1
     cd ../
 }
