@@ -268,10 +268,14 @@ build_linux() {
     # and the kobject/kset hierarchy is pure dead weight on Cortex-M4
     echo "# CONFIG_SYSFS is not set" >>.config
 
+    # BASE_SMALL shrinks core hash tables, IDR radix trees, and pid_max.
+    # It is an EXPERT-visible bool; mps2_defconfig already enables EXPERT.
+    echo "CONFIG_BASE_SMALL=y" >>.config
+
     make ARCH=${CPU} CROSS_COMPILE=${TARGET}- olddefconfig </dev/null
 
     # Verify critical config options survived olddefconfig resolution
-    for opt in "# CONFIG_SYSFS is not set" "CONFIG_BLK_DEV_INITRD=y"; do
+    for opt in "# CONFIG_SYSFS is not set" "CONFIG_BLK_DEV_INITRD=y" "CONFIG_BASE_SMALL=y"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
