@@ -1,0 +1,164 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            cpio \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            texinfo \
+            wget \
+            xz-utils
+
+      - name: Restore source downloads cache
+        id: restore-downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: downloads
+          key: downloads-linux-${{ hashFiles('build.sh') }}
+
+      - name: Restore build workspace cache
+        id: restore-workspace
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .build-state
+            bootwrapper
+            busybox-*
+            elf2flt-*
+            gcc-*
+            linux-*
+            rootfs
+            toolchain
+            uClibc-ng-*
+            binutils-*
+          key: workspace-linux-${{ github.ref_name }}-${{ hashFiles('build.sh', 'configs/**', 'patches/**', 'tools/**') }}
+          restore-keys: |
+            workspace-linux-${{ github.ref_name }}-
+            workspace-linux-${{ github.base_ref }}-
+            workspace-linux-main-
+
+      - name: Build image
+        id: build-image
+        env:
+          QUIET: 1
+        run: ./build.sh
+
+      - name: Save source downloads cache
+        if: always() && steps.restore-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: downloads
+          key: downloads-linux-${{ hashFiles('build.sh') }}
+
+      - name: Save build workspace cache
+        if: always() && steps.restore-workspace.outputs.cache-hit != 'true' && steps.build-image.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .build-state
+            bootwrapper
+            busybox-*
+            elf2flt-*
+            gcc-*
+            linux-*
+            rootfs
+            toolchain
+            uClibc-ng-*
+            binutils-*
+          key: workspace-linux-${{ github.ref_name }}-${{ hashFiles('build.sh', 'configs/**', 'patches/**', 'tools/**') }}
+
+      - name: Summarize cache reuse
+        if: always()
+        run: |
+          {
+            echo "### Cache summary"
+            echo
+            echo "- downloads cache hit: ${{ steps.restore-downloads.outputs.cache-hit }}"
+            echo "- workspace cache hit: ${{ steps.restore-workspace.outputs.cache-hit }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build image
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bootable-image
+          compression-level: 0
+          path: bootwrapper/linux.axf
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          compression-level: 0
+          path: |
+            logs
+          if-no-files-found: ignore
+
+  qemu:
+    name: Validate boot in QEMU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: build
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Install QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            expect \
+            qemu-system-arm
+
+      - name: Download build image
+        uses: actions/download-artifact@v5
+        with:
+          name: bootable-image
+          path: bootwrapper
+
+      - name: Validate boot in QEMU
+        run: scripts/validate-qemu.sh bootwrapper/linux.axf qemu.log
+
+      - name: Upload QEMU logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qemu-logs
+          compression-level: 0
+          path: |
+            qemu.log
+          if-no-files-found: ignore

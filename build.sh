@@ -9,6 +9,8 @@
 
 set -e
 
+# shellcheck disable=SC2329
+
 CPU=arm
 TARGET=arm-uclinuxeabi
 FLAVOR=cortexm-flt
@@ -31,26 +33,171 @@ ROOTDIR=$(cd "$(dirname "$0")" >/dev/null && pwd)
 cd "${ROOTDIR}"
 TOOLCHAIN=${ROOTDIR}/toolchain
 ROOTFS=${ROOTDIR}/rootfs
+LOGDIR=${ROOTDIR}/logs
+STATE_DIR=${ROOTDIR}/.build-state
+QUIET=${QUIET:-0}
+LOG_TAIL_LINES=${LOG_TAIL_LINES:-200}
 
 NCPU=$(grep -c processor /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+MAKE_JOBS=${MAKE_JOBS:-${NCPU}}
 
 PATH=${TOOLCHAIN}/bin:${PATH}
+
+mkdir -p "${LOGDIR}" "${STATE_DIR}"
 
 # SHA256 checksums for downloaded source packages.
 # Update these when bumping component versions.
 # To populate missing checksums: sha256sum downloads/*
-CHECKSUM_binutils=""
-CHECKSUM_gcc=""
-CHECKSUM_uclibc=""
+CHECKSUM_binutils="binutils-${BINUTILS_VERSION}.tar.xz=d75a94f4d73e7a4086f7513e67e439e8fcdcbb726ffe63f4661744e6256b2cf2"
+CHECKSUM_gcc="gcc-${GCC_VERSION}.tar.xz=438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
+CHECKSUM_uclibc="uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz=8bc734b584e23ff6ae3d0ebb4c0fb1d1d814c58c82822b93130d436afa7ace8b"
 CHECKSUM_busybox="busybox-${BUSYBOX_VERSION}.tar.bz2=3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
-CHECKSUM_elf2flt=""
+CHECKSUM_elf2flt="v${ELF2FLT_VERSION}.tar.gz=9fd899d0c66552ecb175ff6764e5af810aa1bb78db38a64768a1b97c3c62199d"
 CHECKSUM_linux="linux-${LINUX_VERSION}.tar.xz=bb7f6d80b387c757b7d14bb93028fcb90f793c5c0d367736ee815a100b3891f0"
+
+toolchain_fingerprint() {
+    {
+        sha256sum build.sh
+        sha256sum patches/0001-* 2>/dev/null || true
+        sha256sum configs/uClibc-ng-* 2>/dev/null || true
+    } | sha256sum | cut -d' ' -f1
+}
+
+image_fingerprint() {
+    {
+        printf '%s\n' "$1"
+        sha256sum build.sh
+        find configs patches tools -type f -print0 | sort -z | xargs -0 sha256sum
+    } | sha256sum | cut -d' ' -f1
+}
+
+TOOLCHAIN_FP=$(toolchain_fingerprint)
+IMAGE_FP=$(image_fingerprint "${TOOLCHAIN_FP}")
+
+stage_fingerprint() {
+    case "$1" in
+    binutils|gcc|linux_headers|uClibc|elf2flt)
+        printf '%s' "${TOOLCHAIN_FP}" ;;
+    *)
+        printf '%s' "${IMAGE_FP}" ;;
+    esac
+}
+
+run_logged() {
+    STEP=$1
+    shift
+
+    if [ "${QUIET}" = "1" ]; then
+        echo "BUILD: ${CURRENT_STAGE}: ${STEP}"
+        if "$@" >>"${CURRENT_LOG}" 2>&1; then
+            return 0
+        else
+            STATUS=$?
+        fi
+
+        echo "ERROR: ${CURRENT_STAGE} failed during ${STEP}" >&2
+        echo "ERROR: showing the last ${LOG_TAIL_LINES} lines from ${CURRENT_LOG}" >&2
+        tail -n "${LOG_TAIL_LINES}" "${CURRENT_LOG}" >&2 || cat "${CURRENT_LOG}" >&2
+        exit "${STATUS}"
+    fi
+
+    "$@"
+}
+
+extract_source() {
+    ARCHIVE=$1
+    SRCDIR=$2
+    shift 2
+
+    if [ -d "${SRCDIR}" ]; then
+        echo "BUILD: reusing ${SRCDIR}"
+        return 0
+    fi
+
+    run_logged "extract ${SRCDIR}" tar "$@" "downloads/${ARCHIVE}"
+}
+
+stage_stamp_file() {
+    echo "${STATE_DIR}/$1.stamp"
+}
+
+stage_stamp_matches() {
+    STAMP_FILE=$(stage_stamp_file "$1")
+    [ -f "${STAMP_FILE}" ] && grep -qx "$(stage_fingerprint "$1")" "${STAMP_FILE}"
+}
+
+mark_stage_complete() {
+    printf '%s\n' "$(stage_fingerprint "$1")" >"$(stage_stamp_file "$1")"
+}
+
+stage_verify_binutils() {
+    [ -x "${TOOLCHAIN}/bin/${TARGET}-ld" ]
+}
+
+stage_verify_gcc() {
+    [ -x "${TOOLCHAIN}/bin/${TARGET}-gcc" ]
+}
+
+stage_verify_linux_headers() {
+    [ -f "${TOOLCHAIN}/${TARGET}/include/linux/types.h" ]
+}
+
+stage_verify_uClibc() {
+    [ -f "${TOOLCHAIN}/${TARGET}/lib/libc.a" ] || [ -f "${TOOLCHAIN}/${TARGET}/lib/libc.so" ]
+}
+
+stage_verify_elf2flt() {
+    [ -x "${TOOLCHAIN}/bin/${TARGET}-elf2flt" ]
+}
+
+stage_verify_busybox() {
+    [ -x "${ROOTFS}/bin/busybox" ]
+}
+
+stage_verify_finalize_rootfs() {
+    [ -x "${ROOTFS}/etc/rc" ] && [ -L "${ROOTFS}/init" ]
+}
+
+stage_verify_linux() {
+    [ -f "${ROOTDIR}/linux-${LINUX_VERSION}/arch/arm/boot/Image" ]
+}
+
+stage_verify_bootwrapper() {
+    [ -f "${ROOTDIR}/bootwrapper/linux.axf" ]
+}
+
+stage_is_current() {
+    STAGE=$1
+    VERIFY_FUNC=stage_verify_${STAGE}
+
+    if ! stage_stamp_matches "${STAGE}"; then
+        return 1
+    fi
+
+    "${VERIFY_FUNC}"
+}
+
+# Remove stale source/build trees before re-running a stage so that
+# cached artifacts (config.status, already-applied patches) cannot
+# silently carry over from a previous fingerprint.
+stage_clean() {
+    case "$1" in
+    binutils)       rm -rf "binutils-${BINUTILS_VERSION}" ;;
+    gcc)            rm -rf "gcc-${GCC_VERSION}" ;;
+    linux_headers)  rm -rf "linux-${LINUX_VERSION}" ;;  # shared with linux; both extract fresh
+    uClibc)         rm -rf "uClibc-ng-${UCLIBC_NG_VERSION}" ;;
+    elf2flt)        rm -rf "elf2flt-${ELF2FLT_VERSION}" ;;
+    busybox)        rm -rf "busybox-${BUSYBOX_VERSION}" "${ROOTFS}" ;;
+    finalize_rootfs) ;; # idempotent; overwrites its outputs
+    linux)          rm -rf "linux-${LINUX_VERSION}" ;;
+    bootwrapper)    rm -rf bootwrapper ;;
+    esac
+}
 
 verify_checksum() {
     FILE=$1
     EXPECTED=$2
     if [ -z "${EXPECTED}" ]; then
-        echo "WARNING: no checksum defined for ${FILE}"
         return 0
     fi
     ACTUAL=$(sha256sum "downloads/${FILE}" | cut -d' ' -f1)
@@ -69,12 +216,17 @@ fetch_file() {
     mkdir -p downloads
     if [ ! -f "downloads/${PACKAGE}" ]; then
         echo "BUILD: fetching ${PACKAGE}"
-        wget -P downloads "${URL}"
+        if [ "${QUIET}" = "1" ]; then
+            wget -q -P downloads "${URL}"
+        else
+            wget -P downloads "${URL}"
+        fi
     fi
+    EXPECTED=""
     if [ -n "${CHECKSUM_VAR}" ]; then
         EXPECTED=$(echo "${CHECKSUM_VAR}" | cut -d= -f2)
-        verify_checksum "${PACKAGE}" "${EXPECTED}"
     fi
+    verify_checksum "${PACKAGE}" "${EXPECTED}"
 }
 
 patch_already_applied() {
@@ -149,29 +301,31 @@ apply_patch_once() {
 
 build_binutils() {
     echo "BUILD: building binutils-${BINUTILS_VERSION}"
-    fetch_file ${BINUTILS_URL} "${CHECKSUM_binutils}"
+    fetch_file "${BINUTILS_URL}" "${CHECKSUM_binutils}"
 
-    tar xvJf downloads/binutils-${BINUTILS_VERSION}.tar.xz
+    extract_source "binutils-${BINUTILS_VERSION}.tar.xz" "binutils-${BINUTILS_VERSION}" -xJf
     cd binutils-${BINUTILS_VERSION}
 
-    patch -p1 -R <../patches/0001-arm-Do-not-insert-stubs-needing-Arm-code-on-Thumb-on.patch
+    if patch -p1 -R --dry-run <../patches/0001-arm-Do-not-insert-stubs-needing-Arm-code-on-Thumb-on.patch >/dev/null 2>&1; then
+        run_logged "apply thumb-only binutils patch" patch -p1 -R <../patches/0001-arm-Do-not-insert-stubs-needing-Arm-code-on-Thumb-on.patch
+    fi
 
-    ./configure --target=${TARGET} --prefix=${TOOLCHAIN}
-    make -j${NCPU}
-    make install
+    run_logged "configure" ./configure --target=${TARGET} --prefix=${TOOLCHAIN}
+    run_logged "build" make -j${MAKE_JOBS}
+    run_logged "install" make install
     cd ../
 }
 
 build_gcc() {
     echo "BUILD: building gcc-${GCC_VERSION}"
-    fetch_file ${GCC_URL} "${CHECKSUM_gcc}"
+    fetch_file "${GCC_URL}" "${CHECKSUM_gcc}"
 
-    tar xvJf downloads/gcc-${GCC_VERSION}.tar.xz
+    extract_source "gcc-${GCC_VERSION}.tar.xz" "gcc-${GCC_VERSION}" -xJf
     cd gcc-${GCC_VERSION}
-    contrib/download_prerequisites
-    mkdir ${TARGET}
+    run_logged "download gcc prerequisites" contrib/download_prerequisites
+    mkdir -p ${TARGET}
     cd ${TARGET}
-    ../configure --target=${TARGET} \
+    run_logged "configure" ../configure --target=${TARGET} \
         --prefix=${TOOLCHAIN} \
         --enable-multilib \
         --disable-shared \
@@ -186,28 +340,30 @@ build_gcc() {
         --without-headers \
         --with-system-zlib \
         --enable-languages=c
-    make -j${NCPU}
-    make install
+    run_logged "build" make -j${MAKE_JOBS}
+    run_logged "install" make install
     cd ../..
 }
 
 build_linux_headers() {
     echo "BUILD: building linux-${LINUX_VERSION} headers"
-    fetch_file ${LINUX_URL} "${CHECKSUM_linux}"
+    fetch_file "${LINUX_URL}" "${CHECKSUM_linux}"
 
-    tar xvJf downloads/linux-${LINUX_VERSION}.tar.xz
+    extract_source "linux-${LINUX_VERSION}.tar.xz" "linux-${LINUX_VERSION}" -xJf
     cd linux-${LINUX_VERSION}
-    make ARCH=${CPU} defconfig
-    make ARCH=${CPU} headers_install
+    run_logged "defconfig" make ARCH=${CPU} defconfig
+    run_logged "headers_install" make ARCH=${CPU} headers_install
+    mkdir -p "${TOOLCHAIN}/${TARGET}"
+    rm -rf "${TOOLCHAIN}/${TARGET}/include"
     cp -a usr/include ${TOOLCHAIN}/${TARGET}/
     cd ../
 }
 
 build_uClibc() {
     echo "BUILD: building uClibc-${UCLIBC_NG_VERSION}"
-    fetch_file ${UCLIBC_NG_URL} "${CHECKSUM_uclibc}"
+    fetch_file "${UCLIBC_NG_URL}" "${CHECKSUM_uclibc}"
 
-    tar xvJf downloads/uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz
+    extract_source "uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz" "uClibc-ng-${UCLIBC_NG_VERSION}" -xJf
     cp configs/uClibc-ng-${UCLIBC_NG_VERSION}-${FLAVOR}.config uClibc-ng-${UCLIBC_NG_VERSION}/.config
     cd uClibc-ng-${UCLIBC_NG_VERSION}
 
@@ -216,16 +372,16 @@ build_uClibc() {
     sed -i "s/^RUNTIME_PREFIX=.*\$/RUNTIME_PREFIX=\"${TOOLCHAIN_ESCAPED}\"/" .config
     sed -i "s/^DEVEL_PREFIX=.*\$/DEVEL_PREFIX=\"${TOOLCHAIN_ESCAPED}\"/" .config
 
-    make oldconfig CROSS=${TARGET}- TARGET_ARCH=${CPU} </dev/null
-    make -j${NCPU} install CROSS=${TARGET}- TARGET_ARCH=${CPU}
+    run_logged "oldconfig" sh -c "make oldconfig CROSS=${TARGET}- TARGET_ARCH=${CPU} </dev/null"
+    run_logged "build and install" make -j${MAKE_JOBS} install CROSS=${TARGET}- TARGET_ARCH=${CPU}
     cd ../
 }
 
 build_elf2flt() {
     echo "BUILD: building elf2flt-${ELF2FLT_VERSION}"
-    fetch_file ${ELF2FLT_URL} "${CHECKSUM_elf2flt}"
+    fetch_file "${ELF2FLT_URL}" "${CHECKSUM_elf2flt}"
 
-    tar xvzf downloads/v${ELF2FLT_VERSION}.tar.gz
+    extract_source "v${ELF2FLT_VERSION}.tar.gz" "elf2flt-${ELF2FLT_VERSION}" -xzf
     cd elf2flt-${ELF2FLT_VERSION}
 
     # Apply elf2flt patches for newer binutils compatibility
@@ -234,23 +390,23 @@ build_elf2flt() {
         apply_patch_once "${p}"
     done
 
-    ./configure --disable-werror \
+    run_logged "configure" ./configure --disable-werror \
         --with-binutils-include-dir=${ROOTDIR}/binutils-${BINUTILS_VERSION}/include \
         --with-bfd-include-dir=${ROOTDIR}/binutils-${BINUTILS_VERSION}/bfd \
         --with-libbfd=${ROOTDIR}/binutils-${BINUTILS_VERSION}/bfd/.libs/libbfd.a \
         --with-libiberty=${ROOTDIR}/binutils-${BINUTILS_VERSION}/libiberty/libiberty.a \
         --prefix=${TOOLCHAIN} \
         --target=${TARGET}
-    make
-    make install
+    run_logged "build" make -j${MAKE_JOBS}
+    run_logged "install" make install
     cd ../
 }
 
 build_busybox() {
     echo "BUILD: building busybox-${BUSYBOX_VERSION}"
-    fetch_file ${BUSYBOX_URL} "${CHECKSUM_busybox}"
+    fetch_file "${BUSYBOX_URL}" "${CHECKSUM_busybox}"
 
-    tar xvjf downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
+    extract_source "busybox-${BUSYBOX_VERSION}.tar.bz2" "busybox-${BUSYBOX_VERSION}" -xjf
     cp configs/busybox-${BUSYBOX_VERSION}.config busybox-${BUSYBOX_VERSION}/.config
     cd busybox-${BUSYBOX_VERSION}
 
@@ -260,34 +416,39 @@ build_busybox() {
     # on FLAT binaries but enables dead-section stripping at ELF stage
     sed -i 's/CONFIG_EXTRA_LDFLAGS=""/CONFIG_EXTRA_LDFLAGS="-Wl,--gc-sections"/' .config
 
-    make oldconfig
-    make -j${NCPU} CROSS_COMPILE=${TARGET}- CONFIG_PREFIX=${ROOTFS} install SKIP_STRIP=y
+    run_logged "oldconfig" make oldconfig
+    run_logged "build and install" make -j${MAKE_JOBS} CROSS_COMPILE=${TARGET}- CONFIG_PREFIX=${ROOTFS} install SKIP_STRIP=y
     cd ../
 }
 
 build_finalize_rootfs() {
     echo "BUILD: finalizing rootfs"
 
-    mkdir -p ${ROOTFS}/etc
-    mkdir -p ${ROOTFS}/proc
+    mkdir -p "${ROOTFS}/etc" "${ROOTFS}/proc"
 
-    echo "::sysinit:/bin/sh /etc/rc" >${ROOTFS}/etc/inittab
-    echo "::respawn:-/bin/sh" >>${ROOTFS}/etc/inittab
+    {
+        echo "::sysinit:/bin/sh /etc/rc"
+        echo "::respawn:-/bin/sh"
+    } >"${ROOTFS}/etc/inittab"
 
-    echo "#!/bin/sh" >${ROOTFS}/etc/rc
-    echo "mount -t devtmpfs devtmpfs /dev" >>${ROOTFS}/etc/rc
-    echo "mount -t proc proc /proc" >>${ROOTFS}/etc/rc
-    echo "echo -e \"\\nLinux for Cortex-M\\n\\n\"" >>${ROOTFS}/etc/rc
-    python3 ${ROOTDIR}/tools/optimize-shell.py ${ROOTFS}/etc/rc >${ROOTFS}/etc/rc.optimized
-    mv ${ROOTFS}/etc/rc.optimized ${ROOTFS}/etc/rc
-    chmod 755 ${ROOTFS}/etc/rc
+    {
+        echo "#!/bin/sh"
+        echo "mount -t devtmpfs devtmpfs /dev"
+        echo "mount -t proc proc /proc"
+        printf '%s\n' 'printf "\nLinux for Cortex-M\n\n"'
+    } >"${ROOTFS}/etc/rc"
+    run_logged "optimize init shell script" sh -c "python3 \"${ROOTDIR}/tools/optimize-shell.py\" \"${ROOTFS}/etc/rc\" >\"${ROOTFS}/etc/rc.optimized\""
+    mv "${ROOTFS}/etc/rc.optimized" "${ROOTFS}/etc/rc"
+    chmod 755 "${ROOTFS}/etc/rc"
 
-    ln -sf /sbin/init ${ROOTFS}/init
+    ln -sf /sbin/init "${ROOTFS}/init"
 }
 
 build_linux() {
     echo "BUILD: building linux-${LINUX_VERSION}"
 
+    fetch_file "${LINUX_URL}" "${CHECKSUM_linux}"
+    extract_source "linux-${LINUX_VERSION}.tar.xz" "linux-${LINUX_VERSION}" -xJf
     cd linux-${LINUX_VERSION}
 
     # Apply linux-tiny patches for reduced memory footprint and LTO support
@@ -296,7 +457,7 @@ build_linux() {
         apply_patch_once "${p}"
     done
 
-    make ARCH=${CPU} CROSS_COMPILE=${TARGET}- mps2_defconfig
+    run_logged "mps2_defconfig" make ARCH=${CPU} CROSS_COMPILE=${TARGET}- mps2_defconfig
 
     sed -i "s/# CONFIG_BLK_DEV_INITRD is not set/CONFIG_BLK_DEV_INITRD=y/" .config
     sed -i "/CONFIG_INITRAMFS_SOURCE=/d" .config
@@ -328,7 +489,7 @@ build_linux() {
     # It is an EXPERT-visible bool; mps2_defconfig already enables EXPERT.
     echo "CONFIG_BASE_SMALL=y" >>.config
 
-    make ARCH=${CPU} CROSS_COMPILE=${TARGET}- olddefconfig </dev/null
+    run_logged "olddefconfig" sh -c "make ARCH=${CPU} CROSS_COMPILE=${TARGET}- olddefconfig </dev/null"
 
     # Verify critical config options survived olddefconfig resolution
     for opt in "# CONFIG_SYSFS is not set" "CONFIG_BLK_DEV_INITRD=y" "CONFIG_BASE_SMALL=y"; do
@@ -338,7 +499,7 @@ build_linux() {
         fi
     done
 
-    make -j${NCPU} ARCH=${CPU} CROSS_COMPILE=${TARGET}- KALLSYMS_EXTRA_PASS=1
+    run_logged "build" make -j${MAKE_JOBS} ARCH=${CPU} CROSS_COMPILE=${TARGET}- KALLSYMS_EXTRA_PASS=1
     cd ../
 }
 
@@ -352,7 +513,7 @@ build_bootwrapper() {
     echo "BUILD: building ARM CORTEX boot wrapper"
 
     if [ ! -d bootwrapper ]; then
-        git clone https://github.com/ARM-software/bootwrapper.git -b cortex-m-linux
+        run_logged "clone bootwrapper" git clone --depth 1 --single-branch https://github.com/ARM-software/bootwrapper.git -b cortex-m-linux
     fi
 
     cd bootwrapper
@@ -364,7 +525,7 @@ build_bootwrapper() {
     sed -i 's/0x60000000/0x21000000/' Makefile
     sed -i 's/. = PHYS_OFFSET;/. = 0x0;/' linux.lds.S
 
-    make CROSS_COMPILE=${TARGET}-
+    run_logged "build" make CROSS_COMPILE=${TARGET}-
 
     cd ../
 }
@@ -373,7 +534,7 @@ build_bootwrapper() {
 # Do the real work.
 #
 
-if [ "$1" = "clean" ]; then
+if [ "${1:-}" = "clean" ]; then
     rm -rf binutils-${BINUTILS_VERSION}
     rm -rf gcc-${GCC_VERSION}
     rm -rf linux-${LINUX_VERSION}
@@ -381,8 +542,10 @@ if [ "$1" = "clean" ]; then
     rm -rf elf2flt-${ELF2FLT_VERSION}
     rm -rf busybox-${BUSYBOX_VERSION}
     rm -rf bootwrapper
-    rm -rf ${TOOLCHAIN}
-    rm -rf ${ROOTFS}
+    rm -rf "${TOOLCHAIN}"
+    rm -rf "${ROOTFS}"
+    rm -rf "${LOGDIR}"
+    rm -rf "${STATE_DIR}"
     exit 0
 fi
 
@@ -409,9 +572,22 @@ else
 fi
 
 for stage in ${STAGES}; do
+    if stage_is_current "${stage}"; then
+        echo "BUILD: skipping ${stage} (up to date)"
+        continue
+    fi
+
+    CURRENT_STAGE=${stage}
+    CURRENT_LOG=${LOGDIR}/${stage}.log
+    : >"${CURRENT_LOG}"
+
+    stage_clean "${stage}"
+
     # Run each stage in a subshell so a mid-build cd failure
     # does not leave the working directory inside a source tree.
-    ( build_${stage} )
+    BUILD_FUNC=build_${stage}
+    ( "${BUILD_FUNC}" )
+    mark_stage_complete "${stage}"
 done
 
 exit 0
