@@ -1,0 +1,94 @@
+#!/usr/bin/expect -f
+
+set image [lindex $argv 0]
+set log_path [lindex $argv 1]
+set timeout_seconds [lindex $argv 2]
+set boot_marker [lindex $argv 3]
+
+if {$image eq "" || $log_path eq "" || $timeout_seconds eq "" || $boot_marker eq ""} {
+    send_user "ERROR: missing QEMU validation arguments\n"
+    exit 1
+}
+
+set timeout $timeout_seconds
+match_max 1048576
+log_user 0
+log_file -noappend $log_path
+
+proc wait_for_shell {} {
+    for {set attempt 0} {$attempt < 6} {incr attempt} {
+        set marker "__SHELL_READY__$attempt"
+        send -- "busybox echo ${marker}\r"
+        expect {
+            -re $marker { return }
+            timeout {
+                send -- "\r"
+            }
+            eof {
+                send_user "ERROR: QEMU exited before the shell became ready\n"
+                exit 1
+            }
+        }
+    }
+
+    send_user "ERROR: BusyBox shell prompt not detected\n"
+    exit 1
+}
+
+proc run_guest_check {command expected marker} {
+    send -- "${command}; busybox echo ${marker}\r"
+    expect {
+        -re $expected {}
+        timeout {
+            send_user "ERROR: command did not emit expected output: ${command}\n"
+            exit 1
+        }
+        eof {
+            send_user "ERROR: QEMU exited while running: ${command}\n"
+            exit 1
+        }
+    }
+    expect {
+        -re $marker {}
+        timeout {
+            send_user "ERROR: command marker not reached: ${command}\n"
+            exit 1
+        }
+        eof {
+            send_user "ERROR: QEMU exited before command marker: ${command}\n"
+            exit 1
+        }
+    }
+}
+
+spawn qemu-system-arm \
+    -M mps2-an386 \
+    -cpu cortex-m4 \
+    -nographic \
+    -no-reboot \
+    -kernel $image
+
+expect {
+    -re $boot_marker {}
+    timeout {
+        send_user "ERROR: QEMU boot marker not found: $boot_marker\n"
+        exit 1
+    }
+    eof {
+        send_user "ERROR: QEMU exited before boot marker: $boot_marker\n"
+        exit 1
+    }
+}
+
+wait_for_shell
+
+run_guest_check "busybox" {BusyBox v} "__BUSYBOX_HELP_OK__"
+run_guest_check "busybox uname -s" {Linux} "__BUSYBOX_UNAME_OK__"
+run_guest_check "busybox ls /bin" {busybox} "__BUSYBOX_LS_OK__"
+run_guest_check "busybox cat /proc/version" {Linux version} "__BUSYBOX_PROC_OK__"
+run_guest_check "busybox test -x /bin/sh && busybox echo /bin/sh-ok" {/bin/sh-ok} "__BUSYBOX_TEST_OK__"
+
+send -- "\001x"
+expect eof
+
+puts "QEMU validation passed: booted Linux and exercised BusyBox"
