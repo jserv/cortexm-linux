@@ -1,0 +1,57 @@
+.github/workflows/main.yml
+  a910441822ff30d4 1-164
+scripts/validate-qemu.sh
+  a910441822ff30d4 1-16
+scripts/validate-qemu.expect
+  a910441822ff30d4 1-94
+build.sh
+  a910441822ff30d4 12-13,36-39,42,46-47,59,64-65,85-125,127-129,131-177,219-223,304,306,309-311,314-315,321,323,325-326,343-344,350,352,354-357,364,366,375-376,382,384,400-401,407,409,419-420,427,429-432,434-442,444,450-451,460,492,502,516,528,537,545-548,575-582,588-590
+  77dd7743ba7b6632 51-52,58,60-63,66-84,126,130,180-196,225,229,313,328,393,584-585
+  7277b14c8c83b526 53,55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "5641cc0e8b8c4e4cfb5991fe0eeba3b0a11c41ad",
+  "prompts": {
+    "7277b14c8c83b526": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019dae3f-2e01-7bd2-bd4b-edecd118e1e4",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    },
+    "77dd7743ba7b6632": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58d9e6e3-720d-4837-a798-6e68c8833a92",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 80,
+      "total_deletions": 52,
+      "accepted_lines": 52,
+      "overriden_lines": 0
+    },
+    "a910441822ff30d4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019dad40-8927-7352-830d-8da3ca6c4e98",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 936,
+      "total_deletions": 75,
+      "accepted_lines": 451,
+      "overriden_lines": 0
+    }
+  }
+}
