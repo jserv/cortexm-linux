@@ -416,6 +416,9 @@ build_busybox() {
     # on FLAT binaries but enables dead-section stripping at ELF stage
     sed -i 's/CONFIG_EXTRA_LDFLAGS=""/CONFIG_EXTRA_LDFLAGS="-Wl,--gc-sections"/' .config
 
+    # Reinstall into a clean rootfs so disabled applets do not leave stale links.
+    rm -rf "${ROOTFS}"
+
     run_logged "oldconfig" make oldconfig
     run_logged "build and install" make -j${MAKE_JOBS} CROSS_COMPILE=${TARGET}- CONFIG_PREFIX=${ROOTFS} install SKIP_STRIP=y
     cd ../
@@ -489,10 +492,13 @@ build_linux() {
     # It is an EXPERT-visible bool; mps2_defconfig already enables EXPERT.
     echo "CONFIG_BASE_SMALL=y" >>.config
 
+    # Single-user system: drop UID/GID mapping and related syscalls.
+    echo "# CONFIG_MULTIUSER is not set" >>.config
+
     run_logged "olddefconfig" sh -c "make ARCH=${CPU} CROSS_COMPILE=${TARGET}- olddefconfig </dev/null"
 
     # Verify critical config options survived olddefconfig resolution
-    for opt in "# CONFIG_SYSFS is not set" "CONFIG_BLK_DEV_INITRD=y" "CONFIG_BASE_SMALL=y"; do
+    for opt in "# CONFIG_SYSFS is not set" "CONFIG_BLK_DEV_INITRD=y" "CONFIG_BASE_SMALL=y" "# CONFIG_MULTIUSER is not set"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
