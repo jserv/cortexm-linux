@@ -1,0 +1,23 @@
+.github/workflows/main.yml
+  a910441822ff30d4 9-11,153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "da7e77db5d89dd18635fa71c389619fe93102351",
+  "prompts": {
+    "a910441822ff30d4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019dad40-8927-7352-830d-8da3ca6c4e98",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 1,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    }
+  }
+}
