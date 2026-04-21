@@ -1,0 +1,29 @@
+build.sh
+  a910441822ff30d4 12-13,36-39,42,46-47,58-161,185-189,269,271,274-276,278-282,288,290,292-293,295-313,319,321,323-326,333,335,344-345,351,353,362-372,378,380,390-391,398,400-403,405-413,415,421-422,431,463,473,487,499,508,516-519,546-554,557-559
+scripts/validate-qemu.expect
+  a910441822ff30d4 1-94
+.github/workflows/main.yml
+  a910441822ff30d4 1-166
+scripts/validate-qemu.sh
+  a910441822ff30d4 1-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "f8ede80f11c2aad52d5bc4bc8df1a2720fb605a0",
+  "prompts": {
+    "a910441822ff30d4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019dad40-8927-7352-830d-8da3ca6c4e98",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 936,
+      "total_deletions": 75,
+      "accepted_lines": 933,
+      "overriden_lines": 0
+    }
+  }
+}
