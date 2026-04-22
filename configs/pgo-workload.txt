@@ -1,0 +1,18 @@
+# label|command|expected regex
+busybox-help|busybox|BusyBox v
+uname|busybox uname -s|Linux
+list-bin|busybox ls /bin|busybox
+proc-version|busybox cat /proc/version|Linux version
+proc-mounts|busybox cat /proc/mounts|/proc
+proc-self-stat|busybox cat /proc/self/stat| \(
+list-proc|busybox ls /proc|self
+read-self-exe|busybox readlink /proc/self/exe|busybox
+shell-path|busybox test -x /bin/sh && busybox echo /bin/sh-ok|/bin/sh-ok
+create-file|busybox sh -c 'busybox echo alpha >/tmp/pgo-file && busybox cat /tmp/pgo-file'|alpha
+rename-file|busybox sh -c 'busybox mv /tmp/pgo-file /tmp/pgo-file-renamed && busybox cat /tmp/pgo-file-renamed'|alpha
+hardlink-file|busybox sh -c 'busybox ln /tmp/pgo-file-renamed /tmp/pgo-file-link && busybox ls -l /tmp/pgo-file-link'|pgo-file-link
+truncate-file|busybox sh -c ': >/tmp/pgo-file-renamed && busybox test ! -s /tmp/pgo-file-renamed && busybox echo zero-ok'|zero-ok
+mkdir-rmdir|busybox sh -c 'busybox mkdir -p /tmp/pgo-dir && busybox ls /tmp | busybox grep pgo-dir && busybox rmdir /tmp/pgo-dir'|pgo-dir
+copy-file|busybox sh -c 'busybox cp /bin/busybox /tmp/pgo-copy && busybox ls -l /tmp/pgo-copy'|pgo-copy
+poll-path|busybox sh -c 'busybox printf \"poll-data\" >/tmp/pgo-poll && busybox cat /tmp/pgo-poll'|poll-data
+cleanup-tmp|busybox sh -c 'busybox rm -f /tmp/pgo-file-renamed /tmp/pgo-file-link /tmp/pgo-poll && busybox echo cleanup-ok'|cleanup-ok

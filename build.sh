@@ -35,6 +35,12 @@ LOGDIR=${ROOTDIR}/logs
 STATE_DIR=${ROOTDIR}/.build-state
 QUIET=${QUIET:-0}
 LOG_TAIL_LINES=${LOG_TAIL_LINES:-200}
+KERNEL_EXPERIMENT=${KERNEL_EXPERIMENT:-none}
+KERNEL_ORDER_FILE=${KERNEL_ORDER_FILE:-}
+KERNEL_CONFIG_FRAGMENT=${KERNEL_CONFIG_FRAGMENT:-}
+KERNEL_REPORT_DIR=${KERNEL_REPORT_DIR:-${ROOTDIR}/profiles/kernel-pgo}
+PGO_WORKLOAD_FILE=${PGO_WORKLOAD_FILE:-${ROOTDIR}/configs/pgo-workload.txt}
+PGO_BASE_CONFIG_FRAGMENT=${PGO_BASE_CONFIG_FRAGMENT:-${ROOTDIR}/configs/kernel-pgo-prune.config}
 
 NCPU=$(grep -c processor /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 MAKE_JOBS=${MAKE_JOBS:-${NCPU}}
@@ -63,8 +69,21 @@ toolchain_fingerprint() {
 image_fingerprint() {
     {
         printf '%s\n' "$1"
+        printf 'KERNEL_EXPERIMENT=%s\n' "${KERNEL_EXPERIMENT}"
+        printf 'KERNEL_ORDER_FILE=%s\n' "${KERNEL_ORDER_FILE}"
+        printf 'KERNEL_CONFIG_FRAGMENT=%s\n' "${KERNEL_CONFIG_FRAGMENT}"
+        if [ -n "${KERNEL_ORDER_FILE}" ] && [ -f "${KERNEL_ORDER_FILE}" ]; then
+            sha256sum "${KERNEL_ORDER_FILE}"
+        fi
+        if [ -n "${KERNEL_CONFIG_FRAGMENT}" ] && [ -f "${KERNEL_CONFIG_FRAGMENT}" ]; then
+            sha256sum "${KERNEL_CONFIG_FRAGMENT}"
+        fi
+        printf 'PGO_WORKLOAD_FILE=%s\n' "${PGO_WORKLOAD_FILE}"
+        if [ -f "${PGO_WORKLOAD_FILE}" ]; then
+            sha256sum "${PGO_WORKLOAD_FILE}"
+        fi
         sha256sum build.sh
-        find configs patches tools -type f -print0 | sort -z | xargs -0 sha256sum
+        find configs patches tools scripts -type f -print0 | sort -z | xargs -0 sha256sum
     } | sha256sum | cut -d' ' -f1
 }
 
@@ -174,6 +193,12 @@ stage_verify_bootwrapper() {
     [ -f "${ROOTDIR}/bootwrapper/linux.axf" ]
 }
 
+stage_verify_kernel_pgo_cycle() {
+    [ -f "${KERNEL_REPORT_DIR}/cycle/final/selected-candidate.txt" ] &&
+        [ -f "${KERNEL_REPORT_DIR}/cycle/configs/pgo-kernel.config" ] &&
+        [ -f "${ROOTDIR}/bootwrapper/linux.axf" ]
+}
+
 stage_is_current() {
     STAGE=$1
     VERIFY_FUNC=stage_verify_${STAGE}
@@ -198,6 +223,7 @@ stage_clean() {
     finalize_rootfs) ;; # idempotent; overwrites its outputs
     linux)          rm -rf "linux-${LINUX_VERSION}" ;;
     bootwrapper)    rm -rf bootwrapper ;;
+    kernel_pgo_cycle) rm -rf "${KERNEL_REPORT_DIR}/cycle" ;;
     esac
 }
 
@@ -562,7 +588,7 @@ build_finalize_rootfs() {
 
     {
         echo "#!/bin/sh"
-        echo "mount -t devtmpfs devtmpfs /dev"
+        echo "mount -t devtmpfs devtmpfs /dev 2>/dev/null || true"
         echo "mount -t proc proc /proc"
         printf '%s\n' 'printf "\nLinux for Cortex-M\n\n"'
     } >"${ROOTFS}/etc/rc"
@@ -571,6 +597,33 @@ build_finalize_rootfs() {
     chmod 755 "${ROOTFS}/etc/rc"
 
     ln -sf /sbin/init "${ROOTFS}/init"
+}
+
+kernel_make() {
+    if [ "${KERNEL_EXPERIMENT}" = "llvm-order-use" ]; then
+        if [ -n "${KERNEL_KBUILD_LDFLAGS:-}" ]; then
+            make ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
+                LLVM=1 LLVM_IAS=0 \
+                HOSTCC=clang HOSTCXX=clang++ \
+                CC=clang LD=ld.lld \
+                "KCFLAGS=${KERNEL_KCFLAGS:-}" \
+                "KBUILD_LDFLAGS+=${KERNEL_KBUILD_LDFLAGS}" \
+                "$@"
+            return
+        fi
+
+        make ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
+            LLVM=1 LLVM_IAS=0 \
+            HOSTCC=clang HOSTCXX=clang++ \
+            CC=clang LD=ld.lld \
+            "KCFLAGS=${KERNEL_KCFLAGS:-}" \
+            "$@"
+        return
+    fi
+
+    make ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
+        "KCFLAGS=${KERNEL_KCFLAGS:-}" \
+        "$@"
 }
 
 build_linux() {
@@ -586,12 +639,40 @@ build_linux() {
         apply_patch_once "${p}"
     done
 
-    run_logged "mps2_defconfig" make ARCH=${CPU} CROSS_COMPILE=${TARGET}- mps2_defconfig
+    KERNEL_KCFLAGS=
+    KERNEL_KBUILD_LDFLAGS=
+
+    case "${KERNEL_EXPERIMENT}" in
+    none)
+        ;;
+    llvm-order-use)
+        if [ -z "${KERNEL_ORDER_FILE}" ]; then
+            echo "ERROR: KERNEL_ORDER_FILE is required when KERNEL_EXPERIMENT=llvm-order-use"
+            exit 1
+        fi
+        if [ ! -f "${KERNEL_ORDER_FILE}" ]; then
+            echo "ERROR: missing kernel order file: ${KERNEL_ORDER_FILE}"
+            exit 1
+        fi
+        KERNEL_KCFLAGS="-ffunction-sections -gmlt"
+        KERNEL_KBUILD_LDFLAGS="--symbol-ordering-file=${KERNEL_ORDER_FILE} --no-warn-symbol-ordering"
+        ;;
+    *)
+        echo "ERROR: unsupported KERNEL_EXPERIMENT='${KERNEL_EXPERIMENT}'"
+        echo "Supported values: none, llvm-order-use"
+        exit 1
+        ;;
+    esac
+
+    run_logged "mps2_defconfig" kernel_make mps2_defconfig
 
     sed -i "s/# CONFIG_BLK_DEV_INITRD is not set/CONFIG_BLK_DEV_INITRD=y/" .config
     sed -i "/CONFIG_INITRAMFS_SOURCE=/d" .config
     echo "CONFIG_INITRAMFS_SOURCE=\"${ROOTFS} ${ROOTDIR}/configs/rootfs.dev\"" >>.config
     echo "CONFIG_INITRAMFS_COMPRESSION_GZIP=y" >>.config
+    if [ -n "${KERNEL_CONFIG_FRAGMENT}" ] && [ -f "${KERNEL_CONFIG_FRAGMENT}" ]; then
+        cat "${KERNEL_CONFIG_FRAGMENT}" >>.config
+    fi
 
     # This board has no NIC and no remaining userspace networking needs.
     sed -i 's/^CONFIG_NET=y/# CONFIG_NET is not set/' .config
@@ -607,8 +688,10 @@ build_linux() {
     echo "# CONFIG_BINFMT_SCRIPT is not set" >>.config
     echo "# CONFIG_COREDUMP is not set" >>.config
 
-    # Enable GCC LTO for whole-kernel optimization
-    echo "CONFIG_LTO_GCC=y" >>.config
+    if [ "${KERNEL_EXPERIMENT}" = "none" ]; then
+        # Enable GCC LTO for whole-kernel optimization in the default build.
+        echo "CONFIG_LTO_GCC=y" >>.config
+    fi
     # Disable KALLSYMS -- incompatible with LTO symbol mangling
     # and unnecessary for this minimal target
     echo "# CONFIG_KALLSYMS is not set" >>.config
@@ -629,7 +712,7 @@ build_linux() {
     # Single-user system: drop UID/GID mapping and related syscalls.
     echo "# CONFIG_MULTIUSER is not set" >>.config
 
-    run_logged "olddefconfig" sh -c "make ARCH=${CPU} CROSS_COMPILE=${TARGET}- olddefconfig </dev/null"
+    run_logged "olddefconfig" kernel_make olddefconfig
 
     # Verify critical config options survived olddefconfig resolution
     for opt in \
@@ -638,6 +721,7 @@ build_linux() {
         "# CONFIG_SYSFS is not set" \
         "CONFIG_BLK_DEV_INITRD=y" \
         "CONFIG_BASE_SMALL=y" \
+        "CONFIG_CC_OPTIMIZE_FOR_SIZE=y" \
         "# CONFIG_MULTIUSER is not set" \
         "CONFIG_BINFMT_ELF_FDPIC=y" \
         "# CONFIG_BINFMT_FLAT is not set" \
@@ -649,9 +733,194 @@ build_linux() {
         fi
     done
 
-    run_logged "build" make -j${MAKE_JOBS} ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
-        KCFLAGS=-mno-fdpic KAFLAGS=-mno-fdpic KALLSYMS_EXTRA_PASS=1
+    if [ "${KERNEL_EXPERIMENT}" = "llvm-order-use" ]; then
+        run_logged "build" kernel_make -j${MAKE_JOBS} KALLSYMS_EXTRA_PASS=1
+    else
+        KERNEL_KCFLAGS="-mno-fdpic ${KERNEL_KCFLAGS}"
+        run_logged "build" kernel_make -j${MAKE_JOBS} KAFLAGS=-mno-fdpic KALLSYMS_EXTRA_PASS=1
+    fi
+
+    REPORT_SUBDIR=${KERNEL_REPORT_DIR}/${KERNEL_EXPERIMENT}
+    mkdir -p "${REPORT_SUBDIR}"
+    run_logged "kernel size report" "${ROOTDIR}/scripts/kernel-size-report.sh" \
+        "${ROOTDIR}" "${ROOTDIR}/linux-${LINUX_VERSION}" "${ROOTDIR}/bootwrapper" "${REPORT_SUBDIR}"
     cd ../
+}
+
+snapshot_kernel_artifacts() {
+    SNAPDIR=$1
+
+    mkdir -p "${SNAPDIR}"
+    cp "linux-${LINUX_VERSION}/vmlinux" "${SNAPDIR}/vmlinux"
+    cp "linux-${LINUX_VERSION}/System.map" "${SNAPDIR}/System.map"
+    cp "linux-${LINUX_VERSION}/.config" "${SNAPDIR}/kernel.config"
+    cp "linux-${LINUX_VERSION}/arch/arm/boot/Image" "${SNAPDIR}/Image"
+    cp "bootwrapper/linux.axf" "${SNAPDIR}/linux.axf"
+}
+
+restore_kernel_artifacts() {
+    SNAPDIR=$1
+
+    cp "${SNAPDIR}/vmlinux" "linux-${LINUX_VERSION}/vmlinux"
+    cp "${SNAPDIR}/System.map" "linux-${LINUX_VERSION}/System.map"
+    cp "${SNAPDIR}/kernel.config" "linux-${LINUX_VERSION}/.config"
+    cp "${SNAPDIR}/Image" "linux-${LINUX_VERSION}/arch/arm/boot/Image"
+    cp "${SNAPDIR}/linux.axf" "bootwrapper/linux.axf"
+}
+
+linux_axf_size() {
+    wc -c <"${ROOTDIR}/bootwrapper/linux.axf" | tr -d ' '
+}
+
+validate_kernel_image() {
+    OUTDIR=$1
+
+    mkdir -p "${OUTDIR}"
+    run_logged "validate qemu workload" "${ROOTDIR}/scripts/validate-qemu.sh" \
+        "${ROOTDIR}/bootwrapper/linux.axf" \
+        "${OUTDIR}/qemu-validate.log" \
+        "${PGO_WORKLOAD_FILE}"
+}
+
+record_candidate_result() {
+    NAME=$1
+    OUTDIR=$2
+    SIZE=$3
+
+    {
+        echo "candidate=${NAME}"
+        echo "linux_axf_bytes=${SIZE}"
+    } >"${OUTDIR}/result.txt"
+}
+
+compose_kernel_config_fragment() {
+    OUTPUT=$1
+    shift
+
+    : >"${OUTPUT}"
+    for FRAGMENT in "$@"; do
+        if [ -n "${FRAGMENT}" ] && [ -f "${FRAGMENT}" ]; then
+            cat "${FRAGMENT}" >>"${OUTPUT}"
+            printf '\n' >>"${OUTPUT}"
+        fi
+    done
+}
+
+build_candidate_kernel() {
+    NAME=$1
+    EXPERIMENT=$2
+    ORDER_FILE=$3
+    CONFIG_FRAGMENT=$4
+    REPORT_ROOT=$5
+    SNAPDIR=$6
+
+    stage_clean linux
+    stage_clean bootwrapper
+    (
+        KERNEL_EXPERIMENT="${EXPERIMENT}" \
+        KERNEL_ORDER_FILE="${ORDER_FILE}" \
+        KERNEL_CONFIG_FRAGMENT="${CONFIG_FRAGMENT}" \
+        KERNEL_REPORT_DIR="${REPORT_ROOT}" \
+        build_linux
+    )
+    (
+        KERNEL_EXPERIMENT="${EXPERIMENT}" \
+        KERNEL_ORDER_FILE="${ORDER_FILE}" \
+        KERNEL_CONFIG_FRAGMENT="${CONFIG_FRAGMENT}" \
+        KERNEL_REPORT_DIR="${REPORT_ROOT}" \
+        build_bootwrapper
+    )
+    validate_kernel_image "${REPORT_ROOT}/validation"
+    snapshot_kernel_artifacts "${SNAPDIR}"
+    record_candidate_result "${NAME}" "${SNAPDIR}" "$(linux_axf_size)"
+}
+
+build_kernel_pgo_cycle() {
+    CYCLE_DIR=${KERNEL_REPORT_DIR}/cycle
+    BASELINE_DIR=${CYCLE_DIR}/baseline
+    FINAL_DIR=${CYCLE_DIR}/final
+    CONFIG_DIR=${CYCLE_DIR}/configs
+    BASELINE_SNAP=${CYCLE_DIR}/artifacts/baseline
+    CONFIG_SNAP=${CYCLE_DIR}/artifacts/config-only
+    ORDER_SNAP=${CYCLE_DIR}/artifacts/llvm-order
+    mkdir -p "${BASELINE_DIR}" "${FINAL_DIR}" "${CONFIG_DIR}" "${CYCLE_DIR}/artifacts"
+
+    if [ ! -f "${PGO_WORKLOAD_FILE}" ]; then
+        echo "ERROR: missing PGO workload file: ${PGO_WORKLOAD_FILE}"
+        exit 1
+    fi
+
+    echo "BUILD: kernel PGO cycle step 1/3 - baseline kernel build"
+    build_candidate_kernel "baseline" "none" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
+    BASELINE_SIZE=$(linux_axf_size)
+
+    echo "BUILD: kernel PGO cycle step 2/3 - QEMU trace collection"
+    run_logged "collect kernel profile" "${ROOTDIR}/scripts/collect-kernel-profile.sh" \
+        "${ROOTDIR}/bootwrapper/linux.axf" \
+        "${ROOTDIR}/linux-${LINUX_VERSION}/vmlinux" \
+        "${BASELINE_DIR}/kernel"
+
+    run_logged "analyze kernel profile" "${ROOTDIR}/scripts/analyze-kernel-pgo.py" \
+        --profile-prefix "${BASELINE_DIR}/kernel/kernel" \
+        --linux-dir "${ROOTDIR}/linux-${LINUX_VERSION}" \
+        --output-dir "${CONFIG_DIR}"
+
+    MERGED_CONFIG=${CONFIG_DIR}/pgo-kernel.merged.config
+    compose_kernel_config_fragment "${MERGED_CONFIG}" \
+        "${PGO_BASE_CONFIG_FRAGMENT}" \
+        "${CONFIG_DIR}/pgo-kernel.config"
+
+    echo "BUILD: kernel PGO cycle step 3/3 - PGO rebuild with generated config fragment"
+    build_candidate_kernel "config-only" "none" "" "${MERGED_CONFIG}" \
+        "${CYCLE_DIR}/config-only" "${CONFIG_SNAP}"
+    CONFIG_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${CONFIG_SNAP}/result.txt")
+    CONFIG_SIZE=${CONFIG_SIZE:-0}
+
+    build_candidate_kernel "llvm-order" "llvm-order-use" "${BASELINE_DIR}/kernel/kernel_ld_profile.txt" \
+        "${MERGED_CONFIG}" "${CYCLE_DIR}/llvm-order" "${ORDER_SNAP}"
+    ORDER_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${ORDER_SNAP}/result.txt")
+    ORDER_SIZE=${ORDER_SIZE:-0}
+
+    BEST_NAME=baseline
+    BEST_SNAP=${BASELINE_SNAP}
+    BEST_SIZE=${BASELINE_SIZE}
+
+    if [ "${CONFIG_SIZE}" -gt 0 ] && [ "${CONFIG_SIZE}" -lt "${BEST_SIZE}" ]; then
+        BEST_NAME=config-only
+        BEST_SNAP=${CONFIG_SNAP}
+        BEST_SIZE=${CONFIG_SIZE}
+    fi
+
+    if [ "${ORDER_SIZE}" -gt 0 ] && [ "${ORDER_SIZE}" -lt "${BEST_SIZE}" ]; then
+        BEST_NAME=llvm-order
+        BEST_SNAP=${ORDER_SNAP}
+        BEST_SIZE=${ORDER_SIZE}
+    fi
+
+    if [ "${BEST_NAME}" = "baseline" ]; then
+        echo "PGO: no candidate improved linux.axf size; keeping baseline"
+        echo "  baseline:    ${BASELINE_SIZE}"
+        echo "  config-only: ${CONFIG_SIZE}"
+        echo "  llvm-order:  ${ORDER_SIZE}"
+    fi
+
+    restore_kernel_artifacts "${BEST_SNAP}"
+
+    {
+        echo "selected_candidate=${BEST_NAME}"
+        echo "baseline_linux_axf_bytes=${BASELINE_SIZE}"
+        echo "selected_linux_axf_bytes=${BEST_SIZE}"
+    } >"${FINAL_DIR}/selected-candidate.txt"
+
+    run_logged "collect final kernel profile" "${ROOTDIR}/scripts/collect-kernel-profile.sh" \
+        "${ROOTDIR}/bootwrapper/linux.axf" \
+        "${ROOTDIR}/linux-${LINUX_VERSION}/vmlinux" \
+        "${FINAL_DIR}/kernel"
+    validate_kernel_image "${FINAL_DIR}/validation"
+
+    # Do not stamp linux/bootwrapper as the default build outputs here.
+    # This stage may restore an experimental or PGO-tuned image, and a
+    # later plain ./build.sh must rebuild the standard kernel path.
 }
 
 # QEMU's Cortex-M machine models lack the direct kernel/DTB loading
@@ -681,6 +950,11 @@ build_bootwrapper() {
         LD="${TOOLCHAIN}/bin/${TARGET}-ld" \
         AS="${TOOLCHAIN}/bin/${TARGET}-as"
 
+    REPORT_SUBDIR=${KERNEL_REPORT_DIR}/${KERNEL_EXPERIMENT}
+    mkdir -p "${REPORT_SUBDIR}"
+    run_logged "refresh kernel size report" "${ROOTDIR}/scripts/kernel-size-report.sh" \
+        "${ROOTDIR}" "${ROOTDIR}/linux-${LINUX_VERSION}" "${ROOTDIR}/bootwrapper" "${REPORT_SUBDIR}"
+
     cd ../
 }
 
@@ -702,22 +976,24 @@ if [ "${1:-}" = "clean" ]; then
     exit 0
 fi
 
-ALL_STAGES="binutils gcc linux_headers uClibc busybox finalize_rootfs linux bootwrapper"
+DEFAULT_STAGES="binutils gcc linux_headers uClibc busybox finalize_rootfs linux bootwrapper"
+ALL_STAGES="${DEFAULT_STAGES} kernel_pgo_cycle"
 
 if [ "$#" = 0 ]; then
-    STAGES="${ALL_STAGES}"
+    STAGES="${DEFAULT_STAGES}"
 else
     STAGES=""
     for arg in "$@"; do
         case "${arg}" in
-        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper)
+        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper | kernel_pgo_cycle)
             STAGES="${STAGES} ${arg}"
             ;;
         *)
             echo "usage: build.sh [clean]"
             echo "       build.sh <stage> [<stage> ...]"
             echo ""
-            echo "stages: ${ALL_STAGES}"
+            echo "default stages: ${DEFAULT_STAGES}"
+            echo "all stages: ${ALL_STAGES}"
             exit 1
             ;;
         esac
