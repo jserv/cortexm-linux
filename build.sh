@@ -593,8 +593,8 @@ build_linux() {
     echo "CONFIG_INITRAMFS_SOURCE=\"${ROOTFS} ${ROOTDIR}/configs/rootfs.dev\"" >>.config
     echo "CONFIG_INITRAMFS_COMPRESSION_GZIP=y" >>.config
 
-    # Enable linux-tiny size reductions
-    echo "CONFIG_NET_SMALL=y" >>.config
+    # This board has no NIC and no remaining userspace networking needs.
+    sed -i 's/^CONFIG_NET=y/# CONFIG_NET is not set/' .config
     echo "CONFIG_MAX_SWAPFILES_SHIFT=0" >>.config
     echo "# CONFIG_CRC32_TABLES is not set" >>.config
     echo "CONFIG_PROC_STRIPPED=y" >>.config
@@ -632,6 +632,7 @@ build_linux() {
 
     # Verify critical config options survived olddefconfig resolution
     for opt in \
+        "# CONFIG_NET is not set" \
         "# CONFIG_SYSFS is not set" \
         "CONFIG_BLK_DEV_INITRD=y" \
         "CONFIG_BASE_SMALL=y" \
