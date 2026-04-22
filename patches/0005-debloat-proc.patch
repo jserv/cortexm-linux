@@ -55,6 +55,90 @@ index b7cab1ad9..e19f627a2 100644
  	proc_create_seq("consoles", 0, NULL, &consoles_op);
  	return 0;
  }
+diff --git a/fs/proc/cpuinfo.c b/fs/proc/cpuinfo.c
+index c1c74550c..8e3d653ef 100644
+--- a/fs/proc/cpuinfo.c
++++ b/fs/proc/cpuinfo.c
+@@ -21,6 +21,9 @@ static const struct proc_ops cpuinfo_proc_ops = {
+ 
+ static int __init proc_cpuinfo_init(void)
+ {
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	proc_create("cpuinfo", 0, NULL, &cpuinfo_proc_ops);
+ 	return 0;
+ }
+diff --git a/fs/proc/devices.c b/fs/proc/devices.c
+index 3f97a8101..176324843 100644
+--- a/fs/proc/devices.c
++++ b/fs/proc/devices.c
+@@ -54,6 +54,9 @@ static const struct seq_operations devinfo_ops = {
+ 
+ static int __init proc_devices_init(void)
+ {
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	struct proc_dir_entry *pde;
+ 
+ 	pde = proc_create_seq("devices", 0, NULL, &devinfo_ops);
+diff --git a/fs/proc/interrupts.c b/fs/proc/interrupts.c
+index 2204a0904..bd548c02f 100644
+--- a/fs/proc/interrupts.c
++++ b/fs/proc/interrupts.c
+@@ -35,6 +35,9 @@ static const struct seq_operations int_seq_ops = {
+ 
+ static int __init proc_interrupts_init(void)
+ {
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	proc_create_seq("interrupts", 0, NULL, &int_seq_ops);
+ 	return 0;
+ }
+diff --git a/fs/proc/loadavg.c b/fs/proc/loadavg.c
+index 0800e8b91..a1f22a0d0 100644
+--- a/fs/proc/loadavg.c
++++ b/fs/proc/loadavg.c
+@@ -27,6 +27,9 @@ static int loadavg_proc_show(struct seq_file *m, void *v)
+ 
+ static int __init proc_loadavg_init(void)
+ {
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	struct proc_dir_entry *pde;
+ 
+ 	pde = proc_create_single("loadavg", 0, NULL, loadavg_proc_show);
+diff --git a/fs/proc/meminfo.c b/fs/proc/meminfo.c
+index 8cefd9b64..f260bfc7d 100644
+--- a/fs/proc/meminfo.c
++++ b/fs/proc/meminfo.c
+@@ -171,6 +171,9 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
+ 
+ static int __init proc_meminfo_init(void)
+ {
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	struct proc_dir_entry *pde;
+ 
+ 	pde = proc_create_single("meminfo", 0, NULL, meminfo_proc_show);
+diff --git a/fs/proc/stat.c b/fs/proc/stat.c
+index c6b18de07..1f2434245 100644
+--- a/fs/proc/stat.c
++++ b/fs/proc/stat.c
+@@ -209,6 +209,9 @@ static const struct proc_ops stat_proc_ops = {
+ 
+ static int __init proc_stat_init(void)
+ {
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	proc_create("stat", 0, NULL, &stat_proc_ops);
+ 	return 0;
+ }
 diff --git a/fs/proc/proc_tty.c b/fs/proc/proc_tty.c
 index 5c6a5ceab..0e83f4dae 100644
 --- a/fs/proc/proc_tty.c
@@ -91,6 +175,20 @@ index 5c6a5ceab..0e83f4dae 100644
  	if (!proc_mkdir("tty", NULL))
  		return;
  	proc_mkdir("tty/ldisc", NULL);	/* Preserved: it's userspace visible */
+diff --git a/fs/proc/uptime.c b/fs/proc/uptime.c
+index 51147d782..624a2f61d 100644
+--- a/fs/proc/uptime.c
++++ b/fs/proc/uptime.c
+@@ -39,6 +39,9 @@ static int uptime_proc_show(struct seq_file *m, void *v)
+ 
+ static int __init proc_uptime_init(void)
+ {
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	struct proc_dir_entry *pde;
+ 
+ 	pde = proc_create_single("uptime", 0, NULL, uptime_proc_show);
 diff --git a/include/net/snmp.h b/include/net/snmp.h
 index 584e70742..91d54169c 100644
 --- a/include/net/snmp.h
@@ -195,6 +293,28 @@ index 33f07c5f2..4c226a052 100644
  	proc_create_single("execdomains", 0, NULL, execdomains_proc_show);
  	return 0;
  }
+diff --git a/include/linux/sysctl.h b/include/linux/sysctl.h
+index 51d8e507e..4299fbca5 100644
+--- a/include/linux/sysctl.h
++++ b/include/linux/sysctl.h
+@@ -258,10 +258,15 @@ struct ctl_table_header *register_sysctl_sz(const char *path, const struct ctl_t
+ void unregister_sysctl_table(struct ctl_table_header * table);
+ 
+ extern int sysctl_init_bases(void);
+ extern void __register_sysctl_init(const char *path, const struct ctl_table *table,
+ 				 const char *table_name, size_t table_size);
+-#define register_sysctl_init(path, table)	\
+-	__register_sysctl_init(path, table, #table, ARRAY_SIZE(table))
++#ifndef CONFIG_PROC_STRIPPED
++#define register_sysctl_init(path, table)	\
++	__register_sysctl_init(path, table, #table, ARRAY_SIZE(table))
++#else
++#define register_sysctl_init(path, table)	\
++	do { } while (0)
++#endif
+ extern struct ctl_table_header *register_sysctl_mount_point(const char *path);
+ 
+ void do_sysctl_args(void);
 diff --git a/kernel/irq/proc.c b/kernel/irq/proc.c
 index b0999a4f1..444bac289 100644
 --- a/kernel/irq/proc.c
@@ -256,26 +376,20 @@ index 61caa55a4..729f1e45c 100644
  	proc_create_single("vmallocinfo", 0400, NULL, vmalloc_info_show);
  	return 0;
  }
-diff --git a/mm/vmstat.c b/mm/vmstat.c
-index 86b14b0f7..7a72c8e0f 100644
---- a/mm/vmstat.c
-+++ b/mm/vmstat.c
-@@ -2288,10 +2288,12 @@ void __init init_mm_internals(void)
- 	start_shepherd_timer();
- #endif
- #ifdef CONFIG_PROC_FS
--	proc_create_seq("buddyinfo", 0444, NULL, &fragmentation_op);
--	proc_create_seq("pagetypeinfo", 0400, NULL, &pagetypeinfo_op);
-+	if (!IS_ENABLED(CONFIG_PROC_STRIPPED)) {
-+		proc_create_seq("buddyinfo", 0444, NULL, &fragmentation_op);
-+		proc_create_seq("pagetypeinfo", 0400, NULL, &pagetypeinfo_op);
-+		proc_create_seq("zoneinfo", 0444, NULL, &zoneinfo_op);
-+	}
- 	proc_create_seq("vmstat", 0444, NULL, &vmstat_op);
--	proc_create_seq("zoneinfo", 0444, NULL, &zoneinfo_op);
- 	register_sysctl_init("vm", vmstat_table);
- #endif
- }
+diff --git a/fs/proc/proc_sysctl.c b/fs/proc/proc_sysctl.c
+index dd3c0a32e..412ab91f8 100644
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -1560,6 +1560,9 @@ int __init proc_sys_init(void)
+ {
+ 	struct proc_dir_entry *proc_sys_root;
+ 
++	if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++		return 0;
++
+ 	proc_sys_root = proc_mkdir("sys", NULL);
+ 	proc_sys_root->proc_iops = &proc_sys_dir_operations;
+ 	proc_sys_root->proc_dir_ops = &proc_sys_dir_file_operations;
 diff --git a/net/8021q/vlanproc.c b/net/8021q/vlanproc.c
 index fa67374bd..3434370ab 100644
 --- a/net/8021q/vlanproc.c
@@ -444,7 +558,42 @@ index 463236e0d..6580854f9 100644
 +
  	return register_pernet_subsys(&ip_rt_proc_ops);
  }
+
+diff --git a/lib/vsprintf.c b/lib/vsprintf.c
+index 5e6564077..df11f8b87 100644
+--- a/lib/vsprintf.c
++++ b/lib/vsprintf.c
+@@ -2536,6 +2536,8 @@
+ 		return symbol_string(buf, end, ptr, spec, fmt);
+ 	case 'R':
+ 	case 'r':
++		if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++			return default_pointer(buf, end, ptr, spec);
+ 		return resource_or_range(fmt, buf, end, ptr, spec);
+ 	case 'h':
+ 		return hex_string(buf, end, ptr, spec, fmt);
+@@ -2578,8 +2580,12 @@
+ 	case 'd':
+ 		return dentry_name(buf, end, ptr, spec, fmt);
+ 	case 't':
++		if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++			return default_pointer(buf, end, ptr, spec);
+ 		return time_and_date(buf, end, ptr, spec, fmt);
+ 	case 'C':
++		if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++			return default_pointer(buf, end, ptr, spec);
+ 		return clock(buf, end, ptr, spec, fmt);
+ 	case 'D':
+ 		return file_dentry_name(buf, end, ptr, spec, fmt);
+@@ -2589,6 +2595,8 @@
+ #endif
+ 
+ 	case 'G':
++		if (IS_ENABLED(CONFIG_PROC_STRIPPED))
++			return default_pointer(buf, end, ptr, spec);
+ 		return flags_string(buf, end, ptr, spec, fmt);
+ 	case 'O':
+ 		return device_node_string(buf, end, ptr, spec, fmt + 1);
  
 -- 
 2.43.0
-

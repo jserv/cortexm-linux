@@ -4,10 +4,11 @@ set image [lindex $argv 0]
 set log_path [lindex $argv 1]
 set timeout_seconds [lindex $argv 2]
 set boot_marker [lindex $argv 3]
-set workload_path [lindex $argv 4]
+set manifest_path [lindex $argv 4]
+set workload_path [lindex $argv 5]
 
-if {$image eq "" || $log_path eq "" || $timeout_seconds eq "" || $boot_marker eq "" || $workload_path eq ""} {
-    send_user "ERROR: missing QEMU validation arguments\n"
+if {$image eq "" || $log_path eq "" || $timeout_seconds eq "" || $boot_marker eq "" || $manifest_path eq "" || $workload_path eq ""} {
+    send_user "ERROR: missing QEMU profiling arguments\n"
     exit 1
 }
 
@@ -16,9 +17,22 @@ match_max 1048576
 log_user 0
 log_file -noappend $log_path
 
+set manifest [open $manifest_path "w"]
+puts $manifest "profiler=qemu-system-arm"
+puts $manifest "machine=mps2-an386"
+puts $manifest "cpu=cortex-m4"
+puts $manifest "mode=system"
+puts $manifest "image=$image"
+puts $manifest "trace_log=$env(QEMU_LOG_FILENAME)"
+puts $manifest "trace_selector=$env(QEMU_LOG)"
+puts $manifest "icount=shift=0"
+puts $manifest "boot_marker=$boot_marker"
+puts $manifest "workload_file=$workload_path"
+close $manifest
+
 proc wait_for_shell {} {
-    for {set attempt 0} {$attempt < 6} {incr attempt} {
-        set marker "__SHELL_READY__$attempt"
+    for {set attempt 0} {$attempt < 8} {incr attempt} {
+        set marker "__PROFILE_READY__$attempt"
         send -- "busybox echo ${marker}\r"
         expect {
             -re $marker { return }
@@ -26,7 +40,7 @@ proc wait_for_shell {} {
                 send -- "\r"
             }
             eof {
-                send_user "ERROR: QEMU exited before the shell became ready\n"
+                send_user "ERROR: QEMU exited before shell became ready\n"
                 exit 1
             }
         }
@@ -73,7 +87,7 @@ proc load_workload {workload_path} {
     return $steps
 }
 
-proc run_guest_check {command expected marker} {
+proc run_guest_step {command expected marker} {
     set begin_marker "__BEGIN_${marker}__"
     send -- "busybox echo ${begin_marker}; ${command}; busybox echo ${marker}\r"
 
@@ -94,7 +108,7 @@ proc run_guest_check {command expected marker} {
     expect {
         -re $expected {}
         timeout {
-            send_user "ERROR: command did not emit expected output: ${command}\n"
+            send_user "ERROR: guest command did not emit expected output: ${command}\n"
             exit 1
         }
         eof {
@@ -103,9 +117,9 @@ proc run_guest_check {command expected marker} {
         }
     }
     expect {
-        -re $marker {}
+        -re $marker { return }
         timeout {
-            send_user "ERROR: command marker not reached: ${command}\n"
+            send_user "ERROR: guest command marker not reached: ${command}\n"
             exit 1
         }
         eof {
@@ -120,7 +134,10 @@ spawn qemu-system-arm \
     -cpu cortex-m4 \
     -nographic \
     -no-reboot \
-    -kernel $image
+    -kernel $image \
+    -icount shift=0 \
+    -d $env(QEMU_LOG) \
+    -D $env(QEMU_LOG_FILENAME)
 
 expect {
     -re $boot_marker {}
@@ -142,11 +159,11 @@ foreach step $workload_steps {
     set label [lindex $step 0]
     set command [lindex $step 1]
     set expected [lindex $step 2]
-    run_guest_check $command $expected "__VALIDATE_${label}_${step_index}__"
+    run_guest_step $command $expected "__PROFILE_${label}_${step_index}__"
     incr step_index
 }
 
 send -- "\001x"
 expect eof
 
-puts "QEMU validation passed: booted Linux and exercised configured workload"
+puts "QEMU profile run passed"
