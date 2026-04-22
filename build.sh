@@ -4,7 +4,7 @@
 #
 # This script produces a self-contained, bootable Linux image targeting the Arm
 # MPS2-AN386 FPGA platform (Cortex-M4, no MMU, Thumb-2 only).
-# It builds a first-pass GCC cross-compiler (C only), uClibc-ng as C library,
+# It builds a first-pass GCC cross-compiler (C only), shared FDPIC uClibc-ng,
 # BusyBox for a minimal userspace, and a Linux kernel with embedded initramfs.
 
 set -e
@@ -12,12 +12,11 @@ set -e
 # shellcheck disable=SC2329
 
 CPU=arm
-TARGET=arm-uclinuxeabi
-FLAVOR=cortexm-flt
+TARGET=arm-uclinuxfdpiceabi
+FLAVOR=cortexm-fdpic
 
 BINUTILS_VERSION=2.46.0
 GCC_VERSION=15.2.0
-ELF2FLT_VERSION=2024.05
 UCLIBC_NG_VERSION=1.0.57
 BUSYBOX_VERSION=1.37.0
 LINUX_VERSION=7.0
@@ -26,7 +25,6 @@ BINUTILS_URL=https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.x
 GCC_URL=https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz
 UCLIBC_NG_URL=https://downloads.uclibc-ng.org/releases/${UCLIBC_NG_VERSION}/uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz
 BUSYBOX_URL=https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
-ELF2FLT_URL=https://github.com/uclinux-dev/elf2flt/archive/refs/tags/v${ELF2FLT_VERSION}.tar.gz
 LINUX_URL=https://www.kernel.org/pub/linux/kernel/v7.x/linux-${LINUX_VERSION}.tar.xz
 
 ROOTDIR=$(cd "$(dirname "$0")" >/dev/null && pwd)
@@ -52,7 +50,6 @@ CHECKSUM_binutils="binutils-${BINUTILS_VERSION}.tar.xz=d75a94f4d73e7a4086f7513e6
 CHECKSUM_gcc="gcc-${GCC_VERSION}.tar.xz=438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
 CHECKSUM_uclibc="uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz=8bc734b584e23ff6ae3d0ebb4c0fb1d1d814c58c82822b93130d436afa7ace8b"
 CHECKSUM_busybox="busybox-${BUSYBOX_VERSION}.tar.bz2=3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
-CHECKSUM_elf2flt="v${ELF2FLT_VERSION}.tar.gz=9fd899d0c66552ecb175ff6764e5af810aa1bb78db38a64768a1b97c3c62199d"
 CHECKSUM_linux="linux-${LINUX_VERSION}.tar.xz=bb7f6d80b387c757b7d14bb93028fcb90f793c5c0d367736ee815a100b3891f0"
 
 toolchain_fingerprint() {
@@ -76,7 +73,7 @@ IMAGE_FP=$(image_fingerprint "${TOOLCHAIN_FP}")
 
 stage_fingerprint() {
     case "$1" in
-    binutils|gcc|linux_headers|uClibc|elf2flt)
+    binutils|gcc|linux_headers|uClibc)
         printf '%s' "${TOOLCHAIN_FP}" ;;
     *)
         printf '%s' "${IMAGE_FP}" ;;
@@ -146,16 +143,27 @@ stage_verify_uClibc() {
     [ -f "${TOOLCHAIN}/${TARGET}/lib/libc.a" ] || [ -f "${TOOLCHAIN}/${TARGET}/lib/libc.so" ]
 }
 
-stage_verify_elf2flt() {
-    [ -x "${TOOLCHAIN}/bin/${TARGET}-elf2flt" ]
-}
-
 stage_verify_busybox() {
     [ -x "${ROOTFS}/bin/busybox" ]
 }
 
 stage_verify_finalize_rootfs() {
-    [ -x "${ROOTFS}/etc/rc" ] && [ -L "${ROOTFS}/init" ]
+    [ -x "${ROOTFS}/etc/rc" ] && [ -L "${ROOTFS}/init" ] || return 1
+
+    # FDPIC rootfs must contain the dynamic loader and shared libraries
+    # that busybox was linked against.
+    READELF=${TOOLCHAIN}/bin/${TARGET}-readelf
+    [ -x "${READELF}" ] || return 0
+
+    INTERP=$(LC_ALL=C "${READELF}" -l "${ROOTFS}/bin/busybox" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
+    [ -z "${INTERP}" ] && return 0
+    [ -e "${ROOTFS}${INTERP}" ] || return 1
+
+    _needed_libs=$(LC_ALL=C "${READELF}" -d "${ROOTFS}/bin/busybox" 2>/dev/null |
+        sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
+    for needed in ${_needed_libs}; do
+        [ -e "${ROOTFS}/lib/${needed}" ] || [ -e "${ROOTFS}/usr/lib/${needed}" ] || return 1
+    done
 }
 
 stage_verify_linux() {
@@ -186,7 +194,6 @@ stage_clean() {
     gcc)            rm -rf "gcc-${GCC_VERSION}" ;;
     linux_headers)  rm -rf "linux-${LINUX_VERSION}" ;;  # shared with linux; both extract fresh
     uClibc)         rm -rf "uClibc-ng-${UCLIBC_NG_VERSION}" ;;
-    elf2flt)        rm -rf "elf2flt-${ELF2FLT_VERSION}" ;;
     busybox)        rm -rf "busybox-${BUSYBOX_VERSION}" "${ROOTFS}" ;;
     finalize_rootfs) ;; # idempotent; overwrites its outputs
     linux)          rm -rf "linux-${LINUX_VERSION}" ;;
@@ -256,15 +263,6 @@ patch_already_applied() {
         grep -q "config LTO_GCC" arch/Kconfig &&
             [ -f scripts/Makefile.lto ]
         ;;
-    0007-*)
-        grep -q "ZSTD_decompress" configure
-        ;;
-    0008-*)
-        grep -q "PRIx64" elf2flt.c
-        ;;
-    0009-*)
-        grep -q "thumb2_movwt_imm16" elf2flt.c
-        ;;
     *)
         return 1
         ;;
@@ -327,7 +325,7 @@ build_gcc() {
     cd ${TARGET}
     run_logged "configure" ../configure --target=${TARGET} \
         --prefix=${TOOLCHAIN} \
-        --enable-multilib \
+        --disable-multilib \
         --disable-shared \
         --disable-libssp \
         --disable-threads \
@@ -339,6 +337,9 @@ build_gcc() {
         --disable-libmpx \
         --without-headers \
         --with-system-zlib \
+        --with-arch=armv7e-m \
+        --with-mode=thumb \
+        --with-float=soft \
         --enable-languages=c
     run_logged "build" make -j${MAKE_JOBS}
     run_logged "install" make install
@@ -369,36 +370,16 @@ build_uClibc() {
 
     TOOLCHAIN_ESCAPED=$(echo ${TOOLCHAIN}/${TARGET} | sed 's/\//\\\//g')
     sed -i "s/^KERNEL_HEADERS=.*\$/KERNEL_HEADERS=\"${TOOLCHAIN_ESCAPED}\/include\"/" .config
-    sed -i "s/^RUNTIME_PREFIX=.*\$/RUNTIME_PREFIX=\"${TOOLCHAIN_ESCAPED}\"/" .config
-    sed -i "s/^DEVEL_PREFIX=.*\$/DEVEL_PREFIX=\"${TOOLCHAIN_ESCAPED}\"/" .config
+    # Use a target-relative runtime prefix so PT_INTERP inside built ELFs
+    # references /lib/ld-uClibc.so.0 instead of the host toolchain path.
+    # Keep development files at the sysroot root because GCC is not
+    # configured with an extra /usr sysroot suffix for target headers/crt.
+    sed -i 's/^RUNTIME_PREFIX=.*$/RUNTIME_PREFIX="\/"/' .config
+    sed -i 's/^DEVEL_PREFIX=.*$/DEVEL_PREFIX="\/"/' .config
 
     run_logged "oldconfig" sh -c "make oldconfig CROSS=${TARGET}- TARGET_ARCH=${CPU} </dev/null"
-    run_logged "build and install" make -j${MAKE_JOBS} install CROSS=${TARGET}- TARGET_ARCH=${CPU}
-    cd ../
-}
-
-build_elf2flt() {
-    echo "BUILD: building elf2flt-${ELF2FLT_VERSION}"
-    fetch_file "${ELF2FLT_URL}" "${CHECKSUM_elf2flt}"
-
-    extract_source "v${ELF2FLT_VERSION}.tar.gz" "elf2flt-${ELF2FLT_VERSION}" -xzf
-    cd elf2flt-${ELF2FLT_VERSION}
-
-    # Apply elf2flt patches for newer binutils compatibility
-    for p in ../patches/0007-*.patch ../patches/0008-*.patch ../patches/0009-*.patch; do
-        [ -f "${p}" ] || continue
-        apply_patch_once "${p}"
-    done
-
-    run_logged "configure" ./configure --disable-werror \
-        --with-binutils-include-dir=${ROOTDIR}/binutils-${BINUTILS_VERSION}/include \
-        --with-bfd-include-dir=${ROOTDIR}/binutils-${BINUTILS_VERSION}/bfd \
-        --with-libbfd=${ROOTDIR}/binutils-${BINUTILS_VERSION}/bfd/.libs/libbfd.a \
-        --with-libiberty=${ROOTDIR}/binutils-${BINUTILS_VERSION}/libiberty/libiberty.a \
-        --prefix=${TOOLCHAIN} \
-        --target=${TARGET}
-    run_logged "build" make -j${MAKE_JOBS}
-    run_logged "install" make install
+    run_logged "build and install" make -j${MAKE_JOBS} install CROSS=${TARGET}- TARGET_ARCH=${CPU} \
+        DESTDIR="${TOOLCHAIN}/${TARGET}"
     cd ../
 }
 
@@ -411,9 +392,10 @@ build_busybox() {
     cd busybox-${BUSYBOX_VERSION}
 
     sed -i 's/# CONFIG_NOMMU is not set/CONFIG_NOMMU=y/' .config
-    sed -i 's/CONFIG_EXTRA_CFLAGS=""/CONFIG_EXTRA_CFLAGS="-mthumb -march=armv7e-m -ffunction-sections -fdata-sections -fipa-icf"/' .config
-    # gc-sections passes through elf2flt wrapper to ld.real; limited effect
-    # on FLAT binaries but enables dead-section stripping at ELF stage
+    sed -i 's/# CONFIG_PIE is not set/CONFIG_PIE=y/' .config
+    sed -i "s|CONFIG_EXTRA_CFLAGS=\"\"|CONFIG_EXTRA_CFLAGS=\"--sysroot=${TOOLCHAIN}/${TARGET} -mthumb -march=armv7e-m -ffunction-sections -fdata-sections -fipa-icf -Os\"|" .config
+    # With FDPIC PIE userspace, gc-sections strips dead ELF sections before
+    # the final link while preserving shared-library dynamic linking.
     sed -i 's/CONFIG_EXTRA_LDFLAGS=""/CONFIG_EXTRA_LDFLAGS="-Wl,--gc-sections"/' .config
 
     # Reinstall into a clean rootfs so disabled applets do not leave stale links.
@@ -424,10 +406,154 @@ build_busybox() {
     cd ../
 }
 
+copy_runtime_src() {
+    SRC=$1
+
+    # Canonicalize both the sysroot prefix and the source path to defeat
+    # symlink-based escapes (e.g. ../../outside passing a lexical prefix check).
+    SYSROOT_REAL=$(cd "${TOOLCHAIN}/${TARGET}" && pwd -P)
+    SRC_REAL=$(cd "$(dirname "${SRC}")" && pwd -P)/$(basename "${SRC}")
+
+    case "${SRC_REAL}" in
+    "${SYSROOT_REAL}"/*) ;;
+    *)
+        echo "ERROR: runtime library '${SRC}' resolves to '${SRC_REAL}', outside ${SYSROOT_REAL}" >&2
+        exit 1
+        ;;
+    esac
+
+    rel=${SRC#${TOOLCHAIN}/${TARGET}/}
+    dst_dir=${ROOTFS}/$(dirname "${rel}")
+    mkdir -p "${dst_dir}"
+    cp -a "${SRC}" "${dst_dir}/"
+
+    if [ -L "${SRC}" ]; then
+        TARGET_NAME=$(readlink "${SRC}")
+        case "${TARGET_NAME}" in
+        /*)
+            TARGET_SRC=${TOOLCHAIN}/${TARGET}${TARGET_NAME}
+            ;;
+        *)
+            TARGET_SRC=$(dirname "${SRC}")/${TARGET_NAME}
+            ;;
+        esac
+        [ -e "${TARGET_SRC}" ] || {
+            echo "ERROR: runtime symlink target '${TARGET_SRC}' does not exist" >&2
+            exit 1
+        }
+        # Guard against circular symlinks: bail if we are about to copy
+        # the same canonical path we started from.
+        NEXT_REAL=$(cd "$(dirname "${TARGET_SRC}")" && pwd -P)/$(basename "${TARGET_SRC}")
+        if [ "${NEXT_REAL}" = "${SRC_REAL}" ]; then
+            echo "ERROR: circular symlink detected at '${SRC}'" >&2
+            exit 1
+        fi
+        copy_runtime_src "${TARGET_SRC}"
+    fi
+}
+
+copy_runtime_entry() {
+    NAME=$1
+    for libdir in "${TOOLCHAIN}/${TARGET}/lib" "${TOOLCHAIN}/${TARGET}/usr/lib"; do
+        SRC=${libdir}/${NAME}
+        [ -e "${SRC}" ] || continue
+        copy_runtime_src "${SRC}"
+        return 0
+    done
+
+    echo "ERROR: failed to locate runtime library '${NAME}' in ${TOOLCHAIN}/${TARGET}" >&2
+    exit 1
+}
+
+install_runtime_libraries() {
+    READELF=${TOOLCHAIN}/bin/${TARGET}-readelf
+    [ -x "${READELF}" ] || return 0
+
+    for libdir in "${ROOTFS}/lib" "${ROOTFS}/usr/lib"; do
+        rm -rf "${libdir}"
+    done
+
+    # Collect the interpreter.
+    INTERP=$(LC_ALL=C "${READELF}" -l "${ROOTFS}/bin/busybox" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
+    if [ -n "${INTERP}" ]; then
+        copy_runtime_entry "$(basename "${INTERP}")"
+    fi
+
+    # Seed the work queue with busybox, then walk DT_NEEDED transitively
+    # so that indirect dependencies (e.g. libpthread pulled by libc) are
+    # also copied into the rootfs.
+    _rt_queue="${ROOTFS}/bin/busybox"
+    _rt_done=""
+
+    while [ -n "${_rt_queue}" ]; do
+        # Pop first entry.
+        _rt_cur="${_rt_queue%%
+*}"
+        _rt_queue="${_rt_queue#${_rt_cur}}"
+        _rt_queue="${_rt_queue#
+}"
+
+        # Skip already-processed files.
+        case " ${_rt_done} " in
+        *" ${_rt_cur} "*) continue ;;
+        esac
+        _rt_done="${_rt_done} ${_rt_cur}"
+
+        LC_ALL=C "${READELF}" -d "${_rt_cur}" 2>/dev/null |
+            sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' |
+            while IFS= read -r needed; do
+                [ -n "${needed}" ] || continue
+                # Copy into rootfs if not already present.
+                for _chk in "${ROOTFS}/lib/${needed}" "${ROOTFS}/usr/lib/${needed}"; do
+                    [ -e "${_chk}" ] && continue 2
+                done
+                copy_runtime_entry "${needed}"
+            done
+
+        # Enqueue any newly copied libraries for transitive scanning.
+        for _libdir in "${ROOTFS}/lib" "${ROOTFS}/usr/lib"; do
+            [ -d "${_libdir}" ] || continue
+            for _f in "${_libdir}"/*.so "${_libdir}"/*.so.*; do
+                [ -f "${_f}" ] || continue
+                case " ${_rt_done} " in
+                *" ${_f} "*) continue ;;
+                esac
+                case "
+${_rt_queue}
+" in
+                *"
+${_f}
+"*) continue ;;
+                esac
+                _rt_queue="${_rt_queue}
+${_f}"
+            done
+        done
+    done
+}
+
+strip_rootfs_binaries() {
+    STRIP=${TOOLCHAIN}/bin/${TARGET}-strip
+    READELF=${TOOLCHAIN}/bin/${TARGET}-readelf
+    [ -x "${STRIP}" ] || return 0
+    [ -x "${READELF}" ] || return 0
+
+    find "${ROOTFS}" -type f \( -name 'busybox' -o -name '*.so' -o -name '*.so.*' \) \
+        -exec sh -c '
+            for f do
+                if "'"${READELF}"'" -h "$f" >/dev/null 2>&1; then
+                    "'"${STRIP}"'" --strip-unneeded "$f"
+                fi
+            done
+        ' sh {} +
+}
+
 build_finalize_rootfs() {
     echo "BUILD: finalizing rootfs"
 
     mkdir -p "${ROOTFS}/etc" "${ROOTFS}/proc"
+    install_runtime_libraries
+    strip_rootfs_binaries
 
     {
         echo "::sysinit:/bin/sh /etc/rc"
@@ -472,6 +598,13 @@ build_linux() {
     echo "CONFIG_MAX_SWAPFILES_SHIFT=0" >>.config
     echo "# CONFIG_CRC32_TABLES is not set" >>.config
     echo "CONFIG_PROC_STRIPPED=y" >>.config
+    echo "CONFIG_CC_OPTIMIZE_FOR_SIZE=y" >>.config
+
+    # FDPIC userspace replaces the previous FLAT pipeline.
+    echo "CONFIG_BINFMT_ELF_FDPIC=y" >>.config
+    echo "# CONFIG_BINFMT_FLAT is not set" >>.config
+    echo "# CONFIG_BINFMT_SCRIPT is not set" >>.config
+    echo "# CONFIG_COREDUMP is not set" >>.config
 
     # Enable GCC LTO for whole-kernel optimization
     echo "CONFIG_LTO_GCC=y" >>.config
@@ -498,14 +631,23 @@ build_linux() {
     run_logged "olddefconfig" sh -c "make ARCH=${CPU} CROSS_COMPILE=${TARGET}- olddefconfig </dev/null"
 
     # Verify critical config options survived olddefconfig resolution
-    for opt in "# CONFIG_SYSFS is not set" "CONFIG_BLK_DEV_INITRD=y" "CONFIG_BASE_SMALL=y" "# CONFIG_MULTIUSER is not set"; do
+    for opt in \
+        "# CONFIG_SYSFS is not set" \
+        "CONFIG_BLK_DEV_INITRD=y" \
+        "CONFIG_BASE_SMALL=y" \
+        "# CONFIG_MULTIUSER is not set" \
+        "CONFIG_BINFMT_ELF_FDPIC=y" \
+        "# CONFIG_BINFMT_FLAT is not set" \
+        "# CONFIG_BINFMT_SCRIPT is not set" \
+        "# CONFIG_COREDUMP is not set"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
         fi
     done
 
-    run_logged "build" make -j${MAKE_JOBS} ARCH=${CPU} CROSS_COMPILE=${TARGET}- KALLSYMS_EXTRA_PASS=1
+    run_logged "build" make -j${MAKE_JOBS} ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
+        KCFLAGS=-mno-fdpic KAFLAGS=-mno-fdpic KALLSYMS_EXTRA_PASS=1
     cd ../
 }
 
@@ -531,7 +673,10 @@ build_bootwrapper() {
     sed -i 's/0x60000000/0x21000000/' Makefile
     sed -i 's/. = PHYS_OFFSET;/. = 0x0;/' linux.lds.S
 
-    run_logged "build" make CROSS_COMPILE=${TARGET}-
+    run_logged "build" make CROSS_COMPILE=${TARGET}- \
+        CC="${TOOLCHAIN}/bin/${TARGET}-gcc -mno-fdpic" \
+        LD="${TOOLCHAIN}/bin/${TARGET}-ld" \
+        AS="${TOOLCHAIN}/bin/${TARGET}-as"
 
     cd ../
 }
@@ -545,7 +690,6 @@ if [ "${1:-}" = "clean" ]; then
     rm -rf gcc-${GCC_VERSION}
     rm -rf linux-${LINUX_VERSION}
     rm -rf uClibc-ng-${UCLIBC_NG_VERSION}
-    rm -rf elf2flt-${ELF2FLT_VERSION}
     rm -rf busybox-${BUSYBOX_VERSION}
     rm -rf bootwrapper
     rm -rf "${TOOLCHAIN}"
@@ -555,7 +699,7 @@ if [ "${1:-}" = "clean" ]; then
     exit 0
 fi
 
-ALL_STAGES="binutils gcc linux_headers uClibc elf2flt busybox finalize_rootfs linux bootwrapper"
+ALL_STAGES="binutils gcc linux_headers uClibc busybox finalize_rootfs linux bootwrapper"
 
 if [ "$#" = 0 ]; then
     STAGES="${ALL_STAGES}"
@@ -563,7 +707,7 @@ else
     STAGES=""
     for arg in "$@"; do
         case "${arg}" in
-        binutils | gcc | linux_headers | uClibc | elf2flt | busybox | finalize_rootfs | linux | bootwrapper)
+        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper)
             STAGES="${STAGES} ${arg}"
             ;;
         *)
