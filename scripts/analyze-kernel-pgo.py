@@ -5,12 +5,14 @@ import collections
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 
 
 TOP_SYMBOL_RE = re.compile(r"^\s*(\d+)\s+(\S+)$")
+SYSCALL_RE = re.compile(r"^(\d+)\s+(\d+)(?:\s+(.*))?$")
 
 HOTSPOT_RULES = [
     (
@@ -114,6 +116,51 @@ def parse_summary(summary_path: pathlib.Path):
             continue
         top_symbols.append((int(match.group(1)), match.group(2)))
     return metadata, top_symbols
+
+
+def parse_syscalls(syscall_path: pathlib.Path):
+    metadata = parse_kv_file(syscall_path)
+    entries = []
+    in_hits = False
+    for line in syscall_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line == "syscall_hits:":
+            in_hits = True
+            continue
+        if not in_hits:
+            continue
+        match = SYSCALL_RE.match(line.strip())
+        if not match:
+            continue
+        number = int(match.group(1))
+        count = int(match.group(2))
+        samples = match.group(3) or ""
+        entries.append((number, count, samples))
+    return metadata, entries
+
+
+def load_syscall_table(syscall_table_path: pathlib.Path):
+    mapping = {}
+    if not syscall_table_path.is_file():
+        return mapping
+
+    for line in syscall_table_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        if len(fields) < 4:
+            continue
+        number_text, abi, name, entry = fields[:4]
+        try:
+            number = int(number_text)
+        except ValueError:
+            continue
+        mapping[number] = {
+            "abi": abi,
+            "name": name,
+            "entry": entry,
+        }
+    return mapping
 
 
 def load_text_symbols(vmlinux_path: pathlib.Path):
@@ -291,6 +338,12 @@ def write_recommendations(output_dir: pathlib.Path, metadata, manifest, top_symb
     lines.append(f"- QEMU cpu: {manifest.get('cpu', 'unknown')}")
     lines.append(f"- Workload file: {manifest.get('workload_file', 'unknown')}")
     lines.append(f"- Matched kernel trace ratio: {metadata.get('matched_ratio', 'unknown')}")
+    lines.append(f"- Top-32 hot-function coverage: {metadata.get('top_32_ratio', 'unknown')}")
+    lines.append(f"- Top-64 hot-function coverage: {metadata.get('top_64_ratio', 'unknown')}")
+    lines.append(
+        f"- Trace-driven layout ordering: {metadata.get('layout_ordering_recommended', 'unknown')} "
+        f"({metadata.get('layout_ordering_reason', 'no reason recorded')})"
+    )
     if notes:
         for note in notes:
             lines.append(f"- {note}")
@@ -365,6 +418,33 @@ def write_workload_notes(output_dir: pathlib.Path, manifest):
     (output_dir / "workload.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_layout_decision(output_dir: pathlib.Path, metadata):
+    def _env_line(key, value):
+        return f"{key}={shlex.quote(str(value))}"
+
+    lines = [
+        _env_line("layout_ordering_recommended", metadata.get("layout_ordering_recommended", "no")),
+        _env_line("layout_ordering_reason", metadata.get("layout_ordering_reason", "missing profile concentration metadata")),
+        _env_line("matched_ratio", metadata.get("matched_ratio", "unknown")),
+        _env_line("top_32_ratio", metadata.get("top_32_ratio", "unknown")),
+        _env_line("top_64_ratio", metadata.get("top_64_ratio", "unknown")),
+    ]
+    (output_dir / "pgo-layout-decision.env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_syscall_report(output_dir: pathlib.Path, syscall_entries, syscall_table):
+    lines = ["number hits abi name entry sample_sites", ""]
+    for number, count, samples in syscall_entries:
+        info = syscall_table.get(number, {})
+        lines.append(
+            f"{number} {count} {info.get('abi', 'unknown')} {info.get('name', 'unknown')} "
+            f"{info.get('entry', 'unknown')} {samples or '-'}"
+        )
+    if not syscall_entries:
+        lines.append("none 0 unknown unknown unknown no-svc-events-detected")
+    (output_dir / "syscalls.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate kernel PGO config fragment and recommendations.")
     parser.add_argument("--profile-prefix", required=True, type=pathlib.Path)
@@ -374,9 +454,11 @@ def main():
 
     summary_path = args.profile_prefix.with_name(args.profile_prefix.name + "_summary.txt")
     hit_path = args.profile_prefix.with_name(args.profile_prefix.name + "_hits.txt")
+    syscall_path = args.profile_prefix.with_name(args.profile_prefix.name + "_syscalls.txt")
     manifest_path = args.profile_prefix.parent / "qemu-profile-manifest.txt"
     config_path = args.linux_dir / ".config"
     vmlinux_path = args.linux_dir / "vmlinux"
+    syscall_table_path = args.linux_dir / "arch" / "arm" / "tools" / "syscall.tbl"
     if not summary_path.is_file():
         print(f"missing summary file: {summary_path}", file=sys.stderr)
         return 1
@@ -385,6 +467,9 @@ def main():
         return 1
     if not hit_path.is_file():
         print(f"missing hit file: {hit_path}", file=sys.stderr)
+        return 1
+    if not syscall_path.is_file():
+        print(f"missing syscall file: {syscall_path}", file=sys.stderr)
         return 1
     if not config_path.is_file():
         print(f"missing kernel config: {config_path}", file=sys.stderr)
@@ -399,6 +484,8 @@ def main():
     manifest = parse_kv_file(manifest_path)
     symbols = load_text_symbols(vmlinux_path)
     hit_counts = load_hit_counts(hit_path)
+    _, syscall_entries = parse_syscalls(syscall_path)
+    syscall_table = load_syscall_table(syscall_table_path)
     fragment_lines, notes = generate_fragment(config, top_symbols)
     categories = infer_hotspot_categories(top_symbols)
     unused_subsystems = infer_unused_subsystems(config, symbols, hit_counts)
@@ -416,8 +503,10 @@ def main():
     write_recommendations(args.output_dir, metadata, manifest, top_symbols, notes, categories, unused_subsystems)
     write_hotspots(args.output_dir, top_symbols, categories)
     write_workload_notes(args.output_dir, manifest)
+    write_layout_decision(args.output_dir, metadata)
     write_unused_symbols(args.output_dir, symbols, hit_counts)
     write_unused_subsystems(args.output_dir, unused_subsystems)
+    write_syscall_report(args.output_dir, syscall_entries, syscall_table)
     return 0
 
 

@@ -35,9 +35,15 @@ if [ ! -f "${WORKLOAD_FILE}" ]; then
 fi
 
 rm -f "${TRACE_LOG}" "${CONSOLE_LOG}" "${MANIFEST_LOG}" \
-    "${PROFILE_PREFIX}_ld_profile.txt" "${PROFILE_PREFIX}_summary.txt"
+    "${PROFILE_PREFIX}_ld_profile.txt" "${PROFILE_PREFIX}_summary.txt" \
+    "${PROFILE_PREFIX}_hits.txt" "${PROFILE_PREFIX}_concentration.txt" \
+    "${PROFILE_PREFIX}_syscalls.txt"
 
-QEMU_LOG=exec \
+# exec,in_asm: TB execution counts + disassembly for SVC site detection.
+# Add "cpu" (QEMU_LOG=exec,cpu,in_asm) to enable R7-based syscall number
+# identification, but note this dumps full register state per TB execution
+# and can produce multi-GB trace files.
+QEMU_LOG=${QEMU_LOG:-exec,in_asm} \
 QEMU_LOG_FILENAME="${TRACE_LOG}" \
     expect "${SCRIPT_DIR}/qemu-profile.expect" \
         "${IMAGE}" "${CONSOLE_LOG}" "${TIMEOUT}" "${BOOT_MARKER}" "${MANIFEST_LOG}" "${WORKLOAD_FILE}"
@@ -56,4 +62,7 @@ echo "  ${TRACE_LOG}"
 echo "  ${CONSOLE_LOG}"
 echo "  ${MANIFEST_LOG}"
 echo "  ${PROFILE_PREFIX}_ld_profile.txt"
+echo "  ${PROFILE_PREFIX}_hits.txt"
+echo "  ${PROFILE_PREFIX}_concentration.txt"
 echo "  ${PROFILE_PREFIX}_summary.txt"
+echo "  ${PROFILE_PREFIX}_syscalls.txt"
