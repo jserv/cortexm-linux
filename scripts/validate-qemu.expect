@@ -5,6 +5,7 @@ set log_path [lindex $argv 1]
 set timeout_seconds [lindex $argv 2]
 set boot_marker [lindex $argv 3]
 set workload_path [lindex $argv 4]
+set metrics_path [lindex $argv 5]
 
 if {$image eq "" || $log_path eq "" || $timeout_seconds eq "" || $boot_marker eq "" || $workload_path eq ""} {
     send_user "ERROR: missing QEMU validation arguments\n"
@@ -16,12 +17,20 @@ match_max 1048576
 log_user 0
 log_file -noappend $log_path
 
+set start_ms [clock milliseconds]
+set boot_marker_ms -1
+set shell_ready_ms -1
+
 proc wait_for_shell {} {
+    global shell_ready_ms
     for {set attempt 0} {$attempt < 6} {incr attempt} {
         set marker "__SHELL_READY__$attempt"
         send -- "busybox echo ${marker}\r"
         expect {
-            -re $marker { return }
+            -re $marker {
+                set shell_ready_ms [clock milliseconds]
+                return
+            }
             timeout {
                 send -- "\r"
             }
@@ -120,10 +129,13 @@ spawn qemu-system-arm \
     -cpu cortex-m4 \
     -nographic \
     -no-reboot \
+    -icount shift=0 \
     -kernel $image
 
 expect {
-    -re $boot_marker {}
+    -re $boot_marker {
+        set boot_marker_ms [clock milliseconds]
+    }
     timeout {
         send_user "ERROR: QEMU boot marker not found: $boot_marker\n"
         exit 1
@@ -148,5 +160,17 @@ foreach step $workload_steps {
 
 send -- "\001x"
 expect eof
+
+if {$metrics_path ne ""} {
+    set metrics [open $metrics_path "w"]
+    puts $metrics "qemu_mode=system"
+    puts $metrics "qemu_machine=mps2-an386"
+    puts $metrics "qemu_cpu=cortex-m4"
+    puts $metrics "icount=shift=0"
+    puts $metrics "boot_marker=$boot_marker"
+    puts $metrics "boot_marker_ms=[expr {$boot_marker_ms - $start_ms}]"
+    puts $metrics "shell_ready_ms=[expr {$shell_ready_ms - $start_ms}]"
+    close $metrics
+}
 
 puts "QEMU validation passed: booted Linux and exercised configured workload"

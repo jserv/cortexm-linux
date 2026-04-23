@@ -37,6 +37,7 @@ QUIET=${QUIET:-0}
 LOG_TAIL_LINES=${LOG_TAIL_LINES:-200}
 KERNEL_EXPERIMENT=${KERNEL_EXPERIMENT:-none}
 KERNEL_ORDER_FILE=${KERNEL_ORDER_FILE:-}
+KERNEL_SYSCALL_TABLE=${KERNEL_SYSCALL_TABLE:-}
 KERNEL_CONFIG_FRAGMENT=${KERNEL_CONFIG_FRAGMENT:-}
 KERNEL_REPORT_DIR=${KERNEL_REPORT_DIR:-${ROOTDIR}/profiles/kernel-pgo}
 PGO_WORKLOAD_FILE=${PGO_WORKLOAD_FILE:-${ROOTDIR}/configs/pgo-workload.txt}
@@ -71,9 +72,13 @@ image_fingerprint() {
         printf '%s\n' "$1"
         printf 'KERNEL_EXPERIMENT=%s\n' "${KERNEL_EXPERIMENT}"
         printf 'KERNEL_ORDER_FILE=%s\n' "${KERNEL_ORDER_FILE}"
+        printf 'KERNEL_SYSCALL_TABLE=%s\n' "${KERNEL_SYSCALL_TABLE}"
         printf 'KERNEL_CONFIG_FRAGMENT=%s\n' "${KERNEL_CONFIG_FRAGMENT}"
         if [ -n "${KERNEL_ORDER_FILE}" ] && [ -f "${KERNEL_ORDER_FILE}" ]; then
             sha256sum "${KERNEL_ORDER_FILE}"
+        fi
+        if [ -n "${KERNEL_SYSCALL_TABLE}" ] && [ -f "${KERNEL_SYSCALL_TABLE}" ]; then
+            sha256sum "${KERNEL_SYSCALL_TABLE}"
         fi
         if [ -n "${KERNEL_CONFIG_FRAGMENT}" ] && [ -f "${KERNEL_CONFIG_FRAGMENT}" ]; then
             sha256sum "${KERNEL_CONFIG_FRAGMENT}"
@@ -664,6 +669,14 @@ build_linux() {
         ;;
     esac
 
+    if [ -n "${KERNEL_SYSCALL_TABLE}" ]; then
+        if [ ! -f "${KERNEL_SYSCALL_TABLE}" ]; then
+            echo "ERROR: missing kernel syscall table override: ${KERNEL_SYSCALL_TABLE}"
+            exit 1
+        fi
+        cp "${KERNEL_SYSCALL_TABLE}" arch/arm/tools/syscall.tbl
+    fi
+
     run_logged "mps2_defconfig" kernel_make mps2_defconfig
 
     sed -i "s/# CONFIG_BLK_DEV_INITRD is not set/CONFIG_BLK_DEV_INITRD=y/" .config
@@ -772,6 +785,79 @@ linux_axf_size() {
     wc -c <"${ROOTDIR}/bootwrapper/linux.axf" | tr -d ' '
 }
 
+read_section_size() {
+    REPORT_FILE=$1
+    SECTION_NAME=$2
+
+    if [ ! -f "${REPORT_FILE}" ]; then
+        echo 0
+        return
+    fi
+
+    awk -v section="${SECTION_NAME}" '
+        /^== / {
+            if (in_vmlinux) {
+                exit
+            }
+            in_vmlinux = ($0 ~ /\/linux-[0-9.]+\/vmlinux ==/)
+            next
+        }
+        in_vmlinux && $1 == section {
+            print $2
+            found = 1
+            exit
+        }
+        END {
+            if (!found) {
+                print 0
+            }
+        }
+    ' "${REPORT_FILE}"
+}
+
+sum_section_sizes() {
+    REPORT_FILE=$1
+    shift
+
+    TOTAL=0
+    for SECTION_NAME in "$@"; do
+        VALUE=$(read_section_size "${REPORT_FILE}" "${SECTION_NAME}")
+        TOTAL=$((TOTAL + VALUE))
+    done
+    echo "${TOTAL}"
+}
+
+read_boot_metric() {
+    METRICS_FILE=$1
+    METRIC_NAME=$2
+
+    if [ ! -f "${METRICS_FILE}" ]; then
+        echo 0
+        return
+    fi
+
+    VALUE=$(sed -n "s/^${METRIC_NAME}=//p" "${METRICS_FILE}" | tail -n 1)
+    case "${VALUE}" in
+    ''|*[!0-9]*)
+        echo 0
+        ;;
+    *)
+        echo "${VALUE}"
+        ;;
+    esac
+}
+
+boot_not_regressed() {
+    _baseline=$1
+    _candidate=$2
+    # No baseline measurement: cannot reject on boot time
+    [ "$_baseline" -eq 0 ] && return 0
+    # Baseline measured but candidate did not: candidate failed to boot
+    [ "$_candidate" -eq 0 ] && return 1
+    # Both measured: candidate must not exceed baseline
+    [ "$_candidate" -le "$_baseline" ]
+}
+
 validate_kernel_image() {
     OUTDIR=$1
 
@@ -779,18 +865,269 @@ validate_kernel_image() {
     run_logged "validate qemu workload" "${ROOTDIR}/scripts/validate-qemu.sh" \
         "${ROOTDIR}/bootwrapper/linux.axf" \
         "${OUTDIR}/qemu-validate.log" \
-        "${PGO_WORKLOAD_FILE}"
+        "${PGO_WORKLOAD_FILE}" \
+        "${OUTDIR}/boot-metrics.txt"
 }
 
 record_candidate_result() {
     NAME=$1
     OUTDIR=$2
     SIZE=$3
+    METRICS_FILE=$4
+    SECTION_REPORT=$5
+    BOOT_MARKER_MS=$(read_boot_metric "${METRICS_FILE}" "boot_marker_ms")
+    SHELL_READY_MS=$(read_boot_metric "${METRICS_FILE}" "shell_ready_ms")
+    TEXT_BYTES=$(sum_section_sizes "${SECTION_REPORT}" ".head.text" ".text")
+    RODATA_BYTES=$(sum_section_sizes "${SECTION_REPORT}" ".rodata" ".ARM.unwind_idx" ".ARM.unwind_tab" "__param" ".notes")
+    DATA_BYTES=$(read_section_size "${SECTION_REPORT}" ".data")
+    BSS_BYTES=$(read_section_size "${SECTION_REPORT}" ".bss")
+    INIT_BYTES=$(sum_section_sizes "${SECTION_REPORT}" ".init.text" ".init.data" ".init.proc.info" ".init.arch.info")
+    RESIDENT_BYTES=$((TEXT_BYTES + RODATA_BYTES + DATA_BYTES + BSS_BYTES))
 
     {
         echo "candidate=${NAME}"
         echo "linux_axf_bytes=${SIZE}"
+        echo "boot_marker_ms=${BOOT_MARKER_MS}"
+        echo "shell_ready_ms=${SHELL_READY_MS}"
+        echo "kernel_text_bytes=${TEXT_BYTES}"
+        echo "kernel_rodata_bytes=${RODATA_BYTES}"
+        echo "kernel_data_bytes=${DATA_BYTES}"
+        echo "kernel_bss_bytes=${BSS_BYTES}"
+        echo "kernel_init_bytes=${INIT_BYTES}"
+        echo "kernel_resident_bytes=${RESIDENT_BYTES}"
     } >"${OUTDIR}/result.txt"
+}
+
+append_candidate_summary() {
+    SUMMARY_FILE=$1
+    NAME=$2
+    RESULT_FILE=$3
+
+    SIZE=$(read_boot_metric "${RESULT_FILE}" "linux_axf_bytes")
+    BOOT_MARKER_MS=$(read_boot_metric "${RESULT_FILE}" "boot_marker_ms")
+    SHELL_READY_MS=$(read_boot_metric "${RESULT_FILE}" "shell_ready_ms")
+    RESIDENT_BYTES=$(read_boot_metric "${RESULT_FILE}" "kernel_resident_bytes")
+    INIT_BYTES=$(read_boot_metric "${RESULT_FILE}" "kernel_init_bytes")
+    printf '%s %s %s %s %s %s\n' \
+        "${NAME}" "${SIZE}" "${BOOT_MARKER_MS}" "${SHELL_READY_MS}" "${RESIDENT_BYTES}" "${INIT_BYTES}" \
+        >>"${SUMMARY_FILE}"
+}
+
+append_candidate_decision() {
+    DECISION_FILE=$1
+    NAME=$2
+    SIZE=$3
+    BOOT_MS=$4
+    SELECTED_NAME=$5
+    SELECTED_SIZE=$6
+    SELECTED_BOOT_MS=$7
+    BASELINE_BOOT_MS=$8
+    RESIDENT_BYTES=$9
+    SELECTED_RESIDENT_BYTES=${10}
+    INIT_BYTES=${11}
+    SELECTED_INIT_BYTES=${12}
+
+    ELIGIBLE=no
+    REASON=skipped
+    SIZE_DELTA=$((SIZE - SELECTED_SIZE))
+    BOOT_DELTA=$((BOOT_MS - SELECTED_BOOT_MS))
+    RESIDENT_DELTA=$((RESIDENT_BYTES - SELECTED_RESIDENT_BYTES))
+    INIT_DELTA=$((INIT_BYTES - SELECTED_INIT_BYTES))
+
+    if [ "${SIZE}" -gt 0 ]; then
+        if boot_not_regressed "${BASELINE_BOOT_MS}" "${BOOT_MS}"; then
+            ELIGIBLE=yes
+            if [ "${NAME}" = "${SELECTED_NAME}" ]; then
+                REASON=selected
+            elif [ "${SIZE}" -gt "${SELECTED_SIZE}" ]; then
+                REASON=larger_than_selected
+            elif [ "${SIZE}" -lt "${SELECTED_SIZE}" ]; then
+                REASON=smaller_than_selected_unexpected
+            elif [ "${BOOT_MS}" -gt "${SELECTED_BOOT_MS}" ]; then
+                REASON=slower_than_selected
+            else
+                REASON=tie_lost
+            fi
+        else
+            REASON=rejected_boot_regression
+        fi
+    fi
+
+    printf '%s %s %s %s %s %s %s %+d %+d %+d %+d\n' \
+        "${NAME}" "${ELIGIBLE}" "${REASON}" "${SIZE}" "${BOOT_MS}" "${RESIDENT_BYTES}" \
+        "${INIT_BYTES}" "${SIZE_DELTA}" "${BOOT_DELTA}" "${RESIDENT_DELTA}" "${INIT_DELTA}" \
+        >>"${DECISION_FILE}"
+}
+
+write_final_summary() {
+    SUMMARY_PATH=$1
+    CANDIDATE_MATRIX=$2
+    DECISION_FILE=$3
+    SELECTED_NAME=$4
+    BASELINE_SIZE=$5
+    SELECTED_SIZE=$6
+    BASELINE_BOOT_MS=$7
+    SELECTED_BOOT_MS=$8
+    LAYOUT_DECISION_FILE=$9
+    BASELINE_KERNEL_DIR=${10}
+    BEST_ORDER_NAME=${11}
+    BEST_ORDER_SIZE=${12}
+    BEST_ORDER_BOOT_MS=${13}
+    BEST_ORDER_FILE=${14}
+    BEST_ORDER_SIZE_DELTA=${15}
+    BEST_ORDER_BOOT_DELTA=${16}
+    BEST_ORDER_RESIDENT_DELTA=${17}
+    BEST_ORDER_INIT_BYTES=${18}
+    BEST_ORDER_INIT_DELTA=${19}
+    OBJECTIVE_SCORECARD=${20}
+
+    {
+        echo "Kernel PGO cycle summary"
+        echo
+        echo "selected_candidate=${SELECTED_NAME}"
+        echo "baseline_linux_axf_bytes=${BASELINE_SIZE}"
+        echo "selected_linux_axf_bytes=${SELECTED_SIZE}"
+        echo "baseline_shell_ready_ms=${BASELINE_BOOT_MS}"
+        echo "selected_shell_ready_ms=${SELECTED_BOOT_MS}"
+        echo "best_order_candidate=${BEST_ORDER_NAME:-none}"
+        echo "best_order_linux_axf_bytes=${BEST_ORDER_SIZE:-0}"
+        echo "best_order_shell_ready_ms=${BEST_ORDER_BOOT_MS:-0}"
+        echo "best_order_file=${BEST_ORDER_FILE:-none}"
+        echo "best_order_size_delta_vs_selected=${BEST_ORDER_SIZE_DELTA:-0}"
+        echo "best_order_shell_delta_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
+        echo "best_order_resident_delta_vs_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
+        echo "best_order_init_bytes=${BEST_ORDER_INIT_BYTES:-0}"
+        echo "best_order_init_delta_vs_selected=${BEST_ORDER_INIT_DELTA:-0}"
+        if [ -f "${OBJECTIVE_SCORECARD}" ]; then
+            echo
+            echo "objective_scorecard:"
+            cat "${OBJECTIVE_SCORECARD}"
+        fi
+        echo
+        echo "remaining_gap_to_trace_layout_win:"
+        if [ "${BEST_ORDER_NAME:-}" = "none" ] || [ -z "${BEST_ORDER_NAME:-}" ]; then
+            echo "best_order_candidate=none"
+            echo "trace_layout_candidate_available=no"
+            echo "trace_layout_win_remaining=yes"
+        else
+            echo "best_order_candidate=${BEST_ORDER_NAME}"
+            echo "trace_layout_candidate_available=yes"
+            if [ "${BEST_ORDER_SIZE_DELTA:-0}" -gt 0 ] ||
+                [ "${BEST_ORDER_RESIDENT_DELTA:-0}" -gt 0 ] ||
+                [ "${BEST_ORDER_INIT_DELTA:-0}" -gt 0 ] ||
+                [ "${BEST_ORDER_BOOT_DELTA:-0}" -gt 0 ]; then
+                echo "trace_layout_win_remaining=yes"
+            else
+                echo "trace_layout_win_remaining=no"
+            fi
+            echo "size_bytes_needed_to_tie_selected=${BEST_ORDER_SIZE_DELTA:-0}"
+            echo "resident_bytes_needed_to_tie_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
+            echo "init_bytes_needed_to_tie_selected=${BEST_ORDER_INIT_DELTA:-0}"
+            echo "shell_ready_ms_headroom_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
+        fi
+        echo
+        echo "footprint_pareto_frontier_boot_eligible:"
+        sed -n '1p' "${CANDIDATE_MATRIX}"
+        awk '
+            NR == FNR {
+                if (FNR > 1 && $2 == "yes") {
+                    eligible[$1] = 1
+                }
+                next
+            }
+            FNR == 1 { next }
+            eligible[$1] {
+                count++
+                name[count] = $1
+                size[count] = $2 + 0
+                boot[count] = $4 + 0
+                resident[count] = $5 + 0
+                init[count] = $6 + 0
+                row[count] = $0
+            }
+            END {
+                for (i = 1; i <= count; i++) {
+                    dominated = 0
+                    for (j = 1; j <= count; j++) {
+                        if (i == j) {
+                            continue
+                        }
+                        if (size[j] <= size[i] &&
+                            resident[j] <= resident[i] &&
+                            init[j] <= init[i] &&
+                            (size[j] < size[i] ||
+                             resident[j] < resident[i] ||
+                             init[j] < init[i])) {
+                            dominated = 1
+                            break
+                        }
+                    }
+                    if (!dominated) {
+                        print row[i]
+                    }
+                }
+            }
+        ' "${DECISION_FILE}" "${CANDIDATE_MATRIX}" | sort -k2,2n -k5,5n -k6,6n -k4,4n -k1,1
+        echo
+        echo "metric_leaders:"
+        echo "image_size=$(tail -n +2 "${CANDIDATE_MATRIX}" | sort -k2,2n -k4,4n -k5,5n -k1,1 | head -n 1)"
+        echo "shell_ready=$(tail -n +2 "${CANDIDATE_MATRIX}" | sort -k4,4n -k2,2n -k5,5n -k1,1 | head -n 1)"
+        echo "resident_footprint=$(tail -n +2 "${CANDIDATE_MATRIX}" | sort -k5,5n -k2,2n -k4,4n -k1,1 | head -n 1)"
+        echo "init_footprint=$(tail -n +2 "${CANDIDATE_MATRIX}" | sort -k6,6n -k5,5n -k2,2n -k1,1 | head -n 1)"
+        echo
+        echo "candidate_matrix:"
+        cat "${CANDIDATE_MATRIX}"
+        echo
+        echo "candidate_ranking_by_size:"
+        {
+            sed -n '1p' "${CANDIDATE_MATRIX}"
+            sed -n '2,$p' "${CANDIDATE_MATRIX}" | sort -k2,2n -k4,4n -k5,5n -k1,1
+        }
+        echo
+        echo "candidate_ranking_by_shell_ready:"
+        {
+            sed -n '1p' "${CANDIDATE_MATRIX}"
+            sed -n '2,$p' "${CANDIDATE_MATRIX}" | sort -k4,4n -k2,2n -k5,5n -k1,1
+        }
+        echo
+        echo "candidate_ranking_by_resident_footprint:"
+        {
+            sed -n '1p' "${CANDIDATE_MATRIX}"
+            sed -n '2,$p' "${CANDIDATE_MATRIX}" | sort -k5,5n -k2,2n -k4,4n -k1,1
+        }
+        echo
+        echo "candidate_ranking_by_init_footprint:"
+        {
+            sed -n '1p' "${CANDIDATE_MATRIX}"
+            sed -n '2,$p' "${CANDIDATE_MATRIX}" | sort -k6,6n -k5,5n -k2,2n -k1,1
+        }
+        echo
+        echo "candidate_decisions:"
+        cat "${DECISION_FILE}"
+        echo
+        echo "layout_profile:"
+        if [ -f "${LAYOUT_DECISION_FILE}" ]; then
+            echo "[layout_decision]"
+            cat "${LAYOUT_DECISION_FILE}"
+        else
+            echo "missing_layout_decision_file=1"
+        fi
+        if [ -f "${BASELINE_KERNEL_DIR}/kernel_summary.txt" ]; then
+            echo "[baseline_profile]"
+            grep -E '^(ordering_symbol_count|ordering_hit_ratio|matched_ratio|top_32_ratio|top_64_ratio)=' \
+                "${BASELINE_KERNEL_DIR}/kernel_summary.txt" || true
+        fi
+        if [ -f "${BASELINE_KERNEL_DIR}/kernel_ld_profile.txt" ]; then
+            echo
+            echo "ordering_file_head:"
+            sed -n '1,12p' "${BASELINE_KERNEL_DIR}/kernel_ld_profile.txt"
+        fi
+        if [ -f "${BASELINE_KERNEL_DIR}/kernel_ld_profile_full.txt" ]; then
+            echo
+            echo "ordering_file_full_head:"
+            sed -n '1,8p' "${BASELINE_KERNEL_DIR}/kernel_ld_profile_full.txt"
+        fi
+    } >"${SUMMARY_PATH}"
 }
 
 compose_kernel_config_fragment() {
@@ -810,15 +1147,17 @@ build_candidate_kernel() {
     NAME=$1
     EXPERIMENT=$2
     ORDER_FILE=$3
-    CONFIG_FRAGMENT=$4
-    REPORT_ROOT=$5
-    SNAPDIR=$6
+    SYSCALL_TABLE=$4
+    CONFIG_FRAGMENT=$5
+    REPORT_ROOT=$6
+    SNAPDIR=$7
 
     stage_clean linux
     stage_clean bootwrapper
     (
         KERNEL_EXPERIMENT="${EXPERIMENT}" \
         KERNEL_ORDER_FILE="${ORDER_FILE}" \
+        KERNEL_SYSCALL_TABLE="${SYSCALL_TABLE}" \
         KERNEL_CONFIG_FRAGMENT="${CONFIG_FRAGMENT}" \
         KERNEL_REPORT_DIR="${REPORT_ROOT}" \
         build_linux
@@ -826,13 +1165,16 @@ build_candidate_kernel() {
     (
         KERNEL_EXPERIMENT="${EXPERIMENT}" \
         KERNEL_ORDER_FILE="${ORDER_FILE}" \
+        KERNEL_SYSCALL_TABLE="${SYSCALL_TABLE}" \
         KERNEL_CONFIG_FRAGMENT="${CONFIG_FRAGMENT}" \
         KERNEL_REPORT_DIR="${REPORT_ROOT}" \
         build_bootwrapper
     )
     validate_kernel_image "${REPORT_ROOT}/validation"
     snapshot_kernel_artifacts "${SNAPDIR}"
-    record_candidate_result "${NAME}" "${SNAPDIR}" "$(linux_axf_size)"
+    record_candidate_result "${NAME}" "${SNAPDIR}" "$(linux_axf_size)" \
+        "${REPORT_ROOT}/validation/boot-metrics.txt" \
+        "${REPORT_ROOT}/${EXPERIMENT}/section-sizes.txt"
 }
 
 build_kernel_pgo_cycle() {
@@ -840,10 +1182,22 @@ build_kernel_pgo_cycle() {
     BASELINE_DIR=${CYCLE_DIR}/baseline
     FINAL_DIR=${CYCLE_DIR}/final
     CONFIG_DIR=${CYCLE_DIR}/configs
+    SUMMARY_FILE=${FINAL_DIR}/candidate-matrix.txt
+    DECISION_FILE=${FINAL_DIR}/candidate-decisions.txt
+    FINAL_SUMMARY=${FINAL_DIR}/summary.txt
+    OBJECTIVE_SCORECARD=${FINAL_DIR}/objective-scorecard.txt
     BASELINE_SNAP=${CYCLE_DIR}/artifacts/baseline
     CONFIG_SNAP=${CYCLE_DIR}/artifacts/config-only
+    SYSCALL_SNAP=${CYCLE_DIR}/artifacts/syscall-prune
     ORDER_SNAP=${CYCLE_DIR}/artifacts/llvm-order
+    ORDER_FULL_SNAP=${CYCLE_DIR}/artifacts/llvm-order-full
     mkdir -p "${BASELINE_DIR}" "${FINAL_DIR}" "${CONFIG_DIR}" "${CYCLE_DIR}/artifacts"
+    {
+        echo "candidate linux_axf_bytes boot_marker_ms shell_ready_ms kernel_resident_bytes kernel_init_bytes"
+    } >"${SUMMARY_FILE}"
+    {
+        echo "candidate eligible decision linux_axf_bytes shell_ready_ms kernel_resident_bytes kernel_init_bytes size_delta_vs_selected shell_delta_vs_selected resident_delta_vs_selected init_delta_vs_selected"
+    } >"${DECISION_FILE}"
 
     if [ ! -f "${PGO_WORKLOAD_FILE}" ]; then
         echo "ERROR: missing PGO workload file: ${PGO_WORKLOAD_FILE}"
@@ -851,8 +1205,10 @@ build_kernel_pgo_cycle() {
     fi
 
     echo "BUILD: kernel PGO cycle step 1/3 - baseline kernel build"
-    build_candidate_kernel "baseline" "none" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
+    build_candidate_kernel "baseline" "none" "" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
     BASELINE_SIZE=$(linux_axf_size)
+    BASELINE_BOOT_MS=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "shell_ready_ms")
+    append_candidate_summary "${SUMMARY_FILE}" "baseline" "${BASELINE_SNAP}/result.txt"
 
     echo "BUILD: kernel PGO cycle step 2/3 - QEMU trace collection"
     run_logged "collect kernel profile" "${ROOTDIR}/scripts/collect-kernel-profile.sh" \
@@ -866,42 +1222,174 @@ build_kernel_pgo_cycle() {
         --output-dir "${CONFIG_DIR}"
 
     MERGED_CONFIG=${CONFIG_DIR}/pgo-kernel.merged.config
+    LAYOUT_DECISION_FILE=${CONFIG_DIR}/pgo-layout-decision.env
     compose_kernel_config_fragment "${MERGED_CONFIG}" \
         "${PGO_BASE_CONFIG_FRAGMENT}" \
         "${CONFIG_DIR}/pgo-kernel.config"
 
     echo "BUILD: kernel PGO cycle step 3/3 - PGO rebuild with generated config fragment"
-    build_candidate_kernel "config-only" "none" "" "${MERGED_CONFIG}" \
+    build_candidate_kernel "config-only" "none" "" "" "${MERGED_CONFIG}" \
         "${CYCLE_DIR}/config-only" "${CONFIG_SNAP}"
     CONFIG_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${CONFIG_SNAP}/result.txt")
     CONFIG_SIZE=${CONFIG_SIZE:-0}
+    CONFIG_BOOT_MS=$(read_boot_metric "${CONFIG_SNAP}/result.txt" "shell_ready_ms")
+    append_candidate_summary "${SUMMARY_FILE}" "config-only" "${CONFIG_SNAP}/result.txt"
 
-    build_candidate_kernel "llvm-order" "llvm-order-use" "${BASELINE_DIR}/kernel/kernel_ld_profile.txt" \
-        "${MERGED_CONFIG}" "${CYCLE_DIR}/llvm-order" "${ORDER_SNAP}"
-    ORDER_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${ORDER_SNAP}/result.txt")
-    ORDER_SIZE=${ORDER_SIZE:-0}
+    DETECTED_SYSCALLS=$(sed -n 's/^detected_syscalls=//p' "${BASELINE_DIR}/kernel/kernel_summary.txt")
+    DETECTED_SYSCALLS=${DETECTED_SYSCALLS:-0}
+
+    SYSCALL_SIZE=0
+    SYSCALL_BOOT_MS=0
+    if [ "${DETECTED_SYSCALLS}" -gt 0 ]; then
+        SYSCALL_TABLE_PATCH=${CONFIG_DIR}/syscall-prune.tbl
+        run_logged "generate syscall prune table" "${ROOTDIR}/scripts/generate-syscall-prune-table.py" \
+            --syscall-report "${CONFIG_DIR}/syscalls.txt" \
+            --syscall-table "${ROOTDIR}/linux-${LINUX_VERSION}/arch/arm/tools/syscall.tbl" \
+            --output-table "${SYSCALL_TABLE_PATCH}"
+
+        build_candidate_kernel "syscall-prune" "none" "" "${SYSCALL_TABLE_PATCH}" "${MERGED_CONFIG}" \
+            "${CYCLE_DIR}/syscall-prune" "${SYSCALL_SNAP}"
+        SYSCALL_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${SYSCALL_SNAP}/result.txt")
+        SYSCALL_SIZE=${SYSCALL_SIZE:-0}
+        SYSCALL_BOOT_MS=$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "shell_ready_ms")
+        append_candidate_summary "${SUMMARY_FILE}" "syscall-prune" "${SYSCALL_SNAP}/result.txt"
+    else
+        echo "PGO: skipping syscall-prune candidate: no syscalls detected (set QEMU_LOG=exec,cpu,in_asm to enable)"
+    fi
+
+    ORDER_SIZE=0
+    ORDER_BOOT_MS=0
+    ORDER_RESIDENT=0
+    ORDER_INIT=0
+    ORDER_FULL_SIZE=0
+    ORDER_FULL_BOOT_MS=0
+    ORDER_FULL_RESIDENT=0
+    ORDER_FULL_INIT=0
+    if [ -f "${LAYOUT_DECISION_FILE}" ]; then
+        # Generated by analyze-kernel-pgo.py with simple shell-safe key=value lines.
+        . "${LAYOUT_DECISION_FILE}"
+    fi
+
+    if [ "${layout_ordering_recommended:-no}" = "yes" ]; then
+        build_candidate_kernel "llvm-order" "llvm-order-use" "${BASELINE_DIR}/kernel/kernel_ld_profile.txt" \
+            "" "${MERGED_CONFIG}" "${CYCLE_DIR}/llvm-order" "${ORDER_SNAP}"
+        ORDER_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${ORDER_SNAP}/result.txt")
+        ORDER_SIZE=${ORDER_SIZE:-0}
+        ORDER_BOOT_MS=$(read_boot_metric "${ORDER_SNAP}/result.txt" "shell_ready_ms")
+        ORDER_RESIDENT=$(read_boot_metric "${ORDER_SNAP}/result.txt" "kernel_resident_bytes")
+        ORDER_INIT=$(read_boot_metric "${ORDER_SNAP}/result.txt" "kernel_init_bytes")
+        append_candidate_summary "${SUMMARY_FILE}" "llvm-order" "${ORDER_SNAP}/result.txt"
+
+        if [ -f "${BASELINE_DIR}/kernel/kernel_ld_profile_full.txt" ]; then
+            build_candidate_kernel "llvm-order-full" "llvm-order-use" \
+                "${BASELINE_DIR}/kernel/kernel_ld_profile_full.txt" \
+                "" "${MERGED_CONFIG}" "${CYCLE_DIR}/llvm-order-full" "${ORDER_FULL_SNAP}"
+            ORDER_FULL_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${ORDER_FULL_SNAP}/result.txt")
+            ORDER_FULL_SIZE=${ORDER_FULL_SIZE:-0}
+            ORDER_FULL_BOOT_MS=$(read_boot_metric "${ORDER_FULL_SNAP}/result.txt" "shell_ready_ms")
+            ORDER_FULL_RESIDENT=$(read_boot_metric "${ORDER_FULL_SNAP}/result.txt" "kernel_resident_bytes")
+            ORDER_FULL_INIT=$(read_boot_metric "${ORDER_FULL_SNAP}/result.txt" "kernel_init_bytes")
+            append_candidate_summary "${SUMMARY_FILE}" "llvm-order-full" "${ORDER_FULL_SNAP}/result.txt"
+        fi
+    else
+        echo "PGO: skipping llvm-order candidate: ${layout_ordering_reason:-trace too diffuse}"
+    fi
 
     BEST_NAME=baseline
     BEST_SNAP=${BASELINE_SNAP}
     BEST_SIZE=${BASELINE_SIZE}
+    BEST_BOOT_MS=${BASELINE_BOOT_MS}
+    BEST_RESIDENT_BYTES=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_resident_bytes")
+    BEST_INIT_BYTES=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_init_bytes")
 
-    if [ "${CONFIG_SIZE}" -gt 0 ] && [ "${CONFIG_SIZE}" -lt "${BEST_SIZE}" ]; then
+    if [ "${CONFIG_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${CONFIG_BOOT_MS}" &&
+        [ "${CONFIG_SIZE}" -lt "${BEST_SIZE}" ]; then
         BEST_NAME=config-only
         BEST_SNAP=${CONFIG_SNAP}
         BEST_SIZE=${CONFIG_SIZE}
+        BEST_BOOT_MS=${CONFIG_BOOT_MS}
+        BEST_RESIDENT_BYTES=$(read_boot_metric "${CONFIG_SNAP}/result.txt" "kernel_resident_bytes")
+        BEST_INIT_BYTES=$(read_boot_metric "${CONFIG_SNAP}/result.txt" "kernel_init_bytes")
     fi
 
-    if [ "${ORDER_SIZE}" -gt 0 ] && [ "${ORDER_SIZE}" -lt "${BEST_SIZE}" ]; then
+    if [ "${SYSCALL_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${SYSCALL_BOOT_MS}" &&
+        [ "${SYSCALL_SIZE}" -lt "${BEST_SIZE}" ]; then
+        BEST_NAME=syscall-prune
+        BEST_SNAP=${SYSCALL_SNAP}
+        BEST_SIZE=${SYSCALL_SIZE}
+        BEST_BOOT_MS=${SYSCALL_BOOT_MS}
+        BEST_RESIDENT_BYTES=$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_resident_bytes")
+        BEST_INIT_BYTES=$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_init_bytes")
+    fi
+
+    if [ "${ORDER_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${ORDER_BOOT_MS}" &&
+        [ "${ORDER_SIZE}" -lt "${BEST_SIZE}" ]; then
         BEST_NAME=llvm-order
         BEST_SNAP=${ORDER_SNAP}
         BEST_SIZE=${ORDER_SIZE}
+        BEST_BOOT_MS=${ORDER_BOOT_MS}
+        BEST_RESIDENT_BYTES=${ORDER_RESIDENT}
+        BEST_INIT_BYTES=${ORDER_INIT}
+    fi
+
+    if [ "${ORDER_FULL_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${ORDER_FULL_BOOT_MS}" &&
+        [ "${ORDER_FULL_SIZE}" -lt "${BEST_SIZE}" ]; then
+        BEST_NAME=llvm-order-full
+        BEST_SNAP=${ORDER_FULL_SNAP}
+        BEST_SIZE=${ORDER_FULL_SIZE}
+        BEST_BOOT_MS=${ORDER_FULL_BOOT_MS}
+        BEST_RESIDENT_BYTES=${ORDER_FULL_RESIDENT}
+        BEST_INIT_BYTES=${ORDER_FULL_INIT}
     fi
 
     if [ "${BEST_NAME}" = "baseline" ]; then
-        echo "PGO: no candidate improved linux.axf size; keeping baseline"
-        echo "  baseline:    ${BASELINE_SIZE}"
-        echo "  config-only: ${CONFIG_SIZE}"
-        echo "  llvm-order:  ${ORDER_SIZE}"
+        echo "PGO: no candidate improved linux.axf size without regressing shell_ready_ms; keeping baseline"
+        echo "  baseline:      ${BASELINE_SIZE} bytes, ${BASELINE_BOOT_MS} ms"
+        echo "  config-only:   ${CONFIG_SIZE} bytes, ${CONFIG_BOOT_MS} ms"
+        echo "  syscall-prune: ${SYSCALL_SIZE} bytes, ${SYSCALL_BOOT_MS} ms"
+        echo "  llvm-order:    ${ORDER_SIZE} bytes, ${ORDER_BOOT_MS} ms"
+        echo "  llvm-order-full: ${ORDER_FULL_SIZE} bytes, ${ORDER_FULL_BOOT_MS} ms"
+    fi
+
+    BEST_ORDER_NAME=
+    BEST_ORDER_SNAP=
+    BEST_ORDER_FILE=
+    BEST_ORDER_SIZE=0
+    BEST_ORDER_BOOT_MS=0
+    BEST_ORDER_SIZE_DELTA=0
+    BEST_ORDER_BOOT_DELTA=0
+    BEST_ORDER_RESIDENT_DELTA=0
+    BEST_ORDER_INIT_BYTES=0
+    BEST_ORDER_INIT_DELTA=0
+    if [ "${ORDER_SIZE}" -gt 0 ]; then
+        BEST_ORDER_NAME=llvm-order
+        BEST_ORDER_SNAP=${ORDER_SNAP}
+        BEST_ORDER_FILE=${BASELINE_DIR}/kernel/kernel_ld_profile.txt
+        BEST_ORDER_SIZE=${ORDER_SIZE}
+        BEST_ORDER_BOOT_MS=${ORDER_BOOT_MS}
+        BEST_ORDER_INIT_BYTES=${ORDER_INIT}
+    fi
+    if [ "${ORDER_FULL_SIZE}" -gt 0 ] &&
+        { [ "${ORDER_SIZE}" -eq 0 ] || [ "${ORDER_FULL_SIZE}" -lt "${ORDER_SIZE}" ]; }; then
+        BEST_ORDER_NAME=llvm-order-full
+        BEST_ORDER_SNAP=${ORDER_FULL_SNAP}
+        BEST_ORDER_FILE=${BASELINE_DIR}/kernel/kernel_ld_profile_full.txt
+        BEST_ORDER_SIZE=${ORDER_FULL_SIZE}
+        BEST_ORDER_BOOT_MS=${ORDER_FULL_BOOT_MS}
+        BEST_ORDER_INIT_BYTES=${ORDER_FULL_INIT}
+    fi
+
+    if [ -n "${BEST_ORDER_NAME}" ]; then
+        BEST_ORDER_SIZE_DELTA=$((BEST_ORDER_SIZE - BEST_SIZE))
+        BEST_ORDER_BOOT_DELTA=$((BEST_ORDER_BOOT_MS - BEST_BOOT_MS))
+        BEST_ORDER_RESIDENT_DELTA=$(( $(read_boot_metric "${BEST_ORDER_SNAP}/result.txt" "kernel_resident_bytes") - BEST_RESIDENT_BYTES ))
+        BEST_ORDER_INIT_DELTA=$((BEST_ORDER_INIT_BYTES - BEST_INIT_BYTES))
+        run_logged "compare ordered kernel layout" "${ROOTDIR}/scripts/compare-kernel-layout.py" \
+            --baseline-vmlinux "${BASELINE_SNAP}/vmlinux" \
+            --candidate-vmlinux "${BEST_ORDER_SNAP}/vmlinux" \
+            --hits "${BASELINE_DIR}/kernel/kernel_hits.txt" \
+            --order-file "${BEST_ORDER_FILE}" \
+            --output-dir "${CYCLE_DIR}/layout"
     fi
 
     restore_kernel_artifacts "${BEST_SNAP}"
@@ -910,7 +1398,105 @@ build_kernel_pgo_cycle() {
         echo "selected_candidate=${BEST_NAME}"
         echo "baseline_linux_axf_bytes=${BASELINE_SIZE}"
         echo "selected_linux_axf_bytes=${BEST_SIZE}"
+        echo "baseline_shell_ready_ms=${BASELINE_BOOT_MS}"
+        echo "selected_shell_ready_ms=${BEST_BOOT_MS}"
+        echo "candidate_matrix=${SUMMARY_FILE}"
+        echo "candidate_decisions=${DECISION_FILE}"
+        echo "best_order_candidate=${BEST_ORDER_NAME:-none}"
+        echo "best_order_linux_axf_bytes=${BEST_ORDER_SIZE:-0}"
+        echo "best_order_shell_ready_ms=${BEST_ORDER_BOOT_MS:-0}"
+        echo "best_order_file=${BEST_ORDER_FILE:-none}"
+        echo "best_order_size_delta_vs_selected=${BEST_ORDER_SIZE_DELTA:-0}"
+        echo "best_order_shell_delta_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
+        echo "best_order_resident_delta_vs_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
+        echo "best_order_init_bytes=${BEST_ORDER_INIT_BYTES:-0}"
+        echo "best_order_init_delta_vs_selected=${BEST_ORDER_INIT_DELTA:-0}"
     } >"${FINAL_DIR}/selected-candidate.txt"
+    append_candidate_decision "${DECISION_FILE}" "baseline" "${BASELINE_SIZE}" "${BASELINE_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_resident_bytes")" "${BEST_RESIDENT_BYTES}" \
+        "$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_init_bytes")" "${BEST_INIT_BYTES}"
+    append_candidate_decision "${DECISION_FILE}" "config-only" "${CONFIG_SIZE}" "${CONFIG_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "$(read_boot_metric "${CONFIG_SNAP}/result.txt" "kernel_resident_bytes")" "${BEST_RESIDENT_BYTES}" \
+        "$(read_boot_metric "${CONFIG_SNAP}/result.txt" "kernel_init_bytes")" "${BEST_INIT_BYTES}"
+    append_candidate_decision "${DECISION_FILE}" "syscall-prune" "${SYSCALL_SIZE}" "${SYSCALL_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_resident_bytes")" "${BEST_RESIDENT_BYTES}" \
+        "$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_init_bytes")" "${BEST_INIT_BYTES}"
+    append_candidate_decision "${DECISION_FILE}" "llvm-order" "${ORDER_SIZE}" "${ORDER_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "${ORDER_RESIDENT}" "${BEST_RESIDENT_BYTES}" "${ORDER_INIT}" "${BEST_INIT_BYTES}"
+    append_candidate_decision "${DECISION_FILE}" "llvm-order-full" "${ORDER_FULL_SIZE}" "${ORDER_FULL_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "${ORDER_FULL_RESIDENT}" "${BEST_RESIDENT_BYTES}" "${ORDER_FULL_INIT}" "${BEST_INIT_BYTES}"
+
+    BASELINE_RESIDENT_BYTES=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_resident_bytes")
+    BASELINE_INIT_BYTES=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_init_bytes")
+    SELECTED_SIZE_DELTA_VS_BASELINE=$((BEST_SIZE - BASELINE_SIZE))
+    SELECTED_BOOT_DELTA_VS_BASELINE=$((BEST_BOOT_MS - BASELINE_BOOT_MS))
+    SELECTED_RESIDENT_DELTA_VS_BASELINE=$((BEST_RESIDENT_BYTES - BASELINE_RESIDENT_BYTES))
+    SELECTED_INIT_DELTA_VS_BASELINE=$((BEST_INIT_BYTES - BASELINE_INIT_BYTES))
+    TRACE_LAYOUT_GOAL_MET=no
+    BEST_ORDER_SIZE_DELTA_VS_BASELINE=0
+    BEST_ORDER_BOOT_DELTA_VS_BASELINE=0
+    BEST_ORDER_RESIDENT_DELTA_VS_BASELINE=0
+    BEST_ORDER_INIT_DELTA_VS_BASELINE=0
+    if [ -n "${BEST_ORDER_NAME}" ]; then
+        BEST_ORDER_RESIDENT_BYTES=$(read_boot_metric "${BEST_ORDER_SNAP}/result.txt" "kernel_resident_bytes")
+        BEST_ORDER_SIZE_DELTA_VS_BASELINE=$((BEST_ORDER_SIZE - BASELINE_SIZE))
+        BEST_ORDER_BOOT_DELTA_VS_BASELINE=$((BEST_ORDER_BOOT_MS - BASELINE_BOOT_MS))
+        BEST_ORDER_RESIDENT_DELTA_VS_BASELINE=$((BEST_ORDER_RESIDENT_BYTES - BASELINE_RESIDENT_BYTES))
+        BEST_ORDER_INIT_DELTA_VS_BASELINE=$((BEST_ORDER_INIT_BYTES - BASELINE_INIT_BYTES))
+        if [ "${BEST_ORDER_SIZE}" -le "${BEST_SIZE}" ] &&
+            [ "${BEST_ORDER_RESIDENT_BYTES}" -le "${BEST_RESIDENT_BYTES}" ] &&
+            [ "${BEST_ORDER_INIT_BYTES}" -le "${BEST_INIT_BYTES}" ] &&
+            boot_not_regressed "${BASELINE_BOOT_MS}" "${BEST_ORDER_BOOT_MS}"; then
+            TRACE_LAYOUT_GOAL_MET=yes
+        fi
+    fi
+
+    {
+        echo "selected_candidate=${BEST_NAME}"
+        echo "selected_size_delta_vs_baseline=${SELECTED_SIZE_DELTA_VS_BASELINE}"
+        echo "selected_shell_delta_vs_baseline=${SELECTED_BOOT_DELTA_VS_BASELINE}"
+        echo "selected_resident_delta_vs_baseline=${SELECTED_RESIDENT_DELTA_VS_BASELINE}"
+        echo "selected_init_delta_vs_baseline=${SELECTED_INIT_DELTA_VS_BASELINE}"
+        echo "selected_image_size_goal_met=$( [ "${BEST_SIZE}" -lt "${BASELINE_SIZE}" ] && echo yes || echo no )"
+        echo "selected_resident_footprint_goal_met=$( [ "${BEST_RESIDENT_BYTES}" -lt "${BASELINE_RESIDENT_BYTES}" ] && echo yes || echo no )"
+        echo "selected_init_footprint_goal_met=$( [ "${BEST_INIT_BYTES}" -lt "${BASELINE_INIT_BYTES}" ] && echo yes || echo no )"
+        echo "selected_boot_constraint_met=$(boot_not_regressed "${BASELINE_BOOT_MS}" "${BEST_BOOT_MS}" && echo yes || echo no)"
+        if [ "${BEST_SIZE}" -lt "${BASELINE_SIZE}" ] &&
+            [ "${BEST_RESIDENT_BYTES}" -lt "${BASELINE_RESIDENT_BYTES}" ] &&
+            [ "${BEST_INIT_BYTES}" -lt "${BASELINE_INIT_BYTES}" ] &&
+            boot_not_regressed "${BASELINE_BOOT_MS}" "${BEST_BOOT_MS}"; then
+            echo "selected_systematic_goal_met=yes"
+        else
+            echo "selected_systematic_goal_met=no"
+        fi
+        echo "trace_layout_goal_met=${TRACE_LAYOUT_GOAL_MET}"
+        echo "best_order_candidate=${BEST_ORDER_NAME:-none}"
+        echo "best_order_size_delta_vs_baseline=${BEST_ORDER_SIZE_DELTA_VS_BASELINE}"
+        echo "best_order_shell_delta_vs_baseline=${BEST_ORDER_BOOT_DELTA_VS_BASELINE}"
+        echo "best_order_resident_delta_vs_baseline=${BEST_ORDER_RESIDENT_DELTA_VS_BASELINE}"
+        echo "best_order_init_delta_vs_baseline=${BEST_ORDER_INIT_DELTA_VS_BASELINE}"
+        echo "best_order_size_delta_vs_selected=${BEST_ORDER_SIZE_DELTA:-0}"
+        echo "best_order_shell_delta_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
+        echo "best_order_resident_delta_vs_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
+        echo "best_order_init_delta_vs_selected=${BEST_ORDER_INIT_DELTA:-0}"
+        if [ "${TRACE_LAYOUT_GOAL_MET}" = "yes" ]; then
+            echo "best_order_competitive_on_systematic_goal=yes"
+        else
+            echo "best_order_competitive_on_systematic_goal=no"
+        fi
+    } >"${OBJECTIVE_SCORECARD}"
+
+    write_final_summary "${FINAL_SUMMARY}" "${SUMMARY_FILE}" "${DECISION_FILE}" "${BEST_NAME}" \
+        "${BASELINE_SIZE}" "${BEST_SIZE}" "${BASELINE_BOOT_MS}" "${BEST_BOOT_MS}" \
+        "${LAYOUT_DECISION_FILE}" "${BASELINE_DIR}/kernel" \
+        "${BEST_ORDER_NAME}" "${BEST_ORDER_SIZE}" "${BEST_ORDER_BOOT_MS}" "${BEST_ORDER_FILE}" \
+        "${BEST_ORDER_SIZE_DELTA}" "${BEST_ORDER_BOOT_DELTA}" "${BEST_ORDER_RESIDENT_DELTA}" \
+        "${BEST_ORDER_INIT_BYTES}" "${BEST_ORDER_INIT_DELTA}" "${OBJECTIVE_SCORECARD}"
 
     run_logged "collect final kernel profile" "${ROOTDIR}/scripts/collect-kernel-profile.sh" \
         "${ROOTDIR}/bootwrapper/linux.axf" \

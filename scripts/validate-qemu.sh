@@ -6,6 +6,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 IMAGE=${1:-bootwrapper/linux.axf}
 LOG=${2:-qemu.log}
 WORKLOAD=${3:-${SCRIPT_DIR}/../configs/pgo-workload.txt}
+METRICS=${4:-}
 TIMEOUT=${QEMU_TIMEOUT:-180}
 BOOT_MARKER=${QEMU_BOOT_MARKER:-Linux for Cortex-M}
 
@@ -19,4 +20,5 @@ if [ ! -f "${WORKLOAD}" ]; then
     exit 1
 fi
 
-exec expect "${SCRIPT_DIR}/validate-qemu.expect" "${IMAGE}" "${LOG}" "${TIMEOUT}" "${BOOT_MARKER}" "${WORKLOAD}"
+exec expect "${SCRIPT_DIR}/validate-qemu.expect" \
+    "${IMAGE}" "${LOG}" "${TIMEOUT}" "${BOOT_MARKER}" "${WORKLOAD}" "${METRICS}"
