@@ -1538,8 +1538,11 @@ build_bootwrapper() {
 
     REPORT_SUBDIR=${KERNEL_REPORT_DIR}/${KERNEL_EXPERIMENT}
     mkdir -p "${REPORT_SUBDIR}"
+    # vmlinux did not change between the kernel build and the bootwrapper
+    # build, so this refresh only needs to capture linux.axf in filesizes.txt.
+    # Running the full report here would rotate the previous snapshot away.
     run_logged "refresh kernel size report" "${ROOTDIR}/scripts/kernel-size-report.sh" \
-        "${ROOTDIR}" "${ROOTDIR}/linux-${LINUX_VERSION}" "${ROOTDIR}/bootwrapper" "${REPORT_SUBDIR}"
+        "${ROOTDIR}" "${ROOTDIR}/linux-${LINUX_VERSION}" "${ROOTDIR}/bootwrapper" "${REPORT_SUBDIR}" files
 
     cd ../
 }
