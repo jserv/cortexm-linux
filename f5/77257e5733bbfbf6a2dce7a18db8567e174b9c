@@ -1,0 +1,38 @@
+patches/0010-tiny-arm-no-unwinder.patch
+  f320a85dde2d39e9 1-80
+build.sh
+  f320a85dde2d39e9 297-302,648,734-756,771-776,783-789
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "f577257e5733bbfbf6a2dce7a18db8567e174b9c",
+  "prompts": {
+    "1b8714f67b902b01": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6a06aee7-1f00-4817-902e-a2ec6e0fba20",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 83,
+      "overriden_lines": 0
+    },
+    "f320a85dde2d39e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08a72bf4-b8db-47f7-9da9-d6a0840a1cb9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 243,
+      "total_deletions": 129,
+      "accepted_lines": 233,
+      "overriden_lines": 0
+    }
+  }
+}
