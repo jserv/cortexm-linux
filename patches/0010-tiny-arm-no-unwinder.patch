@@ -1,0 +1,80 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: arm: add UNWINDER_NONE option
+
+Introduce a third entry in the ARM "Choose kernel unwinder" choice that
+selects neither CONFIG_ARM_UNWIND nor CONFIG_FRAME_POINTER. On size-
+constrained Cortex-M targets the EABI unwind tables (.ARM.exidx /
+.ARM.extab) account for tens of KB of otherwise-dead metadata: the only
+runtime consumer is panic-time backtrace formatting, which a serial-
+only board can do without.
+
+UNWINDER_FRAME_POINTER cannot be selected on THUMB2_KERNEL because the
+existing frame-pointer unwinder assumes ARM-mode prologues, and
+UNWINDER_ARM forces ARM_UNWIND=y, so a no-op option is required to let
+arch/arm/kernel/vmlinux.lds.S DISCARD the unwind sections.
+
+Provide a tiny stub unwind_frame() that returns -EINVAL when neither
+ARM_UNWIND nor FRAME_POINTER is configured. __get_wchan() and
+walk_stackframe() therefore still link, but produce a single-frame
+trace instead of a full call chain.
+
+CAVEAT: arch_stack_walk() (compiled only when CONFIG_STACKTRACE=y) does
+a pre-skip "if (unwind_frame(&frame)) return;" before calling
+walk_stackframe(), so under UNWINDER_NONE that path returns ZERO frames
+instead of one. Harmless while STACKTRACE remains off; if a future
+build enables STACKTRACE=y, switch back to UNWINDER_ARM or extend the
+stub to advance once for the synthetic skip frame.
+
+---
+ arch/arm/Kconfig             | 2 +-
+ arch/arm/Kconfig.debug       | 7 +++++++
+ arch/arm/kernel/stacktrace.c | 7 +++++++
+ 3 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -1123,7 +1123,7 @@ config THUMB2_KERNEL
+ 	bool "Compile the kernel in Thumb-2 mode" if !CPU_THUMBONLY
+ 	depends on (CPU_V7 || CPU_V7M) && !CPU_V6 && !CPU_V6K
+ 	default y if CPU_THUMBONLY
+-	select ARM_UNWIND
++	select ARM_UNWIND if !UNWINDER_NONE
+ 	help
+ 	  By enabling this option, the kernel will be compiled in
+ 	  Thumb-2 mode.
+
+diff --git a/arch/arm/Kconfig.debug b/arch/arm/Kconfig.debug
+--- a/arch/arm/Kconfig.debug
++++ b/arch/arm/Kconfig.debug
+@@ -72,6 +72,13 @@ config UNWINDER_ARM
+ 	  compiler. The resulting kernel image is slightly bigger but
+ 	  the performance is not affected. Currently, this feature
+ 	  only works with EABI compilers.
++
++config UNWINDER_NONE
++	bool "No unwinder (smallest image)"
++	help
++	  Disable kernel-side stack unwinding. Panic and warning backtraces
++	  collapse to a single frame, but the EABI unwind tables
++	  (.ARM.exidx/.ARM.extab) are discarded, saving tens of KB.
+
+ endchoice
+
+diff --git a/arch/arm/kernel/stacktrace.c b/arch/arm/kernel/stacktrace.c
+--- a/arch/arm/kernel/stacktrace.c
++++ b/arch/arm/kernel/stacktrace.c
+@@ -123,6 +123,13 @@ int notrace unwind_frame(struct stackframe *frame)
+ }
+ #endif
+
++#if !defined(CONFIG_ARM_UNWIND) && !defined(CONFIG_FRAME_POINTER)
++int notrace unwind_frame(struct stackframe *frame)
++{
++	return -EINVAL;
++}
++#endif
++
+ void notrace walk_stackframe(struct stackframe *frame,
+ 		     bool (*fn)(void *, unsigned long), void *data)
+ {
