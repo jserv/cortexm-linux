@@ -294,6 +294,12 @@ patch_already_applied() {
         grep -q "config LTO_GCC" arch/Kconfig &&
             [ -f scripts/Makefile.lto ]
         ;;
+    0010-*)
+        # Check for the unique symbols introduced by the patch rather
+        # than literal `select` lines, which are whitespace-fragile.
+        grep -q "config UNWINDER_NONE" arch/arm/Kconfig.debug &&
+            grep -Eq "^[[:space:]]*select[[:space:]]+ARM_UNWIND[[:space:]]+if[[:space:]]+!UNWINDER_NONE[[:space:]]*$" arch/arm/Kconfig
+        ;;
     *)
         return 1
         ;;
@@ -639,7 +645,7 @@ build_linux() {
     cd linux-${LINUX_VERSION}
 
     # Apply linux-tiny patches for reduced memory footprint and LTO support
-    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch; do
+    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch; do
         [ -f "${p}" ] || continue
         apply_patch_once "${p}"
     done
@@ -725,6 +731,29 @@ build_linux() {
     # Single-user system: drop UID/GID mapping and related syscalls.
     echo "# CONFIG_MULTIUSER is not set" >>.config
 
+    # Tier 1 size pruning: defensive disables and minimum sizes.
+    # BLOCK is already off in mps2_defconfig but pin it explicitly so any
+    # future defconfig drift is caught by olddefconfig + the verifier below.
+    # SWAP depends on BLOCK and is therefore unreachable; the explicit "not
+    # set" line keeps the .config audit-friendly.
+    echo "# CONFIG_BLOCK is not set" >>.config
+    echo "# CONFIG_SWAP is not set" >>.config
+    # Tiny SLUB allocator for small-memory uniprocessor (depends on EXPERT).
+    echo "CONFIG_SLUB_TINY=y" >>.config
+    # Drop printk descriptor table to its 4KB Kconfig minimum. The 64KB
+    # default contributes ~180KB of static .data via _printk_rb_static_infos.
+    sed -i "/^CONFIG_LOG_BUF_SHIFT=/d" .config
+    echo "CONFIG_LOG_BUF_SHIFT=12" >>.config
+    # No DWARF in vmlinux: shortens the kernel link and shrinks build
+    # artifacts. CONFIG_DEBUG_INFO is a hidden bool selected by the
+    # DWARF4/5 choice options; once DEBUG_INFO_NONE wins, it disappears
+    # from .config rather than emitting an explicit "not set" line.
+    echo "CONFIG_DEBUG_INFO_NONE=y" >>.config
+    # Drop the ARM EABI unwind tables (.ARM.exidx/.ARM.extab, ~75KB).
+    # Requires patch 0010 to introduce UNWINDER_NONE on Thumb-2.
+    echo "# CONFIG_UNWINDER_ARM is not set" >>.config
+    echo "CONFIG_UNWINDER_NONE=y" >>.config
+
     run_logged "olddefconfig" kernel_make olddefconfig
 
     # Verify critical config options survived olddefconfig resolution
@@ -739,12 +768,25 @@ build_linux() {
         "CONFIG_BINFMT_ELF_FDPIC=y" \
         "# CONFIG_BINFMT_FLAT is not set" \
         "# CONFIG_BINFMT_SCRIPT is not set" \
-        "# CONFIG_COREDUMP is not set"; do
+        "# CONFIG_COREDUMP is not set" \
+        "# CONFIG_BLOCK is not set" \
+        "CONFIG_SLUB_TINY=y" \
+        "CONFIG_LOG_BUF_SHIFT=12" \
+        "CONFIG_DEBUG_INFO_NONE=y" \
+        "CONFIG_UNWINDER_NONE=y"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
         fi
     done
+
+    # ARM_UNWIND is a hidden bool: when no choice or `select` references it
+    # the symbol is omitted from .config entirely rather than emitted as
+    # "is not set". Treat presence of an explicit =y as the failure mode.
+    if grep -q "^CONFIG_ARM_UNWIND=y" .config; then
+        echo "ERROR: CONFIG_ARM_UNWIND=y survived olddefconfig (UNWINDER_NONE patch broken?)"
+        exit 1
+    fi
 
     if [ "${KERNEL_EXPERIMENT}" = "llvm-order-use" ]; then
         run_logged "build" kernel_make -j${MAKE_JOBS} KALLSYMS_EXTRA_PASS=1
