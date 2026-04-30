@@ -34,8 +34,12 @@ proc wait_for_shell {} {
     for {set attempt 0} {$attempt < 8} {incr attempt} {
         set marker "__PROFILE_READY__$attempt"
         send -- "busybox echo ${marker}\r"
+        # Match the marker TWICE: once in the line-discipline echo of the
+        # input, then in busybox's actual stdout. The single-match form
+        # races against shell init -- it returns when the tty buffers the
+        # echoed command line, before busybox has even forked.
         expect {
-            -re $marker { return }
+            -re "${marker}\[\\r\\n\]+${marker}" { return }
             timeout {
                 send -- "\r"
             }
@@ -152,6 +156,23 @@ expect {
 }
 
 wait_for_shell
+
+# See validate-qemu.expect for the rationale -- disable terminal echo
+# so workload commands like "... && busybox echo ok" only have their
+# actual output reach expect's buffer (not the echoed command line),
+# letting trimmed workloads use simple markers without false positives.
+send -- "busybox stty -echo; busybox echo __ECHO_DISABLED__\r"
+expect {
+    -re "__ECHO_DISABLED__\[\\r\\n\]+__ECHO_DISABLED__" {}
+    timeout {
+        send_user "ERROR: failed to disable terminal echo\n"
+        exit 1
+    }
+    eof {
+        send_user "ERROR: QEMU exited before terminal echo could be disabled\n"
+        exit 1
+    }
+}
 
 set workload_steps [load_workload $workload_path]
 set step_index 0

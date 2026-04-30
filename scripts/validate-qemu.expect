@@ -26,8 +26,12 @@ proc wait_for_shell {} {
     for {set attempt 0} {$attempt < 6} {incr attempt} {
         set marker "__SHELL_READY__$attempt"
         send -- "busybox echo ${marker}\r"
+        # Match the marker TWICE: once in the line-discipline echo of the
+        # input, then in busybox's actual stdout. Without the second match
+        # we may return while busybox has not yet finished forking, so
+        # subsequent commands race against shell init.
         expect {
-            -re $marker {
+            -re "${marker}\[\\r\\n\]+${marker}" {
                 set shell_ready_ms [clock milliseconds]
                 return
             }
@@ -147,6 +151,26 @@ expect {
 }
 
 wait_for_shell
+
+# Disable terminal echo before running the workload. Without this the
+# tty line-discipline echoes each "busybox echo ok" command back to
+# expect's buffer, and a generic regex such as "ok" matches the echoed
+# command line before the program's actual output. The double-marker
+# expect below waits for both the echoed copy and the actual echo of
+# __ECHO_DISABLED__, so by the time we return, stty -echo has taken
+# effect and subsequent run_guest_check sees only program output.
+send -- "busybox stty -echo; busybox echo __ECHO_DISABLED__\r"
+expect {
+    -re "__ECHO_DISABLED__\[\\r\\n\]+__ECHO_DISABLED__" {}
+    timeout {
+        send_user "ERROR: failed to disable terminal echo\n"
+        exit 1
+    }
+    eof {
+        send_user "ERROR: QEMU exited before terminal echo could be disabled\n"
+        exit 1
+    }
+}
 
 set workload_steps [load_workload $workload_path]
 set step_index 0

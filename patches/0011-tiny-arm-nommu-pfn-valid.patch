@@ -1,0 +1,51 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: arm: skip HAVE_ARCH_PFN_VALID on ARMv7-M
+
+The ARM-specific pfn_valid() in arch/arm/mm/init.c walks memblock via
+memblock_overlaps_region() on every call. It exists to handle the
+mismatch between mem_map and physical memory layout on classic ARM/A
+systems with split banks, holes, or aliased physical addresses.
+
+On Cortex-M (CPU_V7M) NOMMU boards built via ARM_SINGLE_ARMV7M the
+picture is much simpler:
+  - one contiguous DRAM bank (e.g. MPS2-AN386 SSRAM at 0x21000000),
+  - virt == phys, mem_map covers the bank linearly,
+  - PFN never truncates because the address space fits a u32.
+
+In that regime the generic FLATMEM pfn_valid (single bounds check
+against max_mapnr) is both correct and cheap, and disabling
+HAVE_ARCH_PFN_VALID also re-enables the tight integer-range
+for_each_valid_pfn() loop in init_unavailable_range() instead of the
+fallback that calls pfn_valid() per pfn.
+
+Older ARM7/ARM9 NOMMU boards can have multiple discontinuous memory
+banks where the FLATMEM bounds check would incorrectly accept PFNs in
+the holes; gating on `MMU || !ARM_SINGLE_ARMV7M` keeps those
+configurations on the heavyweight memblock-aware check.
+
+Boot-trace (TB-execution rollup) before:
+
+  pfn_valid               271,195 hits   8.0% of matched kernel blocks
+  init_unavailable_range  135,178 hits   4.0%
+
+Together ~12% of matched boot blocks were spent inside the heavyweight
+arch override -- pure overhead with a single contiguous bank.
+
+Patch makes the select conditional; MMU builds and non-ARMV7M NOMMU
+builds keep the old behavior unchanged.
+---
+ arch/arm/Kconfig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -90,7 +90,7 @@ config ARM
+ 	select HAVE_ARCH_KASAN_VMALLOC if HAVE_ARCH_KASAN
+ 	select HAVE_ARCH_KSTACK_ERASE
+ 	select HAVE_ARCH_MMAP_RND_BITS if MMU
+-	select HAVE_ARCH_PFN_VALID
++	select HAVE_ARCH_PFN_VALID if MMU || !ARM_SINGLE_ARMV7M
+ 	select HAVE_ARCH_SECCOMP
+ 	select HAVE_ARCH_SECCOMP_FILTER if AEABI && !OABI_COMPAT
+ 	select HAVE_ARCH_THREAD_STRUCT_WHITELIST
