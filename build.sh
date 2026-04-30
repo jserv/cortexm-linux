@@ -731,7 +731,7 @@ build_linux() {
     # Single-user system: drop UID/GID mapping and related syscalls.
     echo "# CONFIG_MULTIUSER is not set" >>.config
 
-    # Tier 1 size pruning: defensive disables and minimum sizes.
+    # Core size pruning: defensive disables and minimum sizes.
     # BLOCK is already off in mps2_defconfig but pin it explicitly so any
     # future defconfig drift is caught by olddefconfig + the verifier below.
     # SWAP depends on BLOCK and is therefore unreachable; the explicit "not
@@ -754,9 +754,93 @@ build_linux() {
     echo "# CONFIG_UNWINDER_ARM is not set" >>.config
     echo "CONFIG_UNWINDER_NONE=y" >>.config
 
+    # Subsystem size pruning: serial-only NOMMU
+    # boot-to-shell target. Many of these are dependency-gated off by
+    # NOMMU/NET=n/SYSFS=n already; the explicit lines pin them so future
+    # defconfig drift is caught and the section-size delta is auditable.
+    # SHMEM, AUDIT, POSIX_MQUEUE, SECURITY, TASK_*, AUDIT_*: depend on
+    # MMU, NET, or SYSFS+MULTIUSER and would silently come back if any of
+    # those flipped.  IO_URING / FUTEX / TIMERFD / FHANDLE / MEMBARRIER /
+    # RSEQ default y under EXPERT and need real disables.
+    echo "# CONFIG_IO_URING is not set" >>.config
+    echo "# CONFIG_AIO is not set" >>.config
+    echo "# CONFIG_FHANDLE is not set" >>.config
+    echo "# CONFIG_TIMERFD is not set" >>.config
+    echo "# CONFIG_ADVISE_SYSCALLS is not set" >>.config
+    echo "# CONFIG_MEMBARRIER is not set" >>.config
+    echo "# CONFIG_RSEQ is not set" >>.config
+    echo "# CONFIG_SECCOMP is not set" >>.config
+    echo "# CONFIG_KEYS is not set" >>.config
+    echo "# CONFIG_AUDIT is not set" >>.config
+    echo "# CONFIG_SYSVIPC is not set" >>.config
+    echo "# CONFIG_POSIX_MQUEUE is not set" >>.config
+    echo "# CONFIG_FUTEX is not set" >>.config
+    echo "# CONFIG_EPOLL is not set" >>.config
+    echo "# CONFIG_INOTIFY_USER is not set" >>.config
+    echo "# CONFIG_DNOTIFY is not set" >>.config
+    echo "# CONFIG_SIGNALFD is not set" >>.config
+    echo "# CONFIG_EVENTFD is not set" >>.config
+    echo "# CONFIG_TASKSTATS is not set" >>.config
+    echo "# CONFIG_TASK_DELAY_ACCT is not set" >>.config
+    echo "# CONFIG_TASK_XACCT is not set" >>.config
+    echo "# CONFIG_TASK_IO_ACCOUNTING is not set" >>.config
+    echo "# CONFIG_WATCH_QUEUE is not set" >>.config
+    echo "# CONFIG_VM_EVENT_COUNTERS is not set" >>.config
+    echo "# CONFIG_SHMEM is not set" >>.config
+    echo "# CONFIG_SECURITY is not set" >>.config
+
+    # Serial-only target: drop the VT terminal layer and accessibility
+    # console support.  CONFIG_TTY stays on -- the AMBA PL011 console
+    # driver depends on it.
+    echo "# CONFIG_VT is not set" >>.config
+    echo "# CONFIG_LOGO is not set" >>.config
+    echo "# CONFIG_A11Y_BRAILLE_CONSOLE is not set" >>.config
+
+    # tty trim: keep CONFIG_TTY for the PL011 console; drop PTY layers
+    # and the line-discipline autoloader (no out-of-tree ldiscs to load).
+    echo "# CONFIG_UNIX98_PTYS is not set" >>.config
+    echo "# CONFIG_LEGACY_PTYS is not set" >>.config
+    echo "# CONFIG_LDISC_AUTOLOAD is not set" >>.config
+
+    # Driver families with no consumer on MPS2-AN386.  AMBA bus stays on
+    # because the SoC enumerates PL011 over it.  REGMAP is a hidden bool
+    # auto-selected by MFD_SYSCON et al.; with all selectors off it
+    # disappears from .config on its own.
+    echo "# CONFIG_NEW_LEDS is not set" >>.config
+    echo "# CONFIG_WATCHDOG is not set" >>.config
+    echo "# CONFIG_PPS is not set" >>.config
+    echo "# CONFIG_MFD_SYSCON is not set" >>.config
+    echo "# CONFIG_RTC_CLASS is not set" >>.config
+    echo "# CONFIG_PCI is not set" >>.config
+
+    # Device nodes ship in initramfs (configs/rootfs.dev); the devtmpfs
+    # mount in /etc/rc is guarded with `|| true` so it silently skips.
+    # CONSEQUENCE: any new device the kernel needs (e.g. a second UART,
+    # an HW RNG) must be declared explicitly in configs/rootfs.dev or it
+    # will not appear under /dev -- there is no udev/mdev fallback.
+    echo "# CONFIG_DEVTMPFS is not set" >>.config
+    echo "# CONFIG_DEVTMPFS_MOUNT is not set" >>.config
+
+    # /proc/sys is never read by the boot-to-shell workload.  PROC_FS
+    # itself stays on with PROC_STRIPPED -- BusyBox uses /proc/self/exe
+    # for SH_STANDALONE re-exec.
+    echo "# CONFIG_PROC_SYSCTL is not set" >>.config
+
+    # Debug knobs the production image never exercises.  PRINTK_TIME and
+    # DEBUG_BUGVERBOSE are pure metadata cost; STACKPROTECTOR adds a
+    # canary check at every function prologue.
+    echo "# CONFIG_DEBUG_FS is not set" >>.config
+    echo "# CONFIG_PRINTK_TIME is not set" >>.config
+    echo "# CONFIG_DEBUG_BUGVERBOSE is not set" >>.config
+    echo "# CONFIG_STACKPROTECTOR is not set" >>.config
+    echo "# CONFIG_STACKPROTECTOR_STRONG is not set" >>.config
+
     run_logged "olddefconfig" kernel_make olddefconfig
 
-    # Verify critical config options survived olddefconfig resolution
+    # Verify critical config options survived olddefconfig resolution.
+    # Only symbols whose disable line should reliably appear in .config
+    # are checked positively here; dependency-gated symbols (SHMEM, AUDIT,
+    # POSIX_MQUEUE, SECURITY) are validated by the negative guards below.
     for opt in \
         "# CONFIG_NET is not set" \
         "# CONFIG_MODULES is not set" \
@@ -773,7 +857,40 @@ build_linux() {
         "CONFIG_SLUB_TINY=y" \
         "CONFIG_LOG_BUF_SHIFT=12" \
         "CONFIG_DEBUG_INFO_NONE=y" \
-        "CONFIG_UNWINDER_NONE=y"; do
+        "CONFIG_UNWINDER_NONE=y" \
+        "# CONFIG_IO_URING is not set" \
+        "# CONFIG_FUTEX is not set" \
+        "# CONFIG_EPOLL is not set" \
+        "# CONFIG_INOTIFY_USER is not set" \
+        "# CONFIG_TIMERFD is not set" \
+        "# CONFIG_FHANDLE is not set" \
+        "# CONFIG_VT is not set" \
+        "# CONFIG_UNIX98_PTYS is not set" \
+        "# CONFIG_LEGACY_PTYS is not set" \
+        "# CONFIG_LDISC_AUTOLOAD is not set" \
+        "# CONFIG_NEW_LEDS is not set" \
+        "# CONFIG_WATCHDOG is not set" \
+        "# CONFIG_MFD_SYSCON is not set" \
+        "# CONFIG_DEVTMPFS is not set" \
+        "# CONFIG_PROC_SYSCTL is not set" \
+        "# CONFIG_DEBUG_FS is not set" \
+        "# CONFIG_PRINTK_TIME is not set" \
+        "# CONFIG_VM_EVENT_COUNTERS is not set" \
+        "# CONFIG_SYSVIPC is not set" \
+        "# CONFIG_WATCH_QUEUE is not set" \
+        "# CONFIG_PPS is not set" \
+        "# CONFIG_RTC_CLASS is not set" \
+        "# CONFIG_AIO is not set" \
+        "# CONFIG_SIGNALFD is not set" \
+        "# CONFIG_EVENTFD is not set" \
+        "# CONFIG_DNOTIFY is not set" \
+        "# CONFIG_ADVISE_SYSCALLS is not set" \
+        "# CONFIG_MEMBARRIER is not set" \
+        "# CONFIG_RSEQ is not set" \
+        "# CONFIG_SECCOMP is not set" \
+        "# CONFIG_KEYS is not set" \
+        "# CONFIG_STACKPROTECTOR is not set" \
+        "# CONFIG_DEBUG_BUGVERBOSE is not set"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
@@ -787,6 +904,28 @@ build_linux() {
         echo "ERROR: CONFIG_ARM_UNWIND=y survived olddefconfig (UNWINDER_NONE patch broken?)"
         exit 1
     fi
+
+    # Negative-guard for symbols whose `# CONFIG_X is not set` line gets
+    # stripped by olddefconfig because their `depends on` clause is unmet
+    # under the current build state (NOMMU, NET=n, SYSFS=n, MULTIUSER=n,
+    # VT=n, DEVTMPFS=n, STACKPROTECTOR=n).  These cannot be checked
+    # positively, but they must never silently resolve to =y if a dep
+    # ever flips back:
+    #   SHMEM                     -- depends on MMU
+    #   AUDIT/POSIX_MQUEUE/TASKSTATS -- depend on NET
+    #   SECURITY                  -- depends on SYSFS && MULTIUSER
+    #   PCI                       -- arch-gated; not visible on cortex-m
+    #   STACKPROTECTOR_STRONG     -- depends on STACKPROTECTOR=y
+    #   LOGO/A11Y_BRAILLE_CONSOLE -- depend on the VT stack
+    #   DEVTMPFS_MOUNT            -- depends on DEVTMPFS=y
+    for sym in SHMEM AUDIT POSIX_MQUEUE SECURITY TASKSTATS PCI \
+               STACKPROTECTOR_STRONG LOGO A11Y_BRAILLE_CONSOLE \
+               DEVTMPFS_MOUNT; do
+        if grep -q "^CONFIG_${sym}=y\$" .config; then
+            echo "ERROR: CONFIG_${sym}=y survived olddefconfig (subsystem disable broken?)"
+            exit 1
+        fi
+    done
 
     if [ "${KERNEL_EXPERIMENT}" = "llvm-order-use" ]; then
         run_logged "build" kernel_make -j${MAKE_JOBS} KALLSYMS_EXTRA_PASS=1
