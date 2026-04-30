@@ -1,0 +1,100 @@
+scripts/check-subsystem-budget.py
+  a79fd36ea0e4dfe4 1-157
+scripts/qemu-trace-to-orderfile.py
+  456bc0642d63c92c 23-154,350-378,397-401
+scripts/collect-kernel-profile.sh
+  456bc0642d63c92c 40,69
+configs/subsystem-budget.txt
+  a79fd36ea0e4dfe4 1-34
+scripts/subsystem-rollup.py
+  0216535cb0ccc540 45-48,55,218-226,397-404,544-773,834-848,859-875,958-968
+  a79fd36ea0e4dfe4 3,5-9,11-44,51-52,60,64-74,76-78,81-82,85-112,122-125,131-138,142-145,147-150,153-154,159-160,165-186,188-207,209-210,212,215-216,228-231,235-236,254-396,405-543,774-803,808,814,821-827,853-854,876-880,885-887,891-894,896,898-901,904-914,916-920,922,924-957
+scripts/kernel-size-report.sh
+  0216535cb0ccc540 191-193,197-202,208,219-221
+  a79fd36ea0e4dfe4 14-16,153,176-190,203,206-207,209-210,212-218,225-242,255-256
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "134697fa48ba4170959d6ab16c1d6c3ab85f7e48",
+  "prompts": {
+    "0216535cb0ccc540": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "557b5969-40fb-4c21-ad05-22b61a27b5ac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 1111,
+      "total_deletions": 593,
+      "accepted_lines": 818,
+      "overriden_lines": 0
+    },
+    "1fd6f421dd0454a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1fddddb8-876d-4750-b309-bd405a255026",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 204,
+      "total_deletions": 52,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    },
+    "456bc0642d63c92c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a666171-31bf-4adc-b018-b9e8b56e832c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 316,
+      "overriden_lines": 0
+    },
+    "527dfde82d19002c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9629cb35-b036-42ec-b2fd-89a32c6574cb",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 32,
+      "total_deletions": 6,
+      "accepted_lines": 32,
+      "overriden_lines": 0
+    },
+    "a79fd36ea0e4dfe4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "296737de-2c97-4acd-91e5-d4c8efb59266",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 1161,
+      "total_deletions": 178,
+      "accepted_lines": 1097,
+      "overriden_lines": 0
+    },
+    "df80ce19aab27650": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58bbff10-9782-445b-9f13-2ae479b4ee85",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 132,
+      "overriden_lines": 0
+    }
+  }
+}
