@@ -39,6 +39,14 @@ KERNEL_EXPERIMENT=${KERNEL_EXPERIMENT:-none}
 KERNEL_ORDER_FILE=${KERNEL_ORDER_FILE:-}
 KERNEL_SYSCALL_TABLE=${KERNEL_SYSCALL_TABLE:-}
 KERNEL_CONFIG_FRAGMENT=${KERNEL_CONFIG_FRAGMENT:-}
+# DWARF policy. The default ('none') matches the production image:
+# CONFIG_DEBUG_INFO_NONE=y, addr2line cannot resolve any symbol, and
+# scripts/subsystem-rollup.py exits with the documented "DWARF
+# missing" code. Set KERNEL_DEBUG_INFO=reduced to ship REDUCED DWARF
+# so the diagnostic rollup can attribute symbols to source dirs. The
+# deployed Image is stripped of debug sections before bootwrapper
+# packing, so this knob only changes vmlinux artifacts and link time.
+KERNEL_DEBUG_INFO=${KERNEL_DEBUG_INFO:-none}
 KERNEL_REPORT_DIR=${KERNEL_REPORT_DIR:-${ROOTDIR}/profiles/kernel-pgo}
 PGO_WORKLOAD_FILE=${PGO_WORKLOAD_FILE:-${ROOTDIR}/configs/pgo-workload.txt}
 PGO_BASE_CONFIG_FRAGMENT=${PGO_BASE_CONFIG_FRAGMENT:-${ROOTDIR}/configs/kernel-pgo-prune.config}
@@ -74,6 +82,7 @@ image_fingerprint() {
         printf 'KERNEL_ORDER_FILE=%s\n' "${KERNEL_ORDER_FILE}"
         printf 'KERNEL_SYSCALL_TABLE=%s\n' "${KERNEL_SYSCALL_TABLE}"
         printf 'KERNEL_CONFIG_FRAGMENT=%s\n' "${KERNEL_CONFIG_FRAGMENT}"
+        printf 'KERNEL_DEBUG_INFO=%s\n' "${KERNEL_DEBUG_INFO}"
         if [ -n "${KERNEL_ORDER_FILE}" ] && [ -f "${KERNEL_ORDER_FILE}" ]; then
             sha256sum "${KERNEL_ORDER_FILE}"
         fi
@@ -759,11 +768,35 @@ build_linux() {
     # default contributes ~180KB of static .data via _printk_rb_static_infos.
     sed -i "/^CONFIG_LOG_BUF_SHIFT=/d" .config
     echo "CONFIG_LOG_BUF_SHIFT=12" >>.config
-    # No DWARF in vmlinux: shortens the kernel link and shrinks build
-    # artifacts. CONFIG_DEBUG_INFO is a hidden bool selected by the
-    # DWARF4/5 choice options; once DEBUG_INFO_NONE wins, it disappears
-    # from .config rather than emitting an explicit "not set" line.
-    echo "CONFIG_DEBUG_INFO_NONE=y" >>.config
+    # DWARF policy. Production: CONFIG_DEBUG_INFO_NONE=y (no DWARF in
+    # vmlinux, fastest link, smallest build artifacts). Diagnostic:
+    # KERNEL_DEBUG_INFO=reduced enables CONFIG_DEBUG_INFO_REDUCED=y so
+    # scripts/subsystem-rollup.py can attribute every .text symbol to
+    # a source directory via addr2line. CONFIG_DEBUG_INFO is a hidden
+    # bool selected by the DWARF choice options; we never set it
+    # directly. The deployed Image is stripped of debug sections, so
+    # the diagnostic build does not change shipped image size.
+    case "${KERNEL_DEBUG_INFO}" in
+    none)
+        echo "CONFIG_DEBUG_INFO_NONE=y" >>.config
+        ;;
+    reduced)
+        # The "Debug information" choice block requires exactly one
+        # positive selection. Pick TOOLCHAIN_DEFAULT (which selects
+        # the hidden CONFIG_DEBUG_INFO bool), then layer
+        # DEBUG_INFO_REDUCED on top -- it is a depends-on-DEBUG_INFO
+        # modifier, not a choice member. Stating only DEBUG_INFO_NONE
+        # off would leave the choice under-specified and olddefconfig
+        # would silently fall back to the kconfig default.
+        echo "# CONFIG_DEBUG_INFO_NONE is not set" >>.config
+        echo "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y" >>.config
+        echo "CONFIG_DEBUG_INFO_REDUCED=y" >>.config
+        ;;
+    *)
+        echo "ERROR: KERNEL_DEBUG_INFO must be 'none' or 'reduced' (got '${KERNEL_DEBUG_INFO}')"
+        exit 1
+        ;;
+    esac
     # Drop the ARM EABI unwind tables (.ARM.exidx/.ARM.extab, ~75KB).
     # Requires patch 0010 to introduce UNWINDER_NONE on Thumb-2.
     echo "# CONFIG_UNWINDER_ARM is not set" >>.config
@@ -803,6 +836,19 @@ build_linux() {
     echo "# CONFIG_VM_EVENT_COUNTERS is not set" >>.config
     echo "# CONFIG_SHMEM is not set" >>.config
     echo "# CONFIG_SECURITY is not set" >>.config
+
+    # Initrd decompressor pruning: the embedded initramfs is gzip-compressed
+    # (CONFIG_INITRAMFS_COMPRESSION_GZIP=y). Every other RD_* selector
+    # defaults to y under EXPERT and pulls a full decompressor library into
+    # the image -- olddefconfig silently restores them after defconfig.
+    # Sub-bucket rollup measured RD_ZSTD = 36,942 bytes (lib/zstd),
+    # RD_LZ4 = 10,972 bytes (lib/lz4), RD_XZ = 6,598 bytes (lib/xz) of
+    # dead .text in the production vmlinux. RD_ZSTD also pulls
+    # lib/xxhash.c (~3KB). Keep RD_GZIP=y as the boot-path requirement;
+    # explicitly disable the rest.
+    echo "# CONFIG_RD_ZSTD is not set" >>.config
+    echo "# CONFIG_RD_LZ4 is not set" >>.config
+    echo "# CONFIG_RD_XZ is not set" >>.config
 
     # Serial-only target: drop the VT terminal layer and accessibility
     # console support.  CONFIG_TTY stays on -- the AMBA PL011 console
@@ -871,7 +917,6 @@ build_linux() {
         "# CONFIG_BLOCK is not set" \
         "CONFIG_SLUB_TINY=y" \
         "CONFIG_LOG_BUF_SHIFT=12" \
-        "CONFIG_DEBUG_INFO_NONE=y" \
         "CONFIG_UNWINDER_NONE=y" \
         "# CONFIG_IO_URING is not set" \
         "# CONFIG_FUTEX is not set" \
@@ -905,7 +950,10 @@ build_linux() {
         "# CONFIG_SECCOMP is not set" \
         "# CONFIG_KEYS is not set" \
         "# CONFIG_STACKPROTECTOR is not set" \
-        "# CONFIG_DEBUG_BUGVERBOSE is not set"; do
+        "# CONFIG_DEBUG_BUGVERBOSE is not set" \
+        "# CONFIG_RD_ZSTD is not set" \
+        "# CONFIG_RD_LZ4 is not set" \
+        "# CONFIG_RD_XZ is not set"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
@@ -919,6 +967,28 @@ build_linux() {
         echo "ERROR: CONFIG_ARM_UNWIND=y survived olddefconfig (UNWINDER_NONE patch broken?)"
         exit 1
     fi
+
+    # DWARF policy is mode-conditional: production keeps DEBUG_INFO_NONE=y,
+    # the diagnostic build keeps DEBUG_INFO_REDUCED=y. The other side must
+    # not survive olddefconfig in either mode.
+    case "${KERNEL_DEBUG_INFO}" in
+    none)
+        if ! grep -q "^CONFIG_DEBUG_INFO_NONE=y\$" .config; then
+            echo "ERROR: expected 'CONFIG_DEBUG_INFO_NONE=y' in .config (KERNEL_DEBUG_INFO=none)"
+            exit 1
+        fi
+        if grep -q "^CONFIG_DEBUG_INFO_REDUCED=y\$" .config; then
+            echo "ERROR: CONFIG_DEBUG_INFO_REDUCED=y survived olddefconfig despite KERNEL_DEBUG_INFO=none"
+            exit 1
+        fi
+        ;;
+    reduced)
+        if ! grep -q "^CONFIG_DEBUG_INFO_REDUCED=y\$" .config; then
+            echo "ERROR: expected 'CONFIG_DEBUG_INFO_REDUCED=y' in .config (KERNEL_DEBUG_INFO=reduced)"
+            exit 1
+        fi
+        ;;
+    esac
 
     # Negative-guard for symbols whose `# CONFIG_X is not set` line gets
     # stripped by olddefconfig because their `depends on` clause is unmet
@@ -938,6 +1008,22 @@ build_linux() {
                DEVTMPFS_MOUNT; do
         if grep -q "^CONFIG_${sym}=y\$" .config; then
             echo "ERROR: CONFIG_${sym}=y survived olddefconfig (subsystem disable broken?)"
+            exit 1
+        fi
+    done
+
+    # Decompressor library guard. RD_ZSTD/RD_LZ4/RD_XZ disabled above
+    # must cascade to ZSTD_DECOMPRESS / LZ4_DECOMPRESS / XZ_DEC, the
+    # umbrella DECOMPRESS_* hidden bools, and XXHASH (selected by
+    # ZSTD_DECOMPRESS, also pulled by BCACHE / BTRFS but those need
+    # BLOCK=y which this target lacks). If anything else still
+    # selects them (a future fs/ or net/ enable, e.g. squashfs+zstd),
+    # we must catch that drift loudly so the size win does not
+    # silently regress.
+    for sym in ZSTD_DECOMPRESS ZSTD_COMMON LZ4_DECOMPRESS XZ_DEC \
+               XXHASH DECOMPRESS_ZSTD DECOMPRESS_LZ4 DECOMPRESS_XZ; do
+        if grep -q "^CONFIG_${sym}=y\$" .config; then
+            echo "ERROR: CONFIG_${sym}=y survived olddefconfig (decompressor guard tripped)"
             exit 1
         fi
     done
