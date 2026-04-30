@@ -1,0 +1,73 @@
+scripts/qemu-profile.expect
+  df80ce19aab27650 37-40,42,160-176
+scripts/validate-qemu.expect
+  df80ce19aab27650 29-32,34,155-174
+patches/0011-tiny-arm-nommu-pfn-valid.patch
+  df80ce19aab27650 1-51
+build.sh
+  df80ce19aab27650 648,692-706,1726-1728,1735-1738
+  9a983936c0c4614e 1717-1725,1739
+configs/mps2-slim.dts
+  df80ce19aab27650 1-85
+configs/pgo-workload.txt
+  df80ce19aab27650 2-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "278ae07d3951bd13aaa10e32a9665adef03d21d9",
+  "prompts": {
+    "456bc0642d63c92c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a666171-31bf-4adc-b018-b9e8b56e832c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 366,
+      "total_deletions": 102,
+      "accepted_lines": 316,
+      "overriden_lines": 0
+    },
+    "9a983936c0c4614e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ddce4-959c-7b50-a801-def5a61f6368",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 10,
+      "total_deletions": 5,
+      "accepted_lines": 10,
+      "overriden_lines": 0
+    },
+    "ddbc405b800c562f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "52524da5-1921-4632-9f58-2adeaba476e2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 82,
+      "total_deletions": 83,
+      "accepted_lines": 141,
+      "overriden_lines": 0
+    },
+    "df80ce19aab27650": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58bbff10-9782-445b-9f13-2ae479b4ee85",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 319,
+      "total_deletions": 103,
+      "accepted_lines": 235,
+      "overriden_lines": 0
+    }
+  }
+}
