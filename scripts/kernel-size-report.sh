@@ -11,7 +11,9 @@ MODE=${5:-full}
 TARGET=arm-uclinuxfdpiceabi
 SIZE_TOOL=${ROOTDIR}/toolchain/bin/${TARGET}-size
 NM_TOOL=${ROOTDIR}/toolchain/bin/${TARGET}-nm
-TEXT_ROLLUP=${ROOTDIR}/scripts/text-rollup.py
+SUBSYSTEM_ROLLUP=${ROOTDIR}/scripts/subsystem-rollup.py
+SUBSYSTEM_BUDGET_CHECK=${ROOTDIR}/scripts/check-subsystem-budget.py
+SUBSYSTEM_BUDGET_FILE=${ROOTDIR}/configs/subsystem-budget.txt
 BLOAT_O_METER=${LINUXDIR}/scripts/bloat-o-meter
 
 mkdir -p "${OUTDIR}"
@@ -148,7 +150,7 @@ report_bloat_o_meter() {
     # bloat-o-meter shells out to `${prefix}nm` directly, so it needs the
     # cross toolchain on PATH. build.sh exports PATH already; running this
     # script standalone does not. Run in a subshell so the modified PATH
-    # does not leak into report_text_rollup or anything downstream.
+    # does not leak into report_subsystem_rollup or anything downstream.
     (
         PATH=${ROOTDIR}/toolchain/bin:${PATH}
         export PATH
@@ -171,26 +173,71 @@ report_bloat_o_meter() {
     )
 }
 
-# Subsystem rollup is opt-out only when DWARF is missing or addr2line
-# fails. A missing rollup is acceptable; an empty stale file is not.
-report_text_rollup() {
-    # Use -r, not -x: the script is invoked via `python3 ${TEXT_ROLLUP}`,
-    # so the +x bit is not part of the runtime contract. A checkout that
-    # preserves contents but drops the execute bit (zip extraction, some
-    # rsync flags) would otherwise silently disable the rollup.
-    if [ ! -r "${TEXT_ROLLUP}" ] || [ ! -f "${OUTDIR}/vmlinux.current" ]; then
-        rm -f "${OUTDIR}/text-rollup.txt" "${OUTDIR}/text-rollup.err"
+# LTO-aware subsystem rollup. The Python tool fails with exit code 2
+# when DWARF is missing (production builds, CONFIG_DEBUG_INFO_NONE=y);
+# the shell layer treats that as a documented skip rather than a build
+# failure. The diagnostic build (KERNEL_DEBUG_INFO=reduced) ships
+# enough DWARF for addr2line to attribute symbols, and the rollup
+# emits subsystem-rollup.txt + .svg + .html under OUTDIR.
+report_subsystem_rollup() {
+    # Use -r, not -x: the script runs via `python3`, so the +x bit
+    # is not part of the runtime contract. A checkout that preserves
+    # contents but drops the execute bit (zip extraction, some rsync
+    # flags) would otherwise silently disable the rollup.
+    if [ ! -r "${SUBSYSTEM_ROLLUP}" ] || [ ! -f "${OUTDIR}/vmlinux.current" ]; then
+        rm -f "${OUTDIR}/subsystem-rollup.txt" \
+            "${OUTDIR}/subsystem-rollup.err" \
+            "${OUTDIR}/subsystem-rollup-bars.svg" \
+            "${OUTDIR}/subsystem-rollup-tree.html" \
+            "${OUTDIR}/subsystem-rollup-deep.txt" \
+            "${OUTDIR}/subsystem-rollup-deep.html"
         return 0
     fi
 
-    if python3 "${TEXT_ROLLUP}" \
+    # --deep kernel --deep lib drives the per-bucket source-file
+    # breakdown the methodology refers to. The two big parents account
+    # for ~45% of resident .text after the RD_*-cleanup work, and the
+    # depth-2 view (kernel/sched, lib/zstd, ...) is what surfaces
+    # actionable single-knob disables. Add more --deep flags here when
+    # another parent bucket grows large enough to warrant drilling.
+    if python3 "${SUBSYSTEM_ROLLUP}" \
             --vmlinux "${OUTDIR}/vmlinux.current" \
             --linux-tree "${LINUXDIR}" \
-            --output "${OUTDIR}/text-rollup.txt" 2>"${OUTDIR}/text-rollup.err"; then
-        rm -f "${OUTDIR}/text-rollup.err"
+            --toolchain-bin "${ROOTDIR}/toolchain/bin" \
+            --output "${OUTDIR}/subsystem-rollup.txt" \
+            --deep kernel --deep lib \
+            2>"${OUTDIR}/subsystem-rollup.err"; then
+        rm -f "${OUTDIR}/subsystem-rollup.err"
     else
-        rm -f "${OUTDIR}/text-rollup.txt"
+        # Failure modes:
+        #   exit 1 -- input/tooling problem (loud); leave .err for triage
+        #   exit 2 -- DWARF missing (production build); expected, drop
+        #             the stale outputs but keep .err so the operator
+        #             can confirm the cause if it surprises them.
+        rm -f "${OUTDIR}/subsystem-rollup.txt" \
+            "${OUTDIR}/subsystem-rollup-bars.svg" \
+            "${OUTDIR}/subsystem-rollup-tree.html" \
+            "${OUTDIR}/subsystem-rollup-deep.txt" \
+            "${OUTDIR}/subsystem-rollup-deep.html"
     fi
+}
+
+# Compare the subsystem rollup against configs/subsystem-budget.txt.
+# Warn-only: a breach prints to stderr and writes a status file but
+# does not abort the build. The total-bytes regression gate stays the
+# coarse gate; this layer answers WHICH bucket regressed.
+report_subsystem_budget() {
+    if [ ! -r "${SUBSYSTEM_BUDGET_CHECK}" ] \
+        || [ ! -r "${SUBSYSTEM_BUDGET_FILE}" ] \
+        || [ ! -f "${OUTDIR}/subsystem-rollup.txt" ]; then
+        rm -f "${OUTDIR}/subsystem-budget.txt"
+        return 0
+    fi
+
+    python3 "${SUBSYSTEM_BUDGET_CHECK}" \
+        --rollup "${OUTDIR}/subsystem-rollup.txt" \
+        --budget "${SUBSYSTEM_BUDGET_FILE}" \
+        --output "${OUTDIR}/subsystem-budget.txt" || true
 }
 
 case "${MODE}" in
@@ -205,7 +252,8 @@ full)
     snapshot_vmlinux
     report_section_delta
     report_bloat_o_meter
-    report_text_rollup
+    report_subsystem_rollup
+    report_subsystem_budget
     ;;
 *)
     echo "ERROR: unknown mode '${MODE}' (expected: full | files)" >&2
