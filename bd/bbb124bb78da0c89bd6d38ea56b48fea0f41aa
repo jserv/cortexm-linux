@@ -1,0 +1,38 @@
+configs/kernel-pgo-prune.config
+  ddbc405b800c562f 1-7,9
+build.sh
+  ddbc405b800c562f 734,757-837,840-843,860-893,908-929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "bdbbb124bb78da0c89bd6d38ea56b48fea0f41aa",
+  "prompts": {
+    "ddbc405b800c562f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "52524da5-1921-4632-9f58-2adeaba476e2",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 291,
+      "total_deletions": 196,
+      "accepted_lines": 262,
+      "overriden_lines": 0
+    },
+    "f320a85dde2d39e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08a72bf4-b8db-47f7-9da9-d6a0840a1cb9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 108,
+      "total_deletions": 68,
+      "accepted_lines": 121,
+      "overriden_lines": 0
+    }
+  }
+}
