@@ -20,6 +20,138 @@ ORDER_MIN_SYMBOLS = 64
 ORDER_MAX_SYMBOLS = 256
 ORDER_TARGET_HIT_RATIO = 0.80
 
+# GCC LTO/IPA clones share a base function but suffix the symbol name.
+# Roll them up so a bootcost roll-up does not under-count work that LTO
+# split into a private clone.
+LTO_SUFFIX_RE = re.compile(r"\.(lto_priv|constprop|part|isra|cold|local|fold)\.\d+$")
+
+# Buckets used by the bootcost roll-up.  Patterns match against the
+# LTO-stripped base symbol name.  Order matters: a symbol joins the first
+# bucket it matches, so place narrower buckets first.
+BOOTCOST_BUCKETS = (
+    (
+        "context_switch",
+        (
+            "__switch_to",
+            "cpu_switch_to",
+        ),
+    ),
+    (
+        "scheduler",
+        (
+            "__schedule",
+            "schedule",
+            "schedule_idle",
+            "do_idle",
+            "cpuhp_report_idle_dead",
+            "pick_next_task_fair",
+            "pick_next_task",
+            "dequeue_entities",
+            "dequeue_task_fair",
+            "enqueue_task_fair",
+            "update_curr",
+            "update_load_avg",
+            "__cond_resched",
+            "__sched_setscheduler",
+        ),
+    ),
+    (
+        "syscall_entry",
+        (
+            "vector_swi",
+            "ret_fast_syscall",
+            "syscall_trace_enter",
+            "syscall_trace_exit",
+        ),
+    ),
+    (
+        "exec_path",
+        (
+            "do_execveat_common",
+            "kernel_execve",
+            "bprm_execve",
+            "bprm_execve_security",
+            "load_elf_fdpic_binary",
+            "elf_fdpic_map_file",
+            "elf_fdpic_fetch_phdrs",
+            "setup_arg_pages",
+            "copy_string_kernel",
+            "sys_execve",
+            "sys_execveat",
+            "__se_sys_execve",
+            "__se_sys_execveat",
+        ),
+    ),
+    (
+        "fork_clone",
+        (
+            "kernel_clone",
+            "copy_process",
+            "wake_up_new_task",
+            "sys_clone",
+            "sys_vfork",
+            "__se_sys_clone",
+            "__se_sys_vfork",
+        ),
+    ),
+    (
+        "softirq_irq",
+        (
+            "__do_softirq",
+            "____do_softirq",
+            "irq_enter",
+            "irq_exit",
+            "handle_IRQ",
+            "asm_do_IRQ",
+        ),
+    ),
+)
+
+
+def _strip_lto_suffix(name):
+    while True:
+        stripped = LTO_SUFFIX_RE.sub("", name)
+        if stripped == name:
+            return stripped
+        name = stripped
+
+
+def compute_bootcost(counts, total_hits):
+    bucket_index = {}
+    for bucket_name, members in BOOTCOST_BUCKETS:
+        for member in members:
+            bucket_index.setdefault(member, bucket_name)
+
+    bucket_totals = collections.OrderedDict(
+        (name, 0) for name, _ in BOOTCOST_BUCKETS
+    )
+    bucket_members = collections.defaultdict(list)
+    matched_total = 0
+
+    for symbol, hits in counts.items():
+        base = _strip_lto_suffix(symbol)
+        bucket = bucket_index.get(base)
+        if bucket is None:
+            continue
+        bucket_totals[bucket] += hits
+        bucket_members[bucket].append((base, symbol, hits))
+        matched_total += hits
+
+    for bucket in bucket_members:
+        bucket_members[bucket].sort(key=lambda item: (-item[2], item[0]))
+
+    bucket_ratios = collections.OrderedDict()
+    for name, hits in bucket_totals.items():
+        bucket_ratios[name] = (hits / total_hits) if total_hits else 0.0
+
+    return {
+        "bucket_totals": bucket_totals,
+        "bucket_ratios": bucket_ratios,
+        "bucket_members": bucket_members,
+        "matched_total": matched_total,
+        "matched_ratio": (matched_total / total_hits) if total_hits else 0.0,
+    }
+
 
 def resolve_nm(vmlinux: pathlib.Path):
     cross_compile = os.environ.get("CROSS_COMPILE", "")
@@ -215,6 +347,35 @@ def write_outputs(prefix: pathlib.Path, counts, first_seen, total, matched, sysc
         )
         handle.write(f"layout_ordering_reason={concentration['layout_ordering_reason']}\n")
 
+    bootcost = compute_bootcost(counts, matched)
+    bootcost_path = prefix.with_name(prefix.name + "_bootcost.txt")
+    with bootcost_path.open("w", encoding="utf-8") as handle:
+        handle.write("# Boot-cost roll-up (TB executions per scheduler/exec/syscall bucket).\n")
+        handle.write("# Counts are translation-block executions, NOT cycles: QEMU's MPS2-AN386\n")
+        handle.write("# model maps the entire DWT block (0xe0001000) to a RAZ/WI default handler\n")
+        handle.write("# (qemu hw/arm/armv7m.c, ppb_default_ops), so DWT_CYCCNT reads as zero and\n")
+        handle.write("# any kernel-side cycle-delta instrumentation would silently produce 0.\n")
+        handle.write(f"matched_kernel_blocks={matched}\n")
+        handle.write(f"bootcost_matched_blocks={bootcost['matched_total']}\n")
+        handle.write(f"bootcost_matched_ratio={bootcost['matched_ratio']:.4f}\n")
+        for bucket_name in bootcost["bucket_totals"]:
+            handle.write(
+                f"{bucket_name}_hits={bootcost['bucket_totals'][bucket_name]}\n"
+            )
+            handle.write(
+                f"{bucket_name}_ratio={bootcost['bucket_ratios'][bucket_name]:.4f}\n"
+            )
+        handle.write("members:\n")
+        for bucket_name, _ in BOOTCOST_BUCKETS:
+            members = bootcost["bucket_members"].get(bucket_name, [])
+            if not members:
+                handle.write(f"  [{bucket_name}] (no hits)\n")
+                continue
+            handle.write(f"  [{bucket_name}]\n")
+            for base, symbol, hits in members:
+                tag = symbol if symbol == base else f"{symbol} -> {base}"
+                handle.write(f"    {hits:8d} {tag}\n")
+
     summary = prefix.with_name(prefix.name + "_summary.txt")
     with summary.open("w", encoding="utf-8") as handle:
         handle.write("profile_source=qemu-system-arm-system-mode\n")
@@ -233,6 +394,11 @@ def write_outputs(prefix: pathlib.Path, counts, first_seen, total, matched, sysc
         )
         handle.write(f"layout_ordering_reason={concentration['layout_ordering_reason']}\n")
         handle.write(f"detected_syscalls={len(syscall_counts)}\n")
+        for bucket_name in bootcost["bucket_totals"]:
+            handle.write(
+                f"bootcost_{bucket_name}_ratio={bootcost['bucket_ratios'][bucket_name]:.4f}\n"
+            )
+        handle.write(f"bootcost_total_ratio={bootcost['matched_ratio']:.4f}\n")
         handle.write("top_symbols:\n")
         for name, count in counts.most_common(80):
             handle.write(f"{count:8d} {name}\n")

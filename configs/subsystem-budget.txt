@@ -1,0 +1,34 @@
+# Per-bucket vmlinux .text byte ceilings.
+#
+# Format:  <bucket>  <ceiling-bytes>  [<noise-band-pct>]
+#
+# - Bucket names match scripts/subsystem-rollup.py output. Run a
+#   diagnostic build (KERNEL_DEBUG_INFO=reduced) and inspect
+#   profiles/kernel-pgo/none/subsystem-rollup.txt for the live names.
+# - The noise band absorbs run-to-run variance from GCC LTO
+#   re-deciding what to inline when nothing semantic changed. Default
+#   is 2.0%. Start there, then tighten after observing a week of
+#   clean builds. <icf-merged> tends to be jitterier than real
+#   subsystems -- a wider band there is reasonable.
+# - A breach is "actual > limit * (1 + band/100)". The total-bytes
+#   gate is the coarse safeguard; this layer answers WHICH bucket
+#   regressed.
+#
+# How to populate:
+#   1. KERNEL_DEBUG_INFO=reduced ./build.sh linux bootwrapper
+#   2. Read profiles/kernel-pgo/none/subsystem-rollup.txt for the
+#      observed sizes.
+#   3. Pick ceilings 5-10% above each observed value -- enough room
+#      for legitimate growth without masking regressions.
+#
+# Example values (uncomment and tune to your build):
+#   kernel              260000   2.0
+#   mm                   80000   2.0
+#   fs                   20000   2.0
+#   arch/arm            120000   2.0
+#   drivers/tty          25000   2.0
+#   drivers/clocksource  10000   2.0
+#   lib                  70000   2.0
+#   crypto                5000   2.0
+#   <icf-merged>         30000   5.0
+#   <compiler-partition>  5000   5.0
