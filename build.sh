@@ -645,7 +645,7 @@ build_linux() {
     cd linux-${LINUX_VERSION}
 
     # Apply linux-tiny patches for reduced memory footprint and LTO support
-    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch; do
+    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch; do
         [ -f "${p}" ] || continue
         apply_patch_once "${p}"
     done
@@ -689,6 +689,21 @@ build_linux() {
     sed -i "/CONFIG_INITRAMFS_SOURCE=/d" .config
     echo "CONFIG_INITRAMFS_SOURCE=\"${ROOTFS} ${ROOTDIR}/configs/rootfs.dev\"" >>.config
     echo "CONFIG_INITRAMFS_COMPRESSION_GZIP=y" >>.config
+    # NOTE: LZ4 and ZSTD have been evaluated on this 16 MiB SSRAM target
+    # and both panic during initramfs unpack. lib/decompress_unlz4.c
+    # hardcodes an 8 MiB output buffer (LZ4_DEFAULT_UNCOMPRESSED_CHUNK_SIZE)
+    # which requires an order-11 contiguous block; the buddy allocator
+    # never forms one at boot on this RAM size even with
+    # ARCH_FORCE_MAX_ORDER=11. lib/decompress_unzstd.c sizes its DStream
+    # workspace from the compressed file's windowSize header, and the
+    # default `zstd -19` (scripts/Makefile.lib cmd_zstd) emits an
+    # 8 MiB window so the workspace also exceeds MAX_PAGE_ORDER. Any
+    # switch away from gzip on this target needs either kernel patches
+    # (chunk size in the LZ4 wrapper, or zstd command-line in
+    # scripts/Makefile.lib) or installing lzop on the build host. Until
+    # then, gzip stays and inflate_fast remains ~2.8% of matched boot
+    # blocks (95k TB hits) -- the cost is real but the alternatives are
+    # unbootable as wired today.
     if [ -n "${KERNEL_CONFIG_FRAGMENT}" ] && [ -f "${KERNEL_CONFIG_FRAGMENT}" ]; then
         cat "${KERNEL_CONFIG_FRAGMENT}" >>.config
     fi
@@ -1699,15 +1714,29 @@ build_kernel_pgo_cycle() {
 build_bootwrapper() {
     echo "BUILD: building ARM CORTEX boot wrapper"
 
+    # Reuse the kernel-built dtc when available so fresh hosts do not need
+    # a separate device-tree-compiler package just for the bootwrapper DTB.
+    DTC_BIN="${ROOTDIR}/linux-${LINUX_VERSION}/scripts/dtc/dtc"
+    if [ -x "${DTC_BIN}" ]; then
+        :
+    elif command -v dtc >/dev/null 2>&1; then
+        DTC_BIN=dtc
+    else
+        echo "ERROR: no dtc available (expected ${DTC_BIN} or host 'dtc' in PATH)" >&2
+        exit 1
+    fi
+
     if [ ! -d bootwrapper ]; then
         run_logged "clone bootwrapper" git clone --depth 1 --single-branch https://github.com/ARM-software/bootwrapper.git -b cortex-m-linux
     fi
 
     cd bootwrapper
     cp ../linux-${LINUX_VERSION}/arch/arm/boot/Image .
-    # Linux 7.0 does not ship an AN386 DTS; the AN385 DTB is compatible
-    # because both FPGA images share the same peripheral and memory map.
-    cp ../linux-${LINUX_VERSION}/arch/arm/boot/dts/arm/mps2-an385.dtb mps2.dtb
+    # Hand-pruned DTS strips disabled peripherals (sp804/sp805/extra UARTs),
+    # the SMSC ethernet, FPGA LED MFD, and unused fixed-clocks; this halves
+    # the bootwrapper DTB and roughly halves the early-boot fdt_* hot path.
+    run_logged "compile slim mps2 dtb" \
+        "${DTC_BIN}" -q -I dts -O dtb -o mps2.dtb ../configs/mps2-slim.dts
     sed -i -e 's/mps2-an399.dtb/mps2.dtb/' -e 's/mps2-an385.dtb/mps2.dtb/' Makefile
     sed -i 's/0x60000000/0x21000000/' Makefile
     sed -i 's/. = PHYS_OFFSET;/. = 0x0;/' linux.lds.S

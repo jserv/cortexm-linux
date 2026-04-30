@@ -1,0 +1,85 @@
+/dts-v1/;
+
+/ {
+	#address-cells = <0x01>;
+	#size-cells = <0x01>;
+	model = "ARM MPS2 Application Note 385/386 (slim)";
+	compatible = "arm,mps2";
+
+	chosen {
+		bootargs = "earlycon";
+		stdout-path = "serial0:9600n8";
+	};
+
+	aliases {
+		serial0 = "/soc/apb@40000000/serial@4000";
+	};
+
+	memory@21000000 {
+		device_type = "memory";
+		reg = <0x21000000 0x1000000>;
+	};
+
+	interrupt-controller@e000e100 {
+		compatible = "arm,armv7m-nvic";
+		interrupt-controller;
+		#interrupt-cells = <0x01>;
+		reg = <0xe000e100 0xc00>;
+		phandle = <0x01>;
+	};
+
+	clock-50000000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <0x2faf080>;
+		phandle = <0x03>;
+	};
+
+	clock-sys {
+		compatible = "fixed-factor-clock";
+		clocks = <0x03>;
+		#clock-cells = <0x00>;
+		clock-div = <0x02>;
+		clock-mult = <0x01>;
+		phandle = <0x02>;
+	};
+
+	soc {
+		#address-cells = <0x01>;
+		#size-cells = <0x01>;
+		compatible = "simple-bus";
+		interrupt-parent = <0x01>;
+		ranges;
+
+		apb@40000000 {
+			compatible = "simple-bus";
+			#address-cells = <0x01>;
+			#size-cells = <0x01>;
+			ranges = <0x00 0x40000000 0x10000>;
+
+			mps2-timer0@0 {
+				compatible = "arm,mps2-timer";
+				reg = <0x00 0x1000>;
+				interrupts = <0x08>;
+				clocks = <0x02>;
+				status = "okay";
+			};
+
+			mps2-timer1@1000 {
+				compatible = "arm,mps2-timer";
+				reg = <0x1000 0x1000>;
+				interrupts = <0x09>;
+				clocks = <0x02>;
+				status = "okay";
+			};
+
+			serial@4000 {
+				compatible = "arm,mps2-uart";
+				reg = <0x4000 0x1000>;
+				interrupts = <0x00 0x01 0x0c>;
+				clocks = <0x02>;
+				status = "okay";
+			};
+		};
+	};
+};
