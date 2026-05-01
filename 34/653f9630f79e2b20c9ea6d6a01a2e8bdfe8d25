@@ -1,0 +1,70 @@
+.github/workflows/pr-rollup-comment.yml
+  c79d0deadcdceb2e 1-120
+.github/workflows/main.yml
+  c79d0deadcdceb2e 166
+scripts/rollup-to-markdown.py
+  c79d0deadcdceb2e 66-116
+scripts/kernel-size-report.sh
+  c79d0deadcdceb2e 237-242,245-263
+scripts/check-subsystem-budget.py
+  c79d0deadcdceb2e 22,27-34,87-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "34653f9630f79e2b20c9ea6d6a01a2e8bdfe8d25",
+  "prompts": {
+    "08b101fbcca26352": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7d94ea3b-ba16-452f-9932-4498489c2dbf",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 3,
+      "accepted_lines": 1539,
+      "overriden_lines": 0
+    },
+    "6a88eb5678ff0d29": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019de39b-5eb0-7b83-838a-4942c8e8db15",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 2146,
+      "total_deletions": 1014,
+      "accepted_lines": 1092,
+      "overriden_lines": 0
+    },
+    "95c1eac3675136fe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019de399-ca2c-71f0-9ca5-03cb8095ee17",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 22,
+      "total_deletions": 13,
+      "accepted_lines": 22,
+      "overriden_lines": 0
+    },
+    "c79d0deadcdceb2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "74855f13-abc9-4eaf-bfcb-819fba33b66f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 174,
+      "total_deletions": 45,
+      "accepted_lines": 173,
+      "overriden_lines": 0
+    }
+  }
+}
