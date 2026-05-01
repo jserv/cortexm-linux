@@ -19,9 +19,18 @@
 
 import argparse
 import pathlib
+import re
 import sys
 
 DEFAULT_BAND_PCT = 2.0
+
+# The deep-rollup writer emits "# <bucket> top <N> source files" as the
+# delimiter that closes the depth-2 budget-eligible region. N is the
+# `top_files` parameter on subsystem-rollup.py:write_deep_table and is
+# not currently exposed as a CLI flag, so matching the literal "top 20"
+# would silently drift if that default changed. Match any positive int
+# instead so the two scripts stay decoupled.
+TOP_FILES_HEADER_RE = re.compile(r" top \d+ source files$")
 
 
 def read_budget(path):
@@ -75,11 +84,52 @@ def read_rollup(path):
     return rows
 
 
+def read_deep_rollup(path):
+    rows = {}
+    in_depth2 = False
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line:
+            in_depth2 = False
+            continue
+        if line.startswith("## "):
+            in_depth2 = False
+            continue
+        if line.startswith("# "):
+            # Only the "by 2nd-level subdirectory" table is stable
+            # budget material. The subsequent "top N source files"
+            # table is intentionally excluded from the budget
+            # namespace: file-level churn is too high, and a file name
+            # like "kernel/workqueue.c" would collide conceptually
+            # with a genuine depth-2 bucket if the format ever grows.
+            if line.endswith(" by 2nd-level subdirectory"):
+                in_depth2 = True
+            elif TOP_FILES_HEADER_RE.search(line):
+                in_depth2 = False
+            continue
+        if not in_depth2:
+            continue
+        parts = raw.split("\t")
+        if len(parts) < 2:
+            continue
+        bucket = parts[0]
+        try:
+            rows[bucket] = int(parts[1])
+        except ValueError:
+            continue
+    return rows
+
+
 def main(argv):
     ap = argparse.ArgumentParser(
         description="Compare subsystem rollup against per-bucket budgets."
     )
     ap.add_argument("--rollup", required=True, type=pathlib.Path)
+    ap.add_argument(
+        "--deep-rollup",
+        type=pathlib.Path,
+        help="Optional subsystem-rollup-deep.txt for sub-bucket rules.",
+    )
     ap.add_argument("--budget", required=True, type=pathlib.Path)
     ap.add_argument(
         "--output",
@@ -101,9 +151,32 @@ def main(argv):
             file=sys.stderr,
         )
         return 2
+    if args.deep_rollup is not None and not args.deep_rollup.exists():
+        print(
+            f"check-subsystem-budget: deep rollup not found: "
+            f"{args.deep_rollup}",
+            file=sys.stderr,
+        )
+        return 2
 
     budgets = read_budget(args.budget)
     rollup = read_rollup(args.rollup)
+    deep_rollup = (
+        read_deep_rollup(args.deep_rollup)
+        if args.deep_rollup is not None
+        else {}
+    )
+
+    overlap = sorted(set(rollup) & set(deep_rollup))
+    if overlap:
+        print(
+            "check-subsystem-budget: top-level and deep rollups contain "
+            "the same bucket name(s), refusing ambiguous input: "
+            + ", ".join(overlap),
+            file=sys.stderr,
+        )
+        return 2
+    rollup.update(deep_rollup)
 
     if not budgets:
         # Empty file is a deliberate state: the operator has staged the
@@ -120,6 +193,11 @@ def main(argv):
     lines = [
         f"# subsystem budget check (default band = +/- {DEFAULT_BAND_PCT}%)",
         f"# rollup: {args.rollup}",
+        (
+            f"# deep rollup: {args.deep_rollup}"
+            if args.deep_rollup is not None
+            else "# deep rollup: (not provided)"
+        ),
         f"# budget: {args.budget}",
         "# bucket\tactual\tlimit\tband_pct\tdelta_vs_limit\tstatus",
     ]

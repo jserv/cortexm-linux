@@ -234,10 +234,33 @@ report_subsystem_budget() {
         return 0
     fi
 
-    python3 "${SUBSYSTEM_BUDGET_CHECK}" \
+    # Wipe before the run so an exit other than 0/1 (missing input,
+    # overlap-refusal, malformed file) cannot let a stale status file
+    # from a cached workspace masquerade as the current gate state.
+    rm -f "${OUTDIR}/subsystem-budget.txt"
+
+    set -- \
         --rollup "${OUTDIR}/subsystem-rollup.txt" \
         --budget "${SUBSYSTEM_BUDGET_FILE}" \
-        --output "${OUTDIR}/subsystem-budget.txt" || true
+        --output "${OUTDIR}/subsystem-budget.txt"
+    if [ -f "${OUTDIR}/subsystem-rollup-deep.txt" ]; then
+        set -- "$@" --deep-rollup "${OUTDIR}/subsystem-rollup-deep.txt"
+    fi
+
+    rc=0
+    python3 "${SUBSYSTEM_BUDGET_CHECK}" "$@" || rc=$?
+
+    # Exit codes from check-subsystem-budget.py:
+    #   0 -- ok       (status file written, gate clean)
+    #   1 -- breach   (status file written; warn-only at this layer)
+    #   2 -- input    (no status file; do not let a stale one survive)
+    case "${rc}" in
+        0|1) ;;
+        *)
+            echo "ERROR: subsystem budget checker exited ${rc}" >&2
+            rm -f "${OUTDIR}/subsystem-budget.txt"
+            ;;
+    esac
 }
 
 case "${MODE}" in

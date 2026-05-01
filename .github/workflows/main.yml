@@ -9,6 +9,9 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+permissions:
+  contents: read
+
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -75,6 +78,26 @@ jobs:
           QUIET: 1
         run: ./build.sh
 
+      - name: Build diagnostic subsystem rollup
+        if: success()
+        env:
+          QUIET: 1
+          KERNEL_DEBUG_INFO: reduced
+        run: ./build.sh linux bootwrapper
+
+      - name: Render subsystem rollup markdown
+        if: success()
+        run: |
+          python3 scripts/rollup-to-markdown.py \
+            --rollup profiles/kernel-pgo/none/subsystem-rollup.txt \
+            --budget-status profiles/kernel-pgo/none/subsystem-budget.txt \
+            --top 12 \
+            --output profiles/kernel-pgo/none/subsystem-rollup.md
+
+      - name: Add subsystem rollup to step summary
+        if: success()
+        run: cat profiles/kernel-pgo/none/subsystem-rollup.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Save source downloads cache
         if: always() && steps.restore-downloads.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
@@ -126,6 +149,21 @@ jobs:
           path: |
             logs
           if-no-files-found: ignore
+
+      - name: Upload subsystem rollup artifacts
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: subsystem-rollup
+          compression-level: 0
+          path: |
+            profiles/kernel-pgo/none/subsystem-rollup.txt
+            profiles/kernel-pgo/none/subsystem-rollup.md
+            profiles/kernel-pgo/none/subsystem-budget.txt
+            profiles/kernel-pgo/none/subsystem-rollup-tree.html
+            profiles/kernel-pgo/none/subsystem-rollup-deep.html
+            profiles/kernel-pgo/none/subsystem-rollup-bars.svg
+          if-no-files-found: warn
 
   qemu:
     name: Validate boot in QEMU
