@@ -1,0 +1,146 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: sched: thin pelt.c to its rt.c contract under CONFIG_SCHED_PELT_RT_MINI
+
+Patch 0014 (CONFIG_SCHED_FAIR_TINY) replaced fair.c's CFS body with a
+3-priority O(1) FIFO that does not call PELT, and patch 0013
+(CONFIG_SCHED_DEADLINE_CLASS=n) reduced deadline.c to a stub class
+whose only live callback is pick_task.  The CFS-side and DL-side PELT
+entry points (__update_load_avg_blocked_se, __update_load_avg_se,
+__update_load_avg_cfs_rq, update_dl_rq_load_avg) consequently lose
+all in-tree callers, but kernel/sched/pelt.c kept them as non-static
+externs and LTO cannot dead-strip across that linkage boundary -- the
+file stayed at its full 1,758-byte / 8-symbol footprint.
+
+CONFIG_SCHED_PELT_RT_MINI (default n; mainline behaviour preserved)
+trims pelt.c to the rt.c contract.  When set:
+
+  Kept:
+    runnable_avg_yN_inv data table   (~128 B; walked by decay_load)
+    decay_load                       (~84 B)
+    __accumulate_pelt_segments       (~48 B)
+    accumulate_sum                   (helper for ___update_load_sum)
+    ___update_load_sum               (helper for update_rt_rq_load_avg)
+    ___update_load_avg               (helper for update_rt_rq_load_avg)
+    update_rt_rq_load_avg            (~302 B; 4 callsites in rt.c)
+
+  Stubbed (return 0):
+    __update_load_avg_blocked_se     (no fair-class consumer post-0014)
+    __update_load_avg_se             (no fair-class consumer post-0014)
+    __update_load_avg_cfs_rq         (no fair-class consumer post-0014)
+    update_dl_rq_load_avg            (DL class stubbed by 0013)
+
+  Replaced with thin version:
+    update_other_load_avgs           (now: only update_rt_rq_load_avg;
+                                      DL/HW/IRQ paths drop)
+
+update_hw_load_avg (CONFIG_SCHED_HW_PRESSURE, unselected) and
+update_irq_load_avg (CONFIG_HAVE_SCHED_AVG_IRQ via IRQ_TIME_ACCOUNTING,
+unselected) are already inline-stubbed in kernel/sched/pelt.h on this
+target; we do not touch them here.  core.c::sched_tick still calls
+update_hw_load_avg unconditionally; it resolves to the inline no-op.
+
+Risk: low.  Future EAS / schedutil / fair-class re-enablement requires
+reverting this knob.
+
+Measured on Cortex-M4 nommu mps2-an386 (linux-7.0): pelt.c shrinks from
+1,758 to ~700 bytes; linux.axf trims roughly 1.0-1.4 KB depending on
+how LTO cascades into core.c sched_tick after the stubs flatten.
+
+---
+ init/Kconfig         | 22 ++++++++++++++++++++++
+ kernel/sched/pelt.c  | 18 ++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1050,6 +1050,28 @@ config POSIX_CPU_TIMERS
+ 	  setitimer become silent no-ops.  No syscall numbers vanish.
+ 	  Boot test before deploying.
+
++config SCHED_PELT_RT_MINI
++	bool "Trim PELT to its rt.c contract"
++	default n
++	help
++	  Drop the CFS-side and DL-side PELT entry points
++	  (__update_load_avg_blocked_se / __update_load_avg_se /
++	  __update_load_avg_cfs_rq / update_dl_rq_load_avg) from
++	  kernel/sched/pelt.c.  Replace their bodies with -> 0 stubs.
++	  Keep update_rt_rq_load_avg and its helpers (decay_load,
++	  __accumulate_pelt_segments, accumulate_sum, ___update_load_sum,
++	  ___update_load_avg, runnable_avg_yN_inv) live for rt.c's
++	  4 callsites.  Replace update_other_load_avgs with a thin version
++	  that only calls update_rt_rq_load_avg.
++
++	  Safe when SCHED_FAIR_TINY=y (fair.c does not call PELT) and
++	  SCHED_DEADLINE_CLASS=n (deadline.c stubbed and does not call
++	  PELT).  Re-enabling either requires reverting this knob because
++	  the dropped entry points are stubbed to no-ops, not removed
++	  from the link.
++
++	  Say N unless you are building a heavily size-constrained image.
++
+ endmenu
+
+ #
+diff --git a/kernel/sched/pelt.c b/kernel/sched/pelt.c
+--- a/kernel/sched/pelt.c
++++ b/kernel/sched/pelt.c
+@@ -293,6 +293,7 @@
+  *   load_avg = \Sum se->avg.load_avg
+  */
+
++#ifndef CONFIG_SCHED_PELT_RT_MINI
+ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
+ {
+ 	if (___update_load_sum(now, &se->avg, 0, 0, 0)) {
+@@ -331,6 +332,13 @@ int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq)
+
+ 	return 0;
+ }
++#else /* CONFIG_SCHED_PELT_RT_MINI */
++/* Fair-class PELT is dead under SCHED_FAIR_TINY=y; stub the externs. */
++int __update_load_avg_blocked_se(u64 now, struct sched_entity *se) { return 0; }
++int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq,
++			 struct sched_entity *se) { return 0; }
++int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq) { return 0; }
++#endif /* CONFIG_SCHED_PELT_RT_MINI */
+
+ /*
+  * rt_rq:
+@@ -370,6 +378,7 @@ int update_rt_rq_load_avg(u64 now, struct rq *rq, int running)
+  *
+  */
+
++#ifndef CONFIG_SCHED_PELT_RT_MINI
+ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
+ {
+ 	if (___update_load_sum(now, &rq->avg_dl,
+@@ -384,6 +393,10 @@ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
+
+ 	return 0;
+ }
++#else /* CONFIG_SCHED_PELT_RT_MINI */
++/* DL class stubbed by SCHED_DEADLINE_CLASS=n; no live caller. */
++int update_dl_rq_load_avg(u64 now, struct rq *rq, int running) { return 0; }
++#endif /* CONFIG_SCHED_PELT_RT_MINI */
+
+ #ifdef CONFIG_SCHED_HW_PRESSURE
+ /*
+@@ -476,6 +489,7 @@ int update_irq_load_avg(struct rq *rq, u64 running)
+  */
+ bool update_other_load_avgs(struct rq *rq)
+ {
++#ifndef CONFIG_SCHED_PELT_RT_MINI
+ 	u64 now = rq_clock_pelt(rq);
+ 	const struct sched_class *curr_class = rq->donor->sched_class;
+ 	unsigned long hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
+@@ -487,4 +501,8 @@ bool update_other_load_avgs(struct rq *rq)
+ 		update_dl_rq_load_avg(now, rq, curr_class == &dl_sched_class) |
+ 		update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure) |
+ 		update_irq_load_avg(rq, 0);
++#else /* CONFIG_SCHED_PELT_RT_MINI: only RT class survives */
++	lockdep_assert_rq_held(rq);
++	return update_rt_rq_load_avg(rq_clock_pelt(rq), rq, true);
++#endif
+ }

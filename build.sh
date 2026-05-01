@@ -666,7 +666,7 @@ build_linux() {
     cd linux-${LINUX_VERSION}
 
     # Apply linux-tiny patches for reduced memory footprint and LTO support
-    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch ../patches/0012-*.patch ../patches/0013-*.patch ../patches/0014-*.patch; do
+    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch ../patches/0012-*.patch ../patches/0013-*.patch ../patches/0014-*.patch ../patches/0015-*.patch ../patches/0016-*.patch ../patches/0017-*.patch ../patches/0018-*.patch ../patches/0019-*.patch ../patches/0020-*.patch; do
         [ -f "${p}" ] || continue
         apply_patch_once "${p}"
     done
@@ -952,6 +952,68 @@ build_linux() {
     # still pre-empts via the existing class chain walk.
     echo "CONFIG_SCHED_FAIR_TINY=y" >>.config
 
+    # Patch 0015 introduces CONFIG_SCHED_TOPOLOGY_MINIMAL (default n; set y
+    # here).  Wraps kernel/sched/topology.c body in #ifndef and substitutes
+    # a minimal stub block: def_root_domain + init_rootdomain +
+    # init_defrootdomain + rq_attach_root + sched_get/put_rd +
+    # sched_domains_mutex helpers + empty sched_init_domains and
+    # partition_sched_domains.  Drops sched_domain construction, NUMA,
+    # perf-domain, asym-capacity, and topology-debug machinery.  Safe on
+    # UP NOMMU (SMP=n, NUMA=n, ENERGY_MODEL=n, CGROUPS=n, CPUSETS=n).
+    echo "CONFIG_SCHED_TOPOLOGY_MINIMAL=y" >>.config
+
+    # Patch 0016 introduces CONFIG_SCHED_NO_RICH_API (default n; set y here).
+    # Wraps SYSCALL_DEFINEs for sched_setparam/getparam (154/155),
+    # sched_set/getscheduler (156/157), sched_get_priority_{max,min}
+    # (159/160), sched_rr_get_interval (161), sched_{set,get}affinity
+    # (241/242), sched_{set,get}attr (380/381) in #ifndef; sys_ni.c gains
+    # COND_SYSCALL aliases so the slot returns -ENOSYS.  Internal helpers
+    # (sched_set_fifo*, sched_setscheduler_nocheck, sched_setattr_nocheck,
+    # sched_setaffinity, sched_getaffinity, __sched_setaffinity,
+    # dl_task_check_affinity) stay live for RCU/kthread/compat callers.
+    # Keeps sched_yield (158) and nice (34) intact.
+    echo "CONFIG_SCHED_NO_RICH_API=y" >>.config
+
+    # Patch 0017 introduces CONFIG_POSIX_CPU_TIMERS (default y; set n here).
+    # Wraps kernel/time/posix-cpu-timers.c body in #ifdef and substitutes
+    # k_clock dispatch tables that return -EINVAL for clock_process /
+    # clock_thread / clock_posix_cpu, plus no-op stubs for
+    # posix_cputimers_group_init / posix_cpu_timers_exit{,_group} /
+    # run_posix_cpu_timers / update_rlimit_cpu / thread_group_sample_cputime
+    # / set_process_cpu_timer.  Effective syscall impact: clock_gettime /
+    # clock_getres / clock_nanosleep on CLOCK_PROCESS_CPUTIME_ID and
+    # CLOCK_THREAD_CPUTIME_ID return -EINVAL; setrlimit(RLIMIT_CPU) and
+    # ITIMER_PROF / ITIMER_VIRTUAL become silent no-ops.
+    echo "# CONFIG_POSIX_CPU_TIMERS is not set" >>.config
+
+    # Patch 0018 introduces CONFIG_SCHED_PELT_RT_MINI (default n; set y).
+    # Stubs CFS-side (__update_load_avg_blocked_se / _se / _cfs_rq) and
+    # DL-side (update_dl_rq_load_avg) PELT entry points to return 0;
+    # update_other_load_avgs collapses to a thin call to update_rt_rq_load_avg.
+    # Safe under SCHED_FAIR_TINY=y (no fair-class PELT consumer) and
+    # SCHED_DEADLINE_CLASS=n (DL stub class never accumulates load).
+    echo "CONFIG_SCHED_PELT_RT_MINI=y" >>.config
+
+    # Patch 0019 introduces CONFIG_SCHED_RT_TINY (default n; set y here).
+    # Wraps kernel/sched/rt.c body in #ifndef and substitutes a fixed-priority
+    # FIFO class: priority bitmap + per-priority list_heads, O(1) enqueue /
+    # dequeue / pick.  Drops SCHED_RR slice rotation (RR collapses to FIFO),
+    # RT bandwidth period timer, throttle, push/pull migration, cpupri
+    # find_lowest_rq, and sched_rt/rr_handler sysctl writers.  Cross-priority
+    # preemption stays via resched_curr; RT > fair preemption stays via the
+    # class-chain walk.  Safe on UP NOMMU with no `chrt` applet.
+    echo "CONFIG_SCHED_RT_TINY=y" >>.config
+
+    # Patch 0020 introduces CONFIG_TIME_NO_SET_WALLCLOCK (default n; set y).
+    # Stubs do_settimeofday64, do_adjtimex, and timekeeping_warp_clock to
+    # return -EPERM / no-op.  Effective syscall impact: settimeofday(2),
+    # clock_settime(2), adjtimex(2), and stime(2) all return -EPERM;
+    # clock_gettime(2) read paths stay live.  NTP discipline / leap-second
+    # / TAI maintenance helpers in timekeeping.c become candidates for LTO
+    # dead-stripping.  Safe with QEMU's stable boot-time epoch and no NTP
+    # source / RTC on this target.
+    echo "CONFIG_TIME_NO_SET_WALLCLOCK=y" >>.config
+
     run_logged "olddefconfig" kernel_make olddefconfig
 
     # Verify critical config options survived olddefconfig resolution.
@@ -1018,7 +1080,13 @@ build_linux() {
         "# CONFIG_PSI is not set" \
         "# CONFIG_CGROUPS is not set" \
         "# CONFIG_SCHED_AUTOGROUP is not set" \
-        "CONFIG_SCHED_FAIR_TINY=y"; do
+        "CONFIG_SCHED_FAIR_TINY=y" \
+        "CONFIG_SCHED_TOPOLOGY_MINIMAL=y" \
+        "CONFIG_SCHED_NO_RICH_API=y" \
+        "# CONFIG_POSIX_CPU_TIMERS is not set" \
+        "CONFIG_SCHED_PELT_RT_MINI=y" \
+        "CONFIG_SCHED_RT_TINY=y" \
+        "CONFIG_TIME_NO_SET_WALLCLOCK=y"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
