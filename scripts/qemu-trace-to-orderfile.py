@@ -207,6 +207,18 @@ def find_symbol(pc: int, starts, records):
     return None
 
 
+def record_syscall_sample(r7, tb, syscall_counts, syscall_sites):
+    if tb["symbol"] != "vector_swi":
+        return
+    if r7 > MAX_ARM_SYSCALL:
+        return
+
+    syscall_counts[r7] += 1
+    sites = syscall_sites[r7]
+    if len(sites) < 8:
+        sites.append((tb["pc"], tb["pc"], "vector_swi"))
+
+
 def compute_concentration(counts):
     ordered = [count for _, count in counts.most_common()]
     total_hits = sum(ordered)
@@ -262,7 +274,7 @@ def parse_trace(trace_path: pathlib.Path, starts, records):
     first_seen = {}
     matched = 0
     total = 0
-    pending_tb = None
+    pending_r7 = None
     syscall_counts = collections.Counter()
     syscall_sites = collections.defaultdict(list)
 
@@ -283,21 +295,25 @@ def parse_trace(trace_path: pathlib.Path, starts, records):
                     if name not in first_seen:
                         first_seen[name] = matched
 
-                pending_tb = {"pc": pc, "symbol": name}
+                # QEMU `-d cpu` emits the register dump immediately before
+                # the TB whose entry state it captures, so an R07 only ever
+                # binds to the next TB. A TB without a preceding R07 dump
+                # has no syscall context to recover.
+                if pending_r7 is not None:
+                    record_syscall_sample(
+                        pending_r7,
+                        {"pc": pc, "symbol": name},
+                        syscall_counts,
+                        syscall_sites,
+                    )
+                    pending_r7 = None
                 continue
 
-            if pending_tb is not None and "R07=" in line:
+            if "R07=" in line:
                 match = R07_RE.search(line)
-                if match and pending_tb["symbol"] == "vector_swi":
-                    r7 = int(match.group(1), 16)
-                    if r7 > MAX_ARM_SYSCALL:
-                        pending_tb = None
-                        continue
-                    syscall_counts[r7] += 1
-                    sites = syscall_sites[r7]
-                    if len(sites) < 8:
-                        sites.append((pending_tb["pc"], pending_tb["pc"], "vector_swi"))
-                pending_tb = None
+                if not match:
+                    continue
+                pending_r7 = int(match.group(1), 16)
 
     return counts, first_seen, total, matched, syscall_counts, syscall_sites
 

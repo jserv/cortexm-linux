@@ -220,6 +220,12 @@ stage_verify_kernel_pgo_cycle() {
         [ -f "${ROOTDIR}/bootwrapper/linux.axf" ]
 }
 
+stage_verify_kernel_syscall_prune_cycle() {
+    [ -f "${KERNEL_REPORT_DIR}/syscall-prune-cycle/final/selected-candidate.txt" ] &&
+        [ -f "${KERNEL_REPORT_DIR}/syscall-prune-cycle/configs/syscall-prune.tbl" ] &&
+        [ -f "${ROOTDIR}/bootwrapper/linux.axf" ]
+}
+
 stage_is_current() {
     STAGE=$1
     VERIFY_FUNC=stage_verify_${STAGE}
@@ -245,6 +251,7 @@ stage_clean() {
     linux)          rm -rf "linux-${LINUX_VERSION}" ;;
     bootwrapper)    rm -rf bootwrapper ;;
     kernel_pgo_cycle) rm -rf "${KERNEL_REPORT_DIR}/cycle" ;;
+    kernel_syscall_prune_cycle) rm -rf "${KERNEL_REPORT_DIR}/syscall-prune-cycle" ;;
     esac
 }
 
@@ -1568,6 +1575,113 @@ compose_kernel_config_fragment() {
     done
 }
 
+workload_sha256() {
+    if [ ! -f "${PGO_WORKLOAD_FILE}" ]; then
+        echo missing
+        return 1
+    fi
+    sha256sum "${PGO_WORKLOAD_FILE}" | cut -d' ' -f1
+}
+
+profile_cache_dir() {
+    CACHE_NAMESPACE=$1
+    TRACE_SELECTOR=$2
+    TRACE_TAG=$(printf '%s' "${TRACE_SELECTOR}" | tr ',/' '__')
+    printf '%s/cache/%s-%s\n' "${KERNEL_REPORT_DIR}" "${CACHE_NAMESPACE}" "${TRACE_TAG}"
+}
+
+kernel_profile_cache_valid() {
+    CACHE_DIR=$1
+    TRACE_SELECTOR=$2
+    MANIFEST=${CACHE_DIR}/manifest.env
+    WORKLOAD_SHA=$(workload_sha256) || return 1
+
+    [ -f "${MANIFEST}" ] || return 1
+    [ -f "${CACHE_DIR}/profile/kernel_summary.txt" ] || return 1
+    [ -f "${CACHE_DIR}/profile/kernel_hits.txt" ] || return 1
+    [ -f "${CACHE_DIR}/profile/kernel_ld_profile.txt" ] || return 1
+    [ -f "${CACHE_DIR}/profile/kernel_syscalls.txt" ] || return 1
+    [ -f "${CACHE_DIR}/analysis/pgo-kernel.config" ] || return 1
+    [ -f "${CACHE_DIR}/analysis/syscalls.txt" ] || return 1
+    [ -f "${CACHE_DIR}/analysis/pgo-layout-decision.env" ] || return 1
+
+    [ "$(sed -n 's/^image_fingerprint=//p' "${MANIFEST}")" = "${IMAGE_FP}" ] || return 1
+    [ "$(sed -n 's/^workload_sha256=//p' "${MANIFEST}")" = "${WORKLOAD_SHA}" ] || return 1
+    [ "$(sed -n 's/^trace_selector=//p' "${MANIFEST}")" = "${TRACE_SELECTOR}" ] || return 1
+}
+
+link_cached_tree() {
+    SRC_DIR=$1
+    DEST_DIR=$2
+
+    mkdir -p "${DEST_DIR}"
+    for SRC_FILE in "${SRC_DIR}"/*; do
+        [ -f "${SRC_FILE}" ] || continue
+        DEST_FILE=${DEST_DIR}/$(basename "${SRC_FILE}")
+        rm -f "${DEST_FILE}"
+        ln -s "${SRC_FILE}" "${DEST_FILE}"
+    done
+}
+
+materialize_cache_tree() {
+    # Copy (do not hardlink) so a future writer that follows a
+    # link_cached_tree symlink in a working dir cannot mutate the cached
+    # source through a shared inode.
+    SRC_DIR=$1
+    DEST_DIR=$2
+
+    mkdir -p "${DEST_DIR}"
+    for SRC_FILE in "${SRC_DIR}"/*; do
+        [ -f "${SRC_FILE}" ] || continue
+        DEST_FILE=${DEST_DIR}/$(basename "${SRC_FILE}")
+        rm -f "${DEST_FILE}"
+        cp -f "${SRC_FILE}" "${DEST_FILE}"
+    done
+}
+
+prepare_kernel_profile_analysis() {
+    PROFILE_DIR=$1
+    ANALYSIS_DIR=$2
+    TRACE_SELECTOR=$3
+    CACHE_NAMESPACE=$4
+
+    CACHE_DIR=$(profile_cache_dir "${CACHE_NAMESPACE}" "${TRACE_SELECTOR}")
+    KERNEL_PROFILE_CACHE_HIT=no
+    KERNEL_PROFILE_CACHE_DIR=${CACHE_DIR}
+
+    mkdir -p "${PROFILE_DIR}" "${ANALYSIS_DIR}" "${CACHE_DIR}"
+
+    if kernel_profile_cache_valid "${CACHE_DIR}" "${TRACE_SELECTOR}"; then
+        echo "BUILD: reusing cached kernel profile analysis (${CACHE_DIR})"
+        link_cached_tree "${CACHE_DIR}/profile" "${PROFILE_DIR}"
+        link_cached_tree "${CACHE_DIR}/analysis" "${ANALYSIS_DIR}"
+        KERNEL_PROFILE_CACHE_HIT=yes
+        return 0
+    fi
+
+    echo "BUILD: collecting kernel profile (${TRACE_SELECTOR})"
+    run_logged "collect kernel profile" env "QEMU_LOG=${TRACE_SELECTOR}" \
+        "${ROOTDIR}/scripts/collect-kernel-profile.sh" \
+        "${ROOTDIR}/bootwrapper/linux.axf" \
+        "${ROOTDIR}/linux-${LINUX_VERSION}/vmlinux" \
+        "${PROFILE_DIR}"
+
+    run_logged "analyze kernel profile" python3 "${ROOTDIR}/scripts/analyze-kernel-pgo.py" \
+        --profile-prefix "${PROFILE_DIR}/kernel" \
+        --linux-dir "${ROOTDIR}/linux-${LINUX_VERSION}" \
+        --output-dir "${ANALYSIS_DIR}"
+
+    rm -rf "${CACHE_DIR}/profile" "${CACHE_DIR}/analysis"
+    mkdir -p "${CACHE_DIR}/profile" "${CACHE_DIR}/analysis"
+    materialize_cache_tree "${PROFILE_DIR}" "${CACHE_DIR}/profile"
+    materialize_cache_tree "${ANALYSIS_DIR}" "${CACHE_DIR}/analysis"
+    {
+        printf 'image_fingerprint=%s\n' "${IMAGE_FP}"
+        printf 'workload_sha256=%s\n' "$(workload_sha256)"
+        printf 'trace_selector=%s\n' "${TRACE_SELECTOR}"
+    } >"${CACHE_DIR}/manifest.env"
+}
+
 build_candidate_kernel() {
     NAME=$1
     EXPERIMENT=$2
@@ -1636,15 +1750,8 @@ build_kernel_pgo_cycle() {
     append_candidate_summary "${SUMMARY_FILE}" "baseline" "${BASELINE_SNAP}/result.txt"
 
     echo "BUILD: kernel PGO cycle step 2/3 - QEMU trace collection"
-    run_logged "collect kernel profile" "${ROOTDIR}/scripts/collect-kernel-profile.sh" \
-        "${ROOTDIR}/bootwrapper/linux.axf" \
-        "${ROOTDIR}/linux-${LINUX_VERSION}/vmlinux" \
-        "${BASELINE_DIR}/kernel"
-
-    run_logged "analyze kernel profile" "${ROOTDIR}/scripts/analyze-kernel-pgo.py" \
-        --profile-prefix "${BASELINE_DIR}/kernel/kernel" \
-        --linux-dir "${ROOTDIR}/linux-${LINUX_VERSION}" \
-        --output-dir "${CONFIG_DIR}"
+    prepare_kernel_profile_analysis "${BASELINE_DIR}/kernel" "${CONFIG_DIR}" \
+        "${QEMU_LOG:-exec,in_asm}" "profile-analysis"
 
     MERGED_CONFIG=${CONFIG_DIR}/pgo-kernel.merged.config
     LAYOUT_DECISION_FILE=${CONFIG_DIR}/pgo-layout-decision.env
@@ -1667,7 +1774,7 @@ build_kernel_pgo_cycle() {
     SYSCALL_BOOT_MS=0
     if [ "${DETECTED_SYSCALLS}" -gt 0 ]; then
         SYSCALL_TABLE_PATCH=${CONFIG_DIR}/syscall-prune.tbl
-        run_logged "generate syscall prune table" "${ROOTDIR}/scripts/generate-syscall-prune-table.py" \
+        run_logged "generate syscall prune table" python3 "${ROOTDIR}/scripts/generate-syscall-prune-table.py" \
             --syscall-report "${CONFIG_DIR}/syscalls.txt" \
             --syscall-table "${ROOTDIR}/linux-${LINUX_VERSION}/arch/arm/tools/syscall.tbl" \
             --output-table "${SYSCALL_TABLE_PATCH}"
@@ -1809,7 +1916,7 @@ build_kernel_pgo_cycle() {
         BEST_ORDER_BOOT_DELTA=$((BEST_ORDER_BOOT_MS - BEST_BOOT_MS))
         BEST_ORDER_RESIDENT_DELTA=$(( $(read_boot_metric "${BEST_ORDER_SNAP}/result.txt" "kernel_resident_bytes") - BEST_RESIDENT_BYTES ))
         BEST_ORDER_INIT_DELTA=$((BEST_ORDER_INIT_BYTES - BEST_INIT_BYTES))
-        run_logged "compare ordered kernel layout" "${ROOTDIR}/scripts/compare-kernel-layout.py" \
+        run_logged "compare ordered kernel layout" python3 "${ROOTDIR}/scripts/compare-kernel-layout.py" \
             --baseline-vmlinux "${BASELINE_SNAP}/vmlinux" \
             --candidate-vmlinux "${BEST_ORDER_SNAP}/vmlinux" \
             --hits "${BASELINE_DIR}/kernel/kernel_hits.txt" \
@@ -1934,6 +2041,158 @@ build_kernel_pgo_cycle() {
     # later plain ./build.sh must rebuild the standard kernel path.
 }
 
+build_kernel_syscall_prune_cycle() {
+    CYCLE_DIR=${KERNEL_REPORT_DIR}/syscall-prune-cycle
+    BASELINE_DIR=${CYCLE_DIR}/baseline
+    FINAL_DIR=${CYCLE_DIR}/final
+    CONFIG_DIR=${CYCLE_DIR}/configs
+    SUMMARY_FILE=${FINAL_DIR}/candidate-matrix.txt
+    DECISION_FILE=${FINAL_DIR}/candidate-decisions.txt
+    BASELINE_SNAP=${CYCLE_DIR}/artifacts/baseline
+    CONFIG_SNAP=${CYCLE_DIR}/artifacts/config-only
+    SYSCALL_SNAP=${CYCLE_DIR}/artifacts/syscall-prune
+    TRACE_SELECTOR=${QEMU_LOG:-exec,cpu,in_asm}
+
+    mkdir -p "${BASELINE_DIR}" "${FINAL_DIR}" "${CONFIG_DIR}" "${CYCLE_DIR}/artifacts"
+    {
+        echo "candidate linux_axf_bytes boot_marker_ms shell_ready_ms kernel_resident_bytes kernel_init_bytes"
+    } >"${SUMMARY_FILE}"
+    {
+        echo "candidate eligible decision linux_axf_bytes shell_ready_ms kernel_resident_bytes kernel_init_bytes size_delta_vs_selected shell_delta_vs_selected resident_delta_vs_selected init_delta_vs_selected"
+    } >"${DECISION_FILE}"
+
+    if [ ! -f "${PGO_WORKLOAD_FILE}" ]; then
+        echo "ERROR: missing PGO workload file: ${PGO_WORKLOAD_FILE}"
+        exit 1
+    fi
+
+    echo "BUILD: syscall-prune cycle step 1/3 - baseline kernel build"
+    build_candidate_kernel "baseline" "none" "" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
+    BASELINE_SIZE=$(linux_axf_size)
+    BASELINE_BOOT_MS=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "shell_ready_ms")
+    BASELINE_RESIDENT=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_resident_bytes")
+    BASELINE_INIT=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_init_bytes")
+    append_candidate_summary "${SUMMARY_FILE}" "baseline" "${BASELINE_SNAP}/result.txt"
+
+    echo "BUILD: syscall-prune cycle step 2/3 - QEMU trace collection"
+    prepare_kernel_profile_analysis "${BASELINE_DIR}/kernel" "${CONFIG_DIR}" \
+        "${TRACE_SELECTOR}" "profile-analysis"
+
+    MERGED_CONFIG=${CONFIG_DIR}/pgo-kernel.merged.config
+    compose_kernel_config_fragment "${MERGED_CONFIG}" \
+        "${PGO_BASE_CONFIG_FRAGMENT}" \
+        "${CONFIG_DIR}/pgo-kernel.config"
+
+    echo "BUILD: syscall-prune cycle step 3/3 - candidate rebuilds"
+    build_candidate_kernel "config-only" "none" "" "" "${MERGED_CONFIG}" \
+        "${CYCLE_DIR}/config-only" "${CONFIG_SNAP}"
+    CONFIG_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${CONFIG_SNAP}/result.txt")
+    CONFIG_SIZE=${CONFIG_SIZE:-0}
+    CONFIG_BOOT_MS=$(read_boot_metric "${CONFIG_SNAP}/result.txt" "shell_ready_ms")
+    CONFIG_RESIDENT=$(read_boot_metric "${CONFIG_SNAP}/result.txt" "kernel_resident_bytes")
+    CONFIG_INIT=$(read_boot_metric "${CONFIG_SNAP}/result.txt" "kernel_init_bytes")
+    append_candidate_summary "${SUMMARY_FILE}" "config-only" "${CONFIG_SNAP}/result.txt"
+
+    DETECTED_SYSCALLS=$(sed -n 's/^detected_syscalls=//p' "${BASELINE_DIR}/kernel/kernel_summary.txt")
+    DETECTED_SYSCALLS=${DETECTED_SYSCALLS:-0}
+    if [ "${DETECTED_SYSCALLS}" -le 0 ]; then
+        echo "ERROR: syscall-prune cycle detected no syscalls under trace selector '${TRACE_SELECTOR}'"
+        echo "Hint: use QEMU_LOG=exec,cpu,in_asm or let this stage use its default."
+        exit 1
+    fi
+
+    SYSCALL_TABLE_PATCH=${CONFIG_DIR}/syscall-prune.tbl
+    run_logged "generate syscall prune table" python3 "${ROOTDIR}/scripts/generate-syscall-prune-table.py" \
+        --syscall-report "${CONFIG_DIR}/syscalls.txt" \
+        --syscall-table "${ROOTDIR}/linux-${LINUX_VERSION}/arch/arm/tools/syscall.tbl" \
+        --output-table "${SYSCALL_TABLE_PATCH}"
+
+    build_candidate_kernel "syscall-prune" "none" "" "${SYSCALL_TABLE_PATCH}" "${MERGED_CONFIG}" \
+        "${CYCLE_DIR}/syscall-prune" "${SYSCALL_SNAP}"
+    SYSCALL_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${SYSCALL_SNAP}/result.txt")
+    SYSCALL_SIZE=${SYSCALL_SIZE:-0}
+    SYSCALL_BOOT_MS=$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "shell_ready_ms")
+    SYSCALL_RESIDENT=$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_resident_bytes")
+    SYSCALL_INIT=$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_init_bytes")
+    append_candidate_summary "${SUMMARY_FILE}" "syscall-prune" "${SYSCALL_SNAP}/result.txt"
+
+    BEST_NAME=baseline
+    BEST_SNAP=${BASELINE_SNAP}
+    BEST_SIZE=${BASELINE_SIZE}
+    BEST_BOOT_MS=${BASELINE_BOOT_MS}
+    BEST_RESIDENT_BYTES=${BASELINE_RESIDENT}
+    BEST_INIT_BYTES=${BASELINE_INIT}
+
+    if [ "${CONFIG_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${CONFIG_BOOT_MS}" &&
+        [ "${CONFIG_SIZE}" -lt "${BEST_SIZE}" ]; then
+        BEST_NAME=config-only
+        BEST_SNAP=${CONFIG_SNAP}
+        BEST_SIZE=${CONFIG_SIZE}
+        BEST_BOOT_MS=${CONFIG_BOOT_MS}
+        BEST_RESIDENT_BYTES=${CONFIG_RESIDENT}
+        BEST_INIT_BYTES=${CONFIG_INIT}
+    fi
+
+    if [ "${SYSCALL_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${SYSCALL_BOOT_MS}" &&
+        [ "${SYSCALL_SIZE}" -lt "${BEST_SIZE}" ]; then
+        BEST_NAME=syscall-prune
+        BEST_SNAP=${SYSCALL_SNAP}
+        BEST_SIZE=${SYSCALL_SIZE}
+        BEST_BOOT_MS=${SYSCALL_BOOT_MS}
+        BEST_RESIDENT_BYTES=${SYSCALL_RESIDENT}
+        BEST_INIT_BYTES=${SYSCALL_INIT}
+    fi
+
+    restore_kernel_artifacts "${BEST_SNAP}"
+
+    {
+        echo "selected_candidate=${BEST_NAME}"
+        echo "trace_selector=${TRACE_SELECTOR}"
+        echo "profile_cache_hit=${KERNEL_PROFILE_CACHE_HIT}"
+        echo "profile_cache_dir=${KERNEL_PROFILE_CACHE_DIR}"
+        echo "detected_syscalls=${DETECTED_SYSCALLS}"
+        echo "baseline_linux_axf_bytes=${BASELINE_SIZE}"
+        echo "config_only_linux_axf_bytes=${CONFIG_SIZE}"
+        echo "syscall_prune_linux_axf_bytes=${SYSCALL_SIZE}"
+        echo "baseline_shell_ready_ms=${BASELINE_BOOT_MS}"
+        echo "config_only_shell_ready_ms=${CONFIG_BOOT_MS}"
+        echo "syscall_prune_shell_ready_ms=${SYSCALL_BOOT_MS}"
+        echo "candidate_matrix=${SUMMARY_FILE}"
+        echo "candidate_decisions=${DECISION_FILE}"
+        echo "syscall_table_patch=${SYSCALL_TABLE_PATCH}"
+        echo "syscall_prune_report=${CONFIG_DIR}/syscall-prune.report.txt"
+    } >"${FINAL_DIR}/selected-candidate.txt"
+
+    append_candidate_decision "${DECISION_FILE}" "baseline" "${BASELINE_SIZE}" "${BASELINE_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "${BASELINE_RESIDENT}" "${BEST_RESIDENT_BYTES}" "${BASELINE_INIT}" "${BEST_INIT_BYTES}"
+    append_candidate_decision "${DECISION_FILE}" "config-only" "${CONFIG_SIZE}" "${CONFIG_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "${CONFIG_RESIDENT}" "${BEST_RESIDENT_BYTES}" "${CONFIG_INIT}" "${BEST_INIT_BYTES}"
+    append_candidate_decision "${DECISION_FILE}" "syscall-prune" "${SYSCALL_SIZE}" "${SYSCALL_BOOT_MS}" \
+        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
+        "${SYSCALL_RESIDENT}" "${BEST_RESIDENT_BYTES}" "${SYSCALL_INIT}" "${BEST_INIT_BYTES}"
+
+    {
+        echo "Kernel syscall-prune cycle summary"
+        echo
+        cat "${FINAL_DIR}/selected-candidate.txt"
+        echo
+        echo "candidate_matrix:"
+        cat "${SUMMARY_FILE}"
+        echo
+        echo "candidate_decisions:"
+        cat "${DECISION_FILE}"
+    } >"${FINAL_DIR}/summary.txt"
+
+    if [ "${BEST_NAME}" = "baseline" ]; then
+        echo "SYSCALL-PRUNE: no candidate improved linux.axf size without regressing shell_ready_ms; keeping baseline"
+        echo "  baseline:      ${BASELINE_SIZE} bytes, ${BASELINE_BOOT_MS} ms"
+        echo "  config-only:   ${CONFIG_SIZE} bytes, ${CONFIG_BOOT_MS} ms"
+        echo "  syscall-prune: ${SYSCALL_SIZE} bytes, ${SYSCALL_BOOT_MS} ms"
+    fi
+}
+
 # QEMU's Cortex-M machine models lack the direct kernel/DTB loading
 # support available on full ARM platforms.  A small boot wrapper is
 # required to supply reset vectors and transfer control to the kernel.
@@ -2005,7 +2264,7 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 DEFAULT_STAGES="binutils gcc linux_headers uClibc busybox finalize_rootfs linux bootwrapper"
-ALL_STAGES="${DEFAULT_STAGES} kernel_pgo_cycle"
+ALL_STAGES="${DEFAULT_STAGES} kernel_pgo_cycle kernel_syscall_prune_cycle"
 
 if [ "$#" = 0 ]; then
     STAGES="${DEFAULT_STAGES}"
@@ -2013,7 +2272,7 @@ else
     STAGES=""
     for arg in "$@"; do
         case "${arg}" in
-        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper | kernel_pgo_cycle)
+        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper | kernel_pgo_cycle | kernel_syscall_prune_cycle)
             STAGES="${STAGES} ${arg}"
             ;;
         *)

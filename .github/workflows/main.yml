@@ -183,7 +183,7 @@ jobs:
             qemu-system-arm
 
       - name: Download build image
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: bootable-image
           path: bootwrapper

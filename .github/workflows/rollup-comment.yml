@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Download subsystem rollup artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: subsystem-rollup
           path: rollup
@@ -39,7 +39,7 @@ jobs:
 
       - name: Resolve PR number
         id: pr
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const run = context.payload.workflow_run;
@@ -64,7 +64,7 @@ jobs:
 
       - name: Upsert comment
         if: steps.pr.outputs.number != ''
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           # Pass the PR number through the environment instead of
           # interpolating it directly into the script body. Template
@@ -75,13 +75,24 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            // upload-artifact@v4+ preserves workspace-relative paths,
-            // so the markdown lives at its original profiles/ path
-            // inside the downloaded folder.
-            const body = fs.readFileSync(
+            const candidates = [
+              // download-artifact extracts the common parent of the
+              // uploaded files, so the current artifact lands flat at
+              // the destination root.
+              'rollup/subsystem-rollup.md',
+              // Keep accepting the older nested layout in case the
+              // upload path changes again.
               'rollup/profiles/kernel-pgo/none/subsystem-rollup.md',
-              'utf8',
+            ];
+            const bodyPath = candidates.find(candidate =>
+              fs.existsSync(candidate)
             );
+            if (!bodyPath) {
+              throw new Error(
+                `subsystem rollup markdown not found; checked: ${candidates.join(', ')}`
+              );
+            }
+            const body = fs.readFileSync(bodyPath, 'utf8');
             const marker = '<!-- subsystem-rollup-comment -->';
             const { owner, repo } = context.repo;
             const issue_number = Number(process.env.PR_NUMBER);
