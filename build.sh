@@ -666,7 +666,7 @@ build_linux() {
     cd linux-${LINUX_VERSION}
 
     # Apply linux-tiny patches for reduced memory footprint and LTO support
-    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch ../patches/0012-*.patch ../patches/0013-*.patch; do
+    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch ../patches/0012-*.patch ../patches/0013-*.patch ../patches/0014-*.patch; do
         [ -f "${p}" ] || continue
         apply_patch_once "${p}"
     done
@@ -938,6 +938,20 @@ build_linux() {
     echo "# CONFIG_CGROUPS is not set" >>.config
     echo "# CONFIG_SCHED_AUTOGROUP is not set" >>.config
 
+    # Patch 0014 replaces fair.c (CFS/EEVDF) with a compact O(1) priority
+    # round-robin SCHED_NORMAL class under CONFIG_SCHED_FAIR_TINY.  fair.c
+    # body is wrapped in #ifndef; the #else branch provides a per-CPU
+    # bitmap + per-priority FIFO (HIGH/NORMAL/LOW) plus stubs for every
+    # symbol other TUs (rt.c, deadline.c stub, syscalls.c, topology.c,
+    # idle.c, build_utility.c) reference.  Linux 7.0 has no CONFIG_SMP
+    # guard inside fair.c so balance code (select_task_rq, sched_balance_*,
+    # _nohz_idle_balance, ~7.8KB total) stays linked under UP via the
+    # sched_class table; this knob is the only way to remove it.  nice
+    # values quantise to the three buckets (nice<0 -> HIGH, nice==0 ->
+    # NORMAL, nice>0 -> LOW); SCHED_IDLE collapses to LOW; rt_sched_class
+    # still pre-empts via the existing class chain walk.
+    echo "CONFIG_SCHED_FAIR_TINY=y" >>.config
+
     run_logged "olddefconfig" kernel_make olddefconfig
 
     # Verify critical config options survived olddefconfig resolution.
@@ -1003,7 +1017,8 @@ build_linux() {
         "# CONFIG_SCHED_DEADLINE_CLASS is not set" \
         "# CONFIG_PSI is not set" \
         "# CONFIG_CGROUPS is not set" \
-        "# CONFIG_SCHED_AUTOGROUP is not set"; do
+        "# CONFIG_SCHED_AUTOGROUP is not set" \
+        "CONFIG_SCHED_FAIR_TINY=y"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1

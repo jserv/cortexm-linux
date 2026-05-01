@@ -1,0 +1,513 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: sched: O(1) priority round-robin replacement under CONFIG_SCHED_FAIR_TINY
+
+CFS/EEVDF was designed for hundreds of tasks competing for CPU under
+fairness constraints; the algorithm pays for that with PELT load
+tracking, weighted vruntime arithmetic, an rb-tree min-heap, EEVDF
+eligibility checks, and the SMP load-balancer.  None of it matters on
+a NOMMU image with O(1) tasks (init + BusyBox shell + the occasional
+applet).  Worse, Linux 7.0's fair.c carries no CONFIG_SMP guard at all
+-- balance code (select_task_rq_fair, sched_balance_rq, update_sd_lb_stats,
+sched_balance_find_*_group, _nohz_idle_balance, can_migrate_task,
+active_load_balance_cpu_stop, ...) compiles into UP images and gets
+pinned by the sched_class callback table; --gc-sections cannot remove
+it.  Measured on Cortex-M4 nommu mps2-an386 (linux-7.0):
+
+  fair.c                           16,782 bytes / 97 symbols (post all
+                                                 prior pruning; SMP-balance
+                                                 alone is ~7,800 of those)
+  pelt.c                            1,756 bytes / 8 symbols
+  core.c SMP/migrate residue       ~2,650 bytes
+  rt.c pull_rt_task                   424 bytes
+
+CONFIG_SCHED_FAIR_TINY (default n) wraps the existing fair.c body in
+#ifndef and replaces it with a compact O(1) scheduler:
+
+  - three priority levels: HIGH / NORMAL / LOW
+  - per-CPU bitmap + per-priority FIFO list
+  - O(1) pick:    find_first_bit(active) + list_first_entry
+  - O(1) enqueue: list_add_tail + __set_bit
+  - O(1) dequeue: list_del_init + __clear_bit when queue empties
+  - cross-priority wakeup preemption (a HIGH waker preempts a LOW runner)
+  - round-robin WITHIN a priority via a jiffies time-slice countdown
+    reset on every set_next_task
+
+Priority mapping is purely a function of nice value (no PELT, no
+vruntime, no weight tables):
+
+    p->policy == SCHED_IDLE  -> LOW
+    p->static_prio  < NICE_TO_PRIO(0)  -> HIGH    (nice < 0)
+    p->static_prio  > NICE_TO_PRIO(0)  -> LOW     (nice > 0)
+    p->static_prio == NICE_TO_PRIO(0)  -> NORMAL  (nice == 0; init,
+                                                   BusyBox, applets)
+    SCHED_BATCH uses nice normally; nice values are accepted by
+    sched_setattr(2) but quantised to the three buckets.
+
+Storage strategy: tasks chain through &p->se.group_node (dead under
+!FAIR_GROUP_SCHED) so we don't grow task_struct.  The bucket index is
+recomputed from p->static_prio on every callback; core.c's
+dequeue-modify-enqueue protocol guarantees static_prio is stable
+during dequeue (OLD value, queue removal correct) and during enqueue
+(NEW value, queue insertion correct), so no per-task cached bucket is
+needed.
+
+This is NOT the historical 2.6 O(1) scheduler.  Specifically: no
+active/expired arrays, no interactivity estimator (the gameable
+heuristic that motivated CFS), no priority recalculation, no
+sleep_avg.  Just the priority bitmap + FIFO data structure that O(1)
+got right, without the policy machinery that O(1) got wrong.
+
+External symbols that other TUs (rt.c, deadline.c stub, ext.c stub,
+stop_task.c, syscalls.c, topology.c, idle.c, build_utility.c) depend
+on are re-exported as minimal stubs:
+
+  update_curr_common              -- still computes delta_exec for the
+                                     other classes' runtime accounting
+  init_cfs_rq, fair_server_init,
+  init_sched_fair_class           -- per-CPU bitmap + queue init
+  sched_init_granularity,
+  update_max_interval             -- empty
+  init_entity_runnable_average,
+  post_init_entity_util_avg       -- empty (no PELT)
+  sched_balance_trigger,
+  nohz_balance_{enter,exit}_idle,
+  nohz_run_idle_balance,
+  update_group_capacity           -- empty
+  __setparam_fair                 -- sets static_prio from nice; slice
+                                     defaults to TINY_DEFAULT_SLICE
+  sysctl_sched_base_slice,
+  sysctl_sched_migration_cost     -- kept (referenced by core.c init)
+  arch_asym_cpu_priority          -- kept as __weak fallback
+
+PELT (kernel/sched/pelt.c) is left untouched.  With fair.c gated, its
+CFS-side entry points (__update_load_avg_blocked_se,
+__update_load_avg_se, __update_load_avg_cfs_rq) lose their callers.
+rt.c keeps update_rt_rq_load_avg live; the rest of pelt.c is dead
+weight that LTO largely cannot strip because the symbols are
+non-static.
+
+RT preemption is unchanged: rt_sched_class still preempts fair via the
+existing class chain walk in pick_next_task_balance.  Higher RT
+priorities still preempt lower RT priorities.  Only the WITHIN-fair
+priority differentiation is new.
+
+Expected size delta on linux.axf: about -16,000 bytes (page-aligned)
+relative to the prior production image.  The O(1) bookkeeping (bitmap
++ 3-element queue array + priority lookup) costs ~150-250 bytes vs a
+single-FIFO design but provides correct cross-priority preemption.
+
+Companion patches 0015 (CONFIG_SCHED_TOPOLOGY) and 0016
+(CONFIG_SCHED_RICH_API) reclaim the topology.c and sched_setattr
+surfaces respectively, for ~25KB cumulative.
+
+---
+ init/Kconfig          |  31 ++++++
+ kernel/sched/fair.c   | 286 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 317 insertions(+)
+
+diff --git a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -959,6 +959,38 @@ config SCHED_DEADLINE_CLASS
+ 	  attribute sets; sched_setattr with policy=6 returns -EPERM.  Any
+ 	  later attempt to program a DL server fails with -EOPNOTSUPP.
+ 
++config SCHED_FAIR_TINY
++	bool "Compact O(1) SCHED_NORMAL implementation (3-priority FIFO)"
++	default n
++	help
++	  Replace the CFS/EEVDF SCHED_NORMAL class with a compact O(1)
++	  scheduler: three priority levels (HIGH/NORMAL/LOW) backed by a
++	  per-CPU bitmap and per-priority FIFO list.  enqueue, dequeue, and
++	  pick are all O(1) -- find_first_bit + list_first_entry on pick,
++	  list_add_tail + __set_bit on enqueue, list_del_init + __clear_bit
++	  on dequeue.  Round-robin happens within a priority via a fixed
++	  jiffies time-slice; cross-priority preemption happens at wakeup.
++
++	  No vruntime, no PELT load tracking, no rb-tree, no load weights,
++	  no group scheduling, no active/expired arrays, no interactivity
++	  heuristic.  nice values are quantised: nice < 0 -> HIGH, nice == 0
++	  -> NORMAL, nice > 0 -> LOW.  SCHED_IDLE policy collapses to LOW.
++	  SCHED_BATCH uses nice normally.
++
++	  Designed for size-constrained NOMMU images with O(1) tasks
++	  (init + BusyBox shell + the occasional applet) where the
++	  fairness arithmetic and SMP load-balancer compiled into
++	  mainline fair.c are dead code that --gc-sections cannot reach
++	  through the sched_class callback table.
++
++	  This is NOT a hardware-real-time scheduler.  RT tasks
++	  (sched_setscheduler with policy=1/2) still get the rt_sched_class
++	  and pre-empt fair tasks via the existing class-chain walk.  Use
++	  SCHED_FIFO/SCHED_RR for any deadline-sensitive work.
++
++	  Say N unless you are building a heavily size-constrained image.
++	  Boot test before deploying.
++
+ endmenu
+ 
+ #
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -57,6 +57,8 @@
+ #include "sched.h"
+ #include "stats.h"
+ #include "autogroup.h"
++
++#ifndef CONFIG_SCHED_FAIR_TINY
+ 
+ /*
+  * The initial- and re-scaling of tunables is configurable
+@@ -14053,3 +14055,351 @@ __init void init_sched_fair_class(void)
+ 	zalloc_cpumask_var(&nohz.idle_cpus_mask, GFP_NOWAIT);
+ #endif
+ }
++
++#else /* CONFIG_SCHED_FAIR_TINY */
++
++#include <linux/bitmap.h>
++#include <linux/bitops.h>
++#include <linux/cpumask.h>
++#include <linux/jiffies.h>
++#include <linux/list.h>
++#include <linux/percpu.h>
++#include <linux/sched.h>
++#include <linux/sched/cputime.h>
++#include <linux/sched/nohz.h>
++#include <linux/sched/prio.h>
++
++#include <uapi/linux/sched/types.h>
++
++/*
++ * Tiny O(1) SCHED_NORMAL class.  Three priority buckets, per-CPU
++ * bitmap + per-priority FIFO.  See SCHED_FAIR_TINY help in
++ * init/Kconfig for the rationale.
++ *
++ *   pick    -> find_first_bit(active) + list_first_entry  (O(1))
++ *   enqueue -> list_add_tail + __set_bit                  (O(1))
++ *   dequeue -> list_del_init + __clear_bit if queue empty (O(1))
++ *
++ * Tasks chain through the existing &p->se.group_node (dead under
++ * !FAIR_GROUP_SCHED).  Bucket index is recomputed from p->static_prio
++ * on every callback; core.c's dequeue-modify-enqueue protocol keeps
++ * static_prio stable across the bracketed window so no per-task
++ * cached bucket is needed.
++ */
++
++#define NR_TINY_PRIO		3
++#define TINY_PRIO_HIGH		0
++#define TINY_PRIO_NORMAL	1
++#define TINY_PRIO_LOW		2
++
++/* Time slice in jiffies.  ~20 ms at HZ=1000.  Reset on every
++ * set_next_task; decremented in task_tick; on expiry the running
++ * task rotates to the tail of its own priority queue.  Same slice
++ * for every priority -- differentiation is by which queue the task
++ * sits in, not by how long it gets to run.
++ */
++#define TINY_DEFAULT_SLICE	(HZ / 50 + 1)
++
++struct tiny_rq {
++	DECLARE_BITMAP(active, NR_TINY_PRIO);
++	struct list_head queue[NR_TINY_PRIO];
++};
++
++/* Sysctl tunables that core.c references at sched_init.  Kept as
++ * unused storage; the actual scheduling logic ignores them.
++ */
++unsigned int sysctl_sched_base_slice			= 700000ULL;
++__read_mostly unsigned int sysctl_sched_migration_cost	= 500000UL;
++
++static DEFINE_PER_CPU(struct tiny_rq, tiny_rq);
++
++static inline struct tiny_rq *tiny_rq_of(struct rq *rq)
++{
++	return &per_cpu(tiny_rq, cpu_of(rq));
++}
++
++/* Map a fair-class task to a priority bucket. */
++static inline int tiny_prio_of(const struct task_struct *p)
++{
++	if (p->policy == SCHED_IDLE)
++		return TINY_PRIO_LOW;
++	if (p->static_prio < NICE_TO_PRIO(0))
++		return TINY_PRIO_HIGH;
++	if (p->static_prio > NICE_TO_PRIO(0))
++		return TINY_PRIO_LOW;
++	return TINY_PRIO_NORMAL;
++}
++
++int __weak arch_asym_cpu_priority(int cpu)
++{
++	return -cpu;
++}
++
++/*
++ * Runtime accounting helper used by rt.c, the deadline-class stub,
++ * stop_task.c, and ext (when present).  Updates exec_start and
++ * sum_exec_runtime; returns delta_exec for the caller.
++ */
++s64 update_curr_common(struct rq *rq)
++{
++	struct task_struct *p = rq->donor;
++	struct sched_entity *se = &p->se;
++	u64 now = rq_clock_task(rq);
++	s64 delta_exec;
++
++	delta_exec = now - se->exec_start;
++	if (unlikely(delta_exec <= 0))
++		return delta_exec;
++
++	se->exec_start = now;
++	se->sum_exec_runtime += delta_exec;
++	account_group_exec_runtime(p, delta_exec);
++	cgroup_account_cputime(p, delta_exec);
++	return delta_exec;
++}
++
++/* sched_class methods --------------------------------------------------- */
++
++static void enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
++{
++	struct tiny_rq *tq = tiny_rq_of(rq);
++	struct sched_entity *se = &p->se;
++	int prio = tiny_prio_of(p);
++
++	if (list_empty(&se->group_node)) {
++		list_add_tail(&se->group_node, &tq->queue[prio]);
++		__set_bit(prio, tq->active);
++		rq->cfs.nr_queued++;
++		rq->cfs.h_nr_queued++;
++		add_nr_running(rq, 1);
++	}
++	se->on_rq = 1;
++}
++
++static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
++{
++	struct tiny_rq *tq = tiny_rq_of(rq);
++	struct sched_entity *se = &p->se;
++	int prio = tiny_prio_of(p);
++
++	if (!list_empty(&se->group_node)) {
++		list_del_init(&se->group_node);
++		if (list_empty(&tq->queue[prio]))
++			__clear_bit(prio, tq->active);
++		rq->cfs.nr_queued--;
++		rq->cfs.h_nr_queued--;
++		sub_nr_running(rq, 1);
++	}
++	se->on_rq = 0;
++	return true;
++}
++
++static void yield_task_fair(struct rq *rq)
++{
++	struct tiny_rq *tq = tiny_rq_of(rq);
++	struct sched_entity *se = &rq->donor->se;
++	int prio = tiny_prio_of(rq->donor);
++
++	/* Move to tail of own priority queue.  No-op if alone there. */
++	if (!list_empty(&se->group_node) &&
++	    tq->queue[prio].prev != &se->group_node) {
++		list_del(&se->group_node);
++		list_add_tail(&se->group_node, &tq->queue[prio]);
++	}
++}
++
++static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int flags)
++{
++	/* Higher fair priority (lower bucket index) preempts lower. */
++	if (tiny_prio_of(p) < tiny_prio_of(rq->donor))
++		resched_curr(rq);
++}
++
++static struct task_struct *pick_task_fair(struct rq *rq, struct rq_flags *rf)
++{
++	struct tiny_rq *tq = tiny_rq_of(rq);
++	struct sched_entity *se;
++	int prio;
++
++	prio = find_first_bit(tq->active, NR_TINY_PRIO);
++	if (prio >= NR_TINY_PRIO)
++		return NULL;
++	se = list_first_entry(&tq->queue[prio], struct sched_entity, group_node);
++	return container_of(se, struct task_struct, se);
++}
++
++struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev,
++					struct rq_flags *rf)
++{
++	struct task_struct *p = pick_task_fair(rq, rf);
++
++	if (!p)
++		return NULL;
++	put_prev_set_next_task(rq, prev, p);
++	return p;
++}
++
++static void put_prev_task_fair(struct rq *rq, struct task_struct *p,
++			       struct task_struct *next)
++{
++	update_curr_common(rq);
++}
++
++static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
++{
++	p->se.slice = TINY_DEFAULT_SLICE;
++	p->se.exec_start = rq_clock_task(rq);
++}
++
++static int select_task_rq_fair(struct task_struct *p, int task_cpu, int flags)
++{
++	return task_cpu;	/* UP: only one CPU exists */
++}
++
++static void task_tick_fair(struct rq *rq, struct task_struct *p, int queued)
++{
++	struct tiny_rq *tq = tiny_rq_of(rq);
++	struct sched_entity *se = &p->se;
++	int prio = tiny_prio_of(p);
++
++	update_curr_common(rq);
++
++	/* Single runnable at this priority: nothing to rotate to. */
++	if (tq->queue[prio].next == tq->queue[prio].prev)
++		return;
++
++	/* Decrement jiffies-based slice; on expiry, round-robin to tail. */
++	if (se->slice && --se->slice)
++		return;
++
++	list_del(&se->group_node);
++	list_add_tail(&se->group_node, &tq->queue[prio]);
++	resched_curr(rq);
++}
++
++static void task_fork_fair(struct task_struct *p)
++{
++	INIT_LIST_HEAD(&p->se.group_node);
++	p->se.slice = TINY_DEFAULT_SLICE;
++}
++
++static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task)
++{
++	return TINY_DEFAULT_SLICE;
++}
++
++static void update_curr_fair(struct rq *rq)
++{
++	update_curr_common(rq);
++}
++
++static bool higher_prio_task_fair(struct rq *rq, struct task_struct *p)
++{
++	struct tiny_rq *tq = tiny_rq_of(rq);
++	int highest = find_first_bit(tq->active, NR_TINY_PRIO);
++
++	return highest < tiny_prio_of(p);
++}
++
++static void prio_changed_fair(struct rq *rq, struct task_struct *p, u64 oldprio)
++{
++	if (!task_on_rq_queued(p))
++		return;
++
++	if (p == rq->donor) {
++		/* p was demoted: a now-higher-priority fair waiter may exist. */
++		if (higher_prio_task_fair(rq, p))
++			resched_curr(rq);
++		return;
++	}
++
++	/* If the runner isn't fair, the class chain handles preemption.
++	 * tiny_prio_of(non-fair) is meaningless; skip the comparison.
++	 */
++	if (rq->donor->sched_class != &fair_sched_class)
++		return;
++
++	if (tiny_prio_of(p) < tiny_prio_of(rq->donor))
++		resched_curr(rq);
++}
++
++static void switched_to_fair(struct rq *rq, struct task_struct *p)
++{
++	if (!task_on_rq_queued(p))
++		return;
++
++	if (p == rq->donor) {
++		if (higher_prio_task_fair(rq, p))
++			resched_curr(rq);
++		return;
++	}
++
++	if (rq->donor->sched_class != &fair_sched_class)
++		return;
++
++	if (tiny_prio_of(p) < tiny_prio_of(rq->donor))
++		resched_curr(rq);
++}
++
++/* Externally-called helpers ------------------------------------------- */
++
++void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
++{
++	p->static_prio = NICE_TO_PRIO(attr->sched_nice);
++	p->se.slice = TINY_DEFAULT_SLICE;
++}
++
++void init_cfs_rq(struct cfs_rq *cfs_rq) { }
++void fair_server_init(struct rq *rq) { }
++void __init sched_init_granularity(void) { }
++void update_max_interval(void) { }
++void init_entity_runnable_average(struct sched_entity *se) { }
++void post_init_entity_util_avg(struct task_struct *p) { }
++void sched_balance_trigger(struct rq *rq) { }
++void update_group_capacity(struct sched_domain *sd, int cpu) { }
++
++#ifdef CONFIG_NO_HZ_COMMON
++void nohz_balance_enter_idle(int cpu) { }
++void nohz_balance_exit_idle(struct rq *rq) { }
++void nohz_run_idle_balance(int cpu) { }
++#endif
++
++__init void init_sched_fair_class(void)
++{
++	int cpu, prio;
++	struct tiny_rq *tq;
++
++	for_each_possible_cpu(cpu) {
++		tq = &per_cpu(tiny_rq, cpu);
++		bitmap_zero(tq->active, NR_TINY_PRIO);
++		for (prio = 0; prio < NR_TINY_PRIO; prio++)
++			INIT_LIST_HEAD(&tq->queue[prio]);
++	}
++}
++
++DEFINE_SCHED_CLASS(fair) = {
++	.enqueue_task		= enqueue_task_fair,
++	.dequeue_task		= dequeue_task_fair,
++	.yield_task		= yield_task_fair,
++
++	.wakeup_preempt		= wakeup_preempt_fair,
++
++	.pick_task		= pick_task_fair,
++	.pick_next_task		= pick_next_task_fair,
++	.put_prev_task		= put_prev_task_fair,
++	.set_next_task		= set_next_task_fair,
++
++	.select_task_rq		= select_task_rq_fair,
++	.set_cpus_allowed	= set_cpus_allowed_common,
++
++	.task_tick		= task_tick_fair,
++	.task_fork		= task_fork_fair,
++
++	.prio_changed		= prio_changed_fair,
++	.switched_to		= switched_to_fair,
++	.update_curr		= update_curr_fair,
++
++	.get_rr_interval	= get_rr_interval_fair,
++};
++
++#endif /* CONFIG_SCHED_FAIR_TINY */
