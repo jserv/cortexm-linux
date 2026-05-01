@@ -1,0 +1,42 @@
+scripts/test_qemu_trace_to_orderfile.py
+  a7255f912747fd2f 52-105
+.github/workflows/rollup-comment.yml
+  c35f5a8877f796dd 42,67,78-84,86-88,90-95
+scripts/qemu-trace-to-orderfile.py
+  a7255f912747fd2f 211-221,277,298-309,312,314-316
+build.sh
+  a7255f912747fd2f 1627-1638
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "fae02e5956705f9c9d67afbdb6e53c28943d9411",
+  "prompts": {
+    "a7255f912747fd2f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf0a95f2-494d-4d0e-9586-a244a99aacae",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 70,
+      "total_deletions": 14,
+      "accepted_lines": 94,
+      "overriden_lines": 0
+    },
+    "c35f5a8877f796dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019de516-7bf9-7743-b05f-84919429695d",
+        "model": "gpt-5.4"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 19,
+      "total_deletions": 8,
+      "accepted_lines": 18,
+      "overriden_lines": 0
+    }
+  }
+}
