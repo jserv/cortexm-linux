@@ -1,0 +1,101 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: sched: gate debug.c behind CONFIG_SCHED_DEBUG_OUTPUT
+
+Linux 7.0 removed the historical CONFIG_SCHED_DEBUG gate; debug.c is now
+unconditionally included via build_utility.c.  On a NOMMU image with no
+userspace reader of /proc/<pid>/sched, no debugfs sched-domain consumer,
+and no sysrq input device, the file is ~4KB of dead .text and .rodata.
+
+Re-introduce a knob without resurrecting the old name (which other code
+still references in deprecation comments).  CONFIG_SCHED_DEBUG_OUTPUT
+defaults to y so mainline behavior is preserved; setting it to n wraps
+the body of debug.c in #ifdef and provides empty stubs for the
+externally-called symbols that lack existing header stubs:
+
+  sched_debug_verbose             -- topology.c reads this flag
+  sysrq_sched_debug_show          -- core.c show_state_filter
+  resched_latency_warn            -- core.c sched_tick latency check
+  print_cfs_rq / print_rt_rq      -- print_*_stats bodies in fair.c, rt.c
+  print_dl_rq                     -- print_dl_stats body in deadline.c
+  print_numa_stats                -- print_cfs_stats body in fair.c
+                                     (only when CONFIG_NUMA_BALANCING)
+  proc_sched_show_task            -- fs/proc/base.c /proc/<pid>/sched read
+  proc_sched_set_task             -- fs/proc/base.c /proc/<pid>/sched write
+  update_sched_domain_debugfs     -- topology.c sched-domain rebuild path
+  dirty_sched_domain_sysctl       -- topology.c sched-domain sysctl path
+
+OOPS/panic backtraces are unaffected because sched_show_task and
+dump_cpu_task live in core.c, not debug.c.  /proc/<pid>/sched returns an
+empty seq_file when read.  Boot-path callers silently no-op.
+
+Measured on Cortex-M4 nommu mps2-an386 (linux-7.0): SCHED_DEBUG_OUTPUT=n
+drops 4,278 bytes / 16 symbols from .text per nm --size-sort against the
+production vmlinux.
+
+---
+ init/Kconfig         | 14 ++++++++++++++
+ kernel/sched/debug.c | 22 ++++++++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -932,6 +932,20 @@ config SCHED_PROXY_EXEC
+ 	  This option enables proxy execution, a mechanism for mutex-owning
+ 	  tasks to inherit the scheduling context of higher priority waiters.
+
++config SCHED_DEBUG_OUTPUT
++	bool "Scheduler debug/output paths"
++	default y
++	help
++	  Build kernel/sched/debug.c, which provides /proc/<pid>/sched,
++	  /sys/kernel/debug/sched/* (when DEBUG_FS=y), the sysrq scheduler
++	  dump, and the print_cfs_rq / print_rt_rq / print_dl_rq /
++	  print_numa_stats formatters.
++
++	  Say N on size-constrained NOMMU images that never read
++	  /proc/<pid>/sched and have no debugfs sched-domain consumer.
++	  Boot-path callers become no-ops; OOPS/panic backtraces are
++	  unaffected (sched_show_task lives in core.c).
++
+ endmenu
+
+ #
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -9,6 +9,8 @@
+ #include <linux/debugfs.h>
+ #include <linux/nmi.h>
+ #include "sched.h"
++
++#ifdef CONFIG_SCHED_DEBUG_OUTPUT
+
+ /*
+  * This allows printing both to /sys/kernel/debug/sched/debug and
+@@ -1388,3 +1390,25 @@ void resched_latency_warn(int cpu, u64 latency)
+ 	       cpu, latency, cpu_rq(cpu)->ticks_without_resched);
+ 	dump_stack();
+ }
++
++#else /* !CONFIG_SCHED_DEBUG_OUTPUT */
++
++__read_mostly bool sched_debug_verbose;
++
++void sysrq_sched_debug_show(void) { }
++void resched_latency_warn(int cpu, u64 latency) { }
++void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq) { }
++void print_rt_rq(struct seq_file *m, int cpu, struct rt_rq *rt_rq) { }
++void print_dl_rq(struct seq_file *m, int cpu, struct dl_rq *dl_rq) { }
++#ifdef CONFIG_NUMA_BALANCING
++void print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
++		      unsigned long tpf, unsigned long gsf, unsigned long gpf)
++{ }
++#endif
++void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
++			  struct seq_file *m) { }
++void proc_sched_set_task(struct task_struct *p) { }
++void update_sched_domain_debugfs(void) { }
++void dirty_sched_domain_sysctl(int cpu) { }
++
++#endif /* CONFIG_SCHED_DEBUG_OUTPUT */
