@@ -1,0 +1,48 @@
+patches/0018-tiny-sched-pelt-rt-mini.patch
+  08b101fbcca26352 1-146
+patches/0016-tiny-sched-no-rich-api.patch
+  08b101fbcca26352 1-197
+patches/0020-tiny-time-no-set-wallclock.patch
+  08b101fbcca26352 1-144
+patches/0015-tiny-sched-no-topology.patch
+  08b101fbcca26352 1-222
+build.sh
+  08b101fbcca26352 669,955-1016,1083-1089
+patches/0017-tiny-time-no-cpu-timers.patch
+  08b101fbcca26352 1-181
+patches/0019-tiny-sched-rt-tiny.patch
+  08b101fbcca26352 1-363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d7e553d4d758077965de0908a69e10a8d5c4534a",
+  "prompts": {
+    "08b101fbcca26352": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7d94ea3b-ba16-452f-9932-4498489c2dbf",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 2886,
+      "total_deletions": 78,
+      "accepted_lines": 2855,
+      "overriden_lines": 3
+    },
+    "980f49694791adcd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d79ea0a4-777c-4b18-aac5-bf4dda1ce4be",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 338,
+      "total_deletions": 95,
+      "accepted_lines": 428,
+      "overriden_lines": 6
+    }
+  }
+}
