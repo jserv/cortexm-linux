@@ -1,0 +1,197 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: sched: gate sched_setattr/setscheduler family behind CONFIG_SCHED_NO_RICH_API
+
+kernel/sched/syscalls.c carries the userspace policy/priority/affinity
+control surface: sched_setparam (154), sched_getparam (155),
+sched_setscheduler (156), sched_getscheduler (157), sched_get_priority_max
+(159), sched_get_priority_min (160), sched_rr_get_interval (161),
+sched_setaffinity (241), sched_getaffinity (242), sched_setattr (380),
+sched_getattr (381).  On a NOMMU image without `chrt`, `taskset`, or any
+RT-aware applet (BusyBox here ships none of them, uClibc threads are
+disabled, the kernel cannot host a third-party userspace), every one of
+those handlers is dead reachability for the shipped binaries.
+
+The internal C-level helpers (sched_set_fifo / sched_set_fifo_low /
+sched_set_fifo_secondary / sched_set_normal / sched_setattr_nocheck /
+sched_setscheduler_nocheck / sched_setaffinity / sched_getaffinity /
+__sched_setaffinity / dl_task_check_affinity) still have in-kernel
+callers (RCU kthread priority bumps, kthread_park, compat layer) and
+must remain live.  sched_yield (158) and the SYSCALL_DEFINE1(nice)
+wrapper are kept because hush / busybox / loop guards rely on them.
+
+CONFIG_SCHED_NO_RICH_API (default n; mainline behaviour preserved) wraps
+the gated functions in #ifndef.  The corresponding sys_<name> symbols
+become undefined; kernel/sys_ni.c gains COND_SYSCALL entries so the
+syscall-table slot weakly aliases sys_ni_syscall and the syscall
+returns -ENOSYS.  Internal helpers, the sched_yield / nice handlers,
+and the do_sched_yield / yield / yield_to internal API remain live.
+
+Gated regions inside kernel/sched/syscalls.c:
+
+  - sched_setscheduler / sched_setattr (non-static C wrappers, only
+    callable through the gated SYSCALL_DEFINEs at runtime; the in-tree
+    direct callers we surveyed -- kernel/locking/rtmutex_api.c and
+    kernel/sched/ext.c -- only mention them in comments)
+
+  - do_sched_setscheduler + sched_copy_attr + get_params static helpers,
+    and SYSCALL_DEFINEs for sched_setscheduler / sched_setparam /
+    sched_setattr / sched_getscheduler / sched_getparam / sched_getattr
+    (the helpers have no other callers; LTO would otherwise have to walk
+    the static-fn graph through dropped SYSCALL_DEFINE bodies)
+
+  - get_user_cpu_mask static helper + SYSCALL_DEFINE3(sched_setaffinity)
+  - SYSCALL_DEFINE3(sched_getaffinity)
+  - SYSCALL_DEFINE1(sched_get_priority_max),
+    SYSCALL_DEFINE1(sched_get_priority_min)
+  - sched_rr_get_interval static helper + SYSCALL_DEFINE2(sched_rr_get_interval)
+    + SYSCALL_DEFINE2(sched_rr_get_interval_time32)
+
+Risk: low for our applet set; any third-party RT/affinity tool breaks
+immediately with -ENOSYS.  busybox `nice` (uses SYSCALL_DEFINE1(nice),
+not gated) keeps working; busybox `sleep` (clock_nanosleep) keeps
+working; hush built-in `wait` / `kill` / `jobs` keep working.
+
+Measured on Cortex-M4 nommu mps2-an386 (linux-7.0): syscalls.c shrinks
+from 3,192 to roughly 700 bytes / 41 -> ~10 symbols; linux.axf trims
+2.0-2.5 KB after page-alignment cascade.
+
+---
+ init/Kconfig            |  21 +++++++++++++++++++++
+ kernel/sched/syscalls.c |  44 ++++++++++++++++++++++++++++++++++++++++++++
+ kernel/sys_ni.c         |  13 +++++++++++++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1012,6 +1012,27 @@ config SCHED_TOPOLOGY_MINIMAL
+
+ 	  Say N unless you are building a heavily size-constrained image.
+
++config SCHED_NO_RICH_API
++	bool "Drop sched_setattr/setscheduler/affinity/priority/rr_get_interval syscalls"
++	default n
++	help
++	  Stub the userspace policy/priority/affinity scheduling syscalls
++	  to -ENOSYS via weak cond_syscall aliases: sched_setparam (154),
++	  sched_getparam (155), sched_setscheduler (156), sched_getscheduler
++	  (157), sched_get_priority_{max,min} (159/160), sched_rr_get_interval
++	  (161), sched_{set,get}affinity (241/242), sched_{set,get}attr
++	  (380/381).  sched_yield (158) and nice (34) remain available;
++	  in-kernel C helpers (sched_set_fifo / sched_setscheduler_nocheck /
++	  sched_setattr_nocheck / sched_setaffinity / sched_getaffinity /
++	  __sched_setaffinity / dl_task_check_affinity) stay live for RCU
++	  / kthread / compat callers.
++
++	  Safe on NOMMU images that ship no `chrt`, no `taskset`, and no
++	  RT-aware applet.  Any third-party tool that programs scheduling
++	  policy or affinity from userspace will break with -ENOSYS.
++
++	  Say N unless you are building a heavily size-constrained image.
++
+ endmenu
+
+ #
+diff --git a/kernel/sched/syscalls.c b/kernel/sched/syscalls.c
+--- a/kernel/sched/syscalls.c
++++ b/kernel/sched/syscalls.c
+@@ -755,6 +755,7 @@ int sched_setattr_nocheck_user(struct task_struct *p, const struct sched_attr *u
+  *
+  * NOTE that the task may be already dead.
+  */
++#ifndef CONFIG_SCHED_NO_RICH_API
+ int sched_setscheduler(struct task_struct *p, int policy,
+ 		       const struct sched_param *param)
+ {
+@@ -765,6 +766,7 @@ int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
+ {
+ 	return __sched_setscheduler(p, attr, true, true);
+ }
++#endif /* CONFIG_SCHED_NO_RICH_API */
+
+ int sched_setattr_nocheck(struct task_struct *p, const struct sched_attr *attr)
+ {
+@@ -849,6 +851,7 @@ void sched_set_normal(struct task_struct *p, int nice)
+ }
+ EXPORT_SYMBOL_GPL(sched_set_normal);
+
++#ifndef CONFIG_SCHED_NO_RICH_API
+ static int
+ do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
+ {
+@@ -1097,6 +1100,7 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
+ 	kattr.size = min(usize, sizeof(kattr));
+ 	return copy_struct_to_user(uattr, usize, &kattr, sizeof(kattr), NULL);
+ }
++#endif /* CONFIG_SCHED_NO_RICH_API */
+
+ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
+ {
+@@ -1234,6 +1238,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ 	return retval;
+ }
+
++#ifndef CONFIG_SCHED_NO_RICH_API
+ static int get_user_cpu_mask(unsigned long __user *user_mask_ptr, unsigned len,
+ 			     struct cpumask *new_mask)
+ {
+@@ -1268,6 +1273,7 @@ SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
+ 	free_cpumask_var(new_mask);
+ 	return retval;
+ }
++#endif /* CONFIG_SCHED_NO_RICH_API */
+
+ long sched_getaffinity(pid_t pid, struct cpumask *mask)
+ {
+@@ -1289,6 +1295,7 @@ long sched_getaffinity(pid_t pid, struct cpumask *mask)
+ 	return 0;
+ }
+
++#ifndef CONFIG_SCHED_NO_RICH_API
+ /**
+  * sys_sched_getaffinity - get the CPU affinity of a process
+  * @pid: pid of the process
+@@ -1325,6 +1332,7 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
+
+ 	return ret;
+ }
++#endif /* CONFIG_SCHED_NO_RICH_API */
+
+ static void do_sched_yield(void)
+ {
+@@ -1452,6 +1460,7 @@ int __sched yield_to(struct task_struct *p, bool preempt)
+ }
+ EXPORT_SYMBOL_GPL(yield_to);
+
++#ifndef CONFIG_SCHED_NO_RICH_API
+ /**
+  * sys_sched_get_priority_max - return maximum RT priority.
+  * @policy: scheduling class.
+@@ -1570,3 +1579,4 @@ SYSCALL_DEFINE2(sched_rr_get_interval_time32, pid_t, pid,
+ 	return retval;
+ }
+ #endif
++#endif /* CONFIG_SCHED_NO_RICH_API */
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -333,6 +333,19 @@ COND_SYSCALL(stime32);
+ COND_SYSCALL(utime32);
+ COND_SYSCALL(adjtimex_time32);
+ COND_SYSCALL(sched_rr_get_interval_time32);
++
++/* sched: rich policy/priority/affinity API gated by CONFIG_SCHED_NO_RICH_API */
++COND_SYSCALL(sched_setparam);
++COND_SYSCALL(sched_getparam);
++COND_SYSCALL(sched_setscheduler);
++COND_SYSCALL(sched_getscheduler);
++COND_SYSCALL(sched_setattr);
++COND_SYSCALL(sched_getattr);
++COND_SYSCALL(sched_setaffinity);
++COND_SYSCALL(sched_getaffinity);
++COND_SYSCALL(sched_get_priority_max);
++COND_SYSCALL(sched_get_priority_min);
++COND_SYSCALL(sched_rr_get_interval);
+ COND_SYSCALL(nanosleep_time32);
+ COND_SYSCALL(rt_sigtimedwait_time32);
+ COND_SYSCALL_COMPAT(rt_sigtimedwait_time32);

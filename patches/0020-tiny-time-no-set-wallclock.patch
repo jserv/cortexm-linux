@@ -1,0 +1,144 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: time: gate wallclock-setting paths behind CONFIG_TIME_NO_SET_WALLCLOCK
+
+kernel/time/timekeeping.c implements both the read side (clock_gettime
+on CLOCK_REALTIME / CLOCK_MONOTONIC / CLOCK_BOOTTIME / CLOCK_TAI;
+ktime_get*; getboottime; do_timer) and the discipline / setting side
+(NTP frequency / phase adjustment, leap-second / TAI maintenance, the
+do_settimeofday64 / settimeofday / adjtimex / clock_settime entry
+points).  On a NOMMU MPS2-AN386 image with no NTP source, no RTC, and
+QEMU providing a stable epoch at boot, the entire setting half is
+unreachable from the shipped applet set.
+
+CONFIG_TIME_NO_SET_WALLCLOCK (default n; mainline behaviour preserved)
+gates the three top-level setting entry points and turns
+timekeeping_warp_clock into a no-op:
+
+    do_settimeofday64           -> -EPERM
+    do_adjtimex                 -> -EPERM
+    timekeeping_warp_clock      -> empty
+
+timekeeping_inject_sleeptime64 (RTC suspend path) is left untouched
+since CONFIG_RTC_CLASS=n on this target makes its only callers
+(rtc_resume / rtc_suspend) unreachable; LTO drops the path
+naturally.
+
+Effective userspace impact:
+    settimeofday(2)  -> -EPERM via kernel/time/time.c
+    clock_settime(2) -> -EPERM via kernel/time/posix-timers.c
+    adjtimex(2)      -> -EPERM via kernel/time/time.c
+    stime(2) compat  -> -EPERM
+    clock_gettime(2) -> unchanged: read paths still live
+
+The discipline-side helpers
+(__timekeeping_inject_offset / timekeeping_inject_offset /
+__timekeeping_set_tai_offset / change_clocksource / timekeeping_notify /
+timekeeping_adjust / timekeeping_apply_adjustment / __do_adjtimex /
+timekeeping_validate_timex / hardpps) lose all in-tree callers and are
+candidates for LTO dead-stripping.  Static-internal helpers are dropped
+unconditionally; non-static ones (do_settimeofday64, do_adjtimex,
+timekeeping_warp_clock, timekeeping_inject_sleeptime64) keep their
+symbols so the existing extern declarations in include/linux/timekeeping.h
+and include/linux/timex.h still resolve.
+
+Risk: low.  Wallclock cannot be corrected after boot; QEMU provides
+a stable RTC at startup so the boot-time value is already reasonable.
+NTP source absent on this target.  Re-enabling RTC, NTP daemon, or
+hwclock requires reverting this knob.
+
+Measured on Cortex-M4 nommu mps2-an386 (linux-7.0): timekeeping.c
+shrinks from 9,296 to ~7 KB; linux.axf trims roughly 1.5-2.5 KB after
+page-alignment cascade.
+
+---
+ init/Kconfig             | 22 ++++++++++++++++++++++
+ kernel/time/timekeeping.c | 18 ++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1101,6 +1101,28 @@ config SCHED_RT_TINY
+ 	  Say N unless you are building a heavily size-constrained image.
+ 	  Boot test before deploying.
+
++config TIME_NO_SET_WALLCLOCK
++	bool "Drop wallclock-setting paths (clock_settime / adjtimex / settimeofday)"
++	default n
++	help
++	  Stub do_settimeofday64, do_adjtimex, and timekeeping_warp_clock
++	  to return -EPERM / no-op respectively.  Effective userspace
++	  impact:
++
++	    settimeofday(2)  -> -EPERM
++	    clock_settime(2) -> -EPERM
++	    adjtimex(2)      -> -EPERM
++	    stime(2)         -> -EPERM
++	    clock_gettime(2) -> unchanged (read paths stay live)
++
++	  Safe on NOMMU images with no NTP source, no RTC, and a stable
++	  boot-time epoch (QEMU provides one).  The wallclock cannot be
++	  corrected after boot.  The NTP discipline / leap-second / TAI
++	  maintenance helpers in timekeeping.c lose all in-tree callers
++	  and become candidates for LTO dead-stripping.
++
++	  Say N unless you are building a heavily size-constrained image.
++
+ endmenu
+
+ #
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1433,6 +1433,9 @@ bool timekeeping_clocksource_has_base(enum clocksource_ids id)
+  */
+ int do_settimeofday64(const struct timespec64 *ts)
+ {
++#ifdef CONFIG_TIME_NO_SET_WALLCLOCK
++	return -EPERM;
++#else
+ 	struct timespec64 ts_delta, xt;
+
+ 	if (!timespec64_valid_settod(ts))
+@@ -1462,6 +1465,7 @@ int do_settimeofday64(const struct timespec64 *ts)
+ 	audit_tk_injoffset(ts_delta);
+ 	add_device_randomness(ts, sizeof(*ts));
+ 	return 0;
++#endif
+ }
+ EXPORT_SYMBOL(do_settimeofday64);
+
+@@ -1556,12 +1560,14 @@ EXPORT_SYMBOL(persistent_clock_is_local);
+  */
+ void timekeeping_warp_clock(void)
+ {
++#ifndef CONFIG_TIME_NO_SET_WALLCLOCK
+ 	if (sys_tz.tz_minuteswest != 0) {
+ 		struct timespec64 adjust;
+
+ 		persistent_clock_is_local = 1;
+ 		adjust.tv_sec = sys_tz.tz_minuteswest * 60;
+ 		adjust.tv_nsec = 0;
+ 		timekeeping_inject_offset(&adjust);
+ 	}
++#endif
+ }
+
+@@ -2753,6 +2759,9 @@ static int __do_adjtimex(struct tk_data *tkd, struct __kernel_timex *txc,
+  */
+ int do_adjtimex(struct __kernel_timex *txc)
+ {
++#ifdef CONFIG_TIME_NO_SET_WALLCLOCK
++	return -EPERM;
++#else
+ 	struct adjtimex_result result = { };
+ 	int ret;
+
+@@ -2770,6 +2779,7 @@ int do_adjtimex(struct __kernel_timex *txc)
+ 	ntp_notify_cmos_timer(result.delta.tv_sec != 0);
+
+ 	return ret;
++#endif
+ }
+
+ long ktime_get_ntp_seconds(unsigned int id)
