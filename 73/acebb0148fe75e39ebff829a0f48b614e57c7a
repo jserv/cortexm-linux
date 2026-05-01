@@ -1,0 +1,58 @@
+build.sh
+  3b06846bca3bbc64 913-916,918-920,981-984,1034,1038-1040
+  b91e9d992531dbdd 657,899-912,917,921,979-980,1037
+patches/0012-tiny-sched-no-debug-output.patch
+  b91e9d992531dbdd 1-12,14-23,26-36,39-75,77-97,100-101
+  3b06846bca3bbc64 24-25,76,98-99
+  b938dcd61772bb40 13,37-38
+patches/0013-tiny-sched-no-deadline-class.patch
+  b938dcd61772bb40 36,57-58
+  3b06846bca3bbc64 44-45,48-50,77-78,95,125-127,135,157
+  b91e9d992531dbdd 1-35,37-43,46-47,51-56,59-76,79-94,96-124,128-134,136-156,158-159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "73acebb0148fe75e39ebff829a0f48b614e57c7a",
+  "prompts": {
+    "3b06846bca3bbc64": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019de185-78ed-7723-bd07-64c9bedc157f",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 50,
+      "total_deletions": 33,
+      "accepted_lines": 33,
+      "overriden_lines": 0
+    },
+    "b91e9d992531dbdd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44ede5b1-52a4-499e-9007-6821bf065887",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 345,
+      "total_deletions": 55,
+      "accepted_lines": 256,
+      "overriden_lines": 0
+    },
+    "b938dcd61772bb40": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ddde6-ef58-7af1-a8f1-d757a20cda67",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang",
+      "messages": [],
+      "total_additions": 6,
+      "total_deletions": 21,
+      "accepted_lines": 6,
+      "overriden_lines": 0
+    }
+  }
+}
