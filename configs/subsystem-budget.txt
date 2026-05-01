@@ -2,33 +2,35 @@
 #
 # Format:  <bucket>  <ceiling-bytes>  [<noise-band-pct>]
 #
-# - Bucket names match scripts/subsystem-rollup.py output. Run a
-#   diagnostic build (KERNEL_DEBUG_INFO=reduced) and inspect
-#   profiles/kernel-pgo/none/subsystem-rollup.txt for the live names.
-# - The noise band absorbs run-to-run variance from GCC LTO
-#   re-deciding what to inline when nothing semantic changed. Default
-#   is 2.0%. Start there, then tighten after observing a week of
-#   clean builds. <icf-merged> tends to be jitterier than real
-#   subsystems -- a wider band there is reasonable.
+# - Bucket names match scripts/subsystem-rollup.py output. The checker
+#   now merges both subsystem-rollup.txt and subsystem-rollup-deep.txt,
+#   so rules may target top-level buckets (`kernel`, `lib`, `fs`) or
+#   deep sub-buckets (`kernel/sched`, `kernel/printk`, `lib/zstd`).
 # - A breach is "actual > limit * (1 + band/100)". The total-bytes
-#   gate is the coarse safeguard; this layer answers WHICH bucket
+#   gate remains the coarse safeguard; this layer answers WHICH bucket
 #   regressed.
+# - The default 2.0% band is still a placeholder until run-to-run LTO
+#   variance is measured. `<icf-merged>` gets 5.0% because IPA-ICF
+#   alias groups jitter more than the real subsystem buckets.
 #
-# How to populate:
-#   1. KERNEL_DEBUG_INFO=reduced ./build.sh linux bootwrapper
-#   2. Read profiles/kernel-pgo/none/subsystem-rollup.txt for the
-#      observed sizes.
-#   3. Pick ceilings 5-10% above each observed value -- enough room
-#      for legitimate growth without masking regressions.
-#
-# Example values (uncomment and tune to your build):
-#   kernel              260000   2.0
-#   mm                   80000   2.0
-#   fs                   20000   2.0
-#   arch/arm            120000   2.0
-#   drivers/tty          25000   2.0
-#   drivers/clocksource  10000   2.0
-#   lib                  70000   2.0
-#   crypto                5000   2.0
-#   <icf-merged>         30000   5.0
-#   <compiler-partition>  5000   5.0
+# Baseline sources:
+# - Top-level ceilings come from the 2026-05-01 diagnostic snapshot in
+#   TODO.md's "Snapshot from Latest Production Build" section.
+# - `kernel/sched` and `kernel/printk` come from the 2026-05-01
+#   "Kernel and Lib Sub-Bucket Breakdown" section after patches
+#   0015-0020 and CONFIG_SCHED_FAIR_TINY.
+# - `lib/zstd`, `lib/lz4`, and `lib/xz` are pinned at zero to catch an
+#   `olddefconfig` re-enable of already-disabled RD_* decompressors.
+
+kernel         200000  2.0
+fs             165000  2.0
+lib            116000  2.0
+mm              86000  2.0
+<icf-merged>    28000  5.0
+
+kernel/sched    23500  2.0
+kernel/printk   18500  2.0
+
+lib/zstd            0  0.0
+lib/lz4             0  0.0
+lib/xz              0  0.0

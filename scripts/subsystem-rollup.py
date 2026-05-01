@@ -412,40 +412,67 @@ def write_svg(buckets, grand_total, path):
         )
         return
 
-    chart_w = 720
-    label_w = 240
-    text_w = 180
-    bar_h = 22
-    pad = 4
-    height = pad * 2 + len(rows) * (bar_h + pad)
+    chart_w = 760
+    label_w = 260
+    text_w = 186
+    bar_h = 24
+    row_gap = 8
+    pad_x = 22
+    pad_y = 22
+    title_h = 54
+    height = pad_y * 2 + title_h + len(rows) * (bar_h + row_gap)
     width = label_w + chart_w + text_w
     max_bytes = max(b.bytes for _, b in rows) or 1
 
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-        f'height="{height}" font-family="ui-monospace, monospace" '
+        f'height="{height}" font-family="Iosevka Term, SFMono-Regular, Menlo, monospace" '
         'font-size="13">',
-        f'<rect width="{width}" height="{height}" fill="#fafafa"/>',
-        f'<line x1="{label_w}" y1="0" x2="{label_w}" y2="{height}" '
-        'stroke="#ddd"/>',
+        '<defs>',
+        '<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">',
+        '<stop offset="0%" stop-color="#f7f2e8"/>',
+        '<stop offset="100%" stop-color="#fdfcf9"/>',
+        '</linearGradient>',
+        '<linearGradient id="barMain" x1="0" y1="0" x2="1" y2="0">',
+        '<stop offset="0%" stop-color="#1f6f78"/>',
+        '<stop offset="100%" stop-color="#2d9c8f"/>',
+        '</linearGradient>',
+        '<linearGradient id="barSpecial" x1="0" y1="0" x2="1" y2="0">',
+        '<stop offset="0%" stop-color="#9f3a2c"/>',
+        '<stop offset="100%" stop-color="#d46b4c"/>',
+        '</linearGradient>',
+        '</defs>',
+        f'<rect width="{width}" height="{height}" fill="url(#bg)"/>',
+        f'<text x="{pad_x}" y="{pad_y + 12}" fill="#17313a" '
+        'font-size="18" font-weight="700">vmlinux .text by subsystem</text>',
+        f'<text x="{pad_x}" y="{pad_y + 34}" fill="#52636a" '
+        'font-size="12">Sorted by resident bytes; special buckets '
+        'highlight compiler/linker artefacts.</text>',
+        f'<line x1="{pad_x + label_w}" y1="{pad_y + title_h - 2}" '
+        f'x2="{pad_x + label_w}" y2="{height - pad_y}" stroke="#d8d2c4"/>',
     ]
     for i, (name, b) in enumerate(rows):
-        y = pad + i * (bar_h + pad)
+        y = pad_y + title_h + i * (bar_h + row_gap)
         bar_w = max(1, int(chart_w * b.bytes / max_bytes))
         pct = (b.bytes * 100.0 / grand_total) if grand_total else 0.0
-        color = "#c84030" if name.startswith("<") else "#4682b4"
+        color = "url(#barSpecial)" if name.startswith("<") else "url(#barMain)"
+        rail_x = pad_x + label_w
         parts.append(
-            f'<text x="{label_w - 8}" y="{y + bar_h - 6}" '
-            f'text-anchor="end" fill="#222">{_esc(name)}</text>'
+            f'<text x="{pad_x + label_w - 12}" y="{y + 16}" '
+            f'text-anchor="end" fill="#24343a">{_esc(name)}</text>'
         )
         parts.append(
-            f'<rect x="{label_w}" y="{y}" width="{bar_w}" '
-            f'height="{bar_h - 2}" fill="{color}"/>'
+            f'<rect x="{rail_x}" y="{y}" width="{chart_w}" '
+            f'height="{bar_h - 4}" rx="6" fill="#e8e1d5"/>'
         )
         parts.append(
-            f'<text x="{label_w + bar_w + 6}" y="{y + bar_h - 6}" '
-            f'fill="#222">{b.bytes:,} ({pct:.1f}%)</text>'
+            f'<rect x="{rail_x}" y="{y}" width="{bar_w}" '
+            f'height="{bar_h - 4}" rx="6" fill="{color}"/>'
+        )
+        parts.append(
+            f'<text x="{rail_x + bar_w + 10}" y="{y + 16}" '
+            f'fill="#24343a">{b.bytes:,} bytes  {pct:.1f}%</text>'
         )
     parts.append("</svg>")
     path.write_text("\n".join(parts) + "\n")
@@ -455,86 +482,493 @@ TREEMAP_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>vmlinux .text rollup -- subsystem treemap</title>
+<title>vmlinux .text rollup -- subsystem breakdown</title>
 <style>
-body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #fafafa; color: #222; }
-header { padding: 12px 20px; border-bottom: 1px solid #ddd; }
-header h1 { margin: 0; font-size: 15px; }
-header p { margin: 4px 0 0; font-size: 12px; color: #555; }
-header code { background: #eee; padding: 1px 4px; border-radius: 3px; }
-#chart { width: 100%; height: calc(100vh - 90px); display: block; }
-.tile rect { stroke: #fff; stroke-width: 1; }
-.tile:hover rect { stroke: #000; stroke-width: 2; }
-.tile text { font-size: 11px; fill: #fff; pointer-events: none; }
-.tooltip {
-  position: absolute; pointer-events: none;
-  background: #222; color: #fff;
-  padding: 6px 10px; font-size: 12px;
-  border-radius: 4px; opacity: 0;
-  max-width: 360px; word-break: break-all;
+:root {
+  --bg: #f7f4ed;
+  --panel: #fffdf9;
+  --line: #ddd6c8;
+  --ink: #1f2a30;
+  --muted: #66757c;
+  --accent: #236d72;
+  --accent-soft: #58a8a0;
+  --special: #a45137;
+  --special-soft: #d17d5b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+}
+header {
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+header h1 { margin: 0; font-size: 28px; letter-spacing: -0.02em; }
+header p { margin: 8px 0 0; font-size: 13px; color: var(--muted); max-width: 980px; line-height: 1.45; }
+header code {
+  background: #f0ece3;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-family: "Iosevka Term", "SFMono-Regular", monospace;
+  font-size: 12px;
+}
+.summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+.card {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+.card .label {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.card .value {
+  display: block;
+  margin-top: 6px;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.card .sub {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(340px, 0.7fr);
+  gap: 16px;
+  padding: 16px 18px 18px;
+  align-items: start;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.panel-head {
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.panel-head h2 {
+  margin: 0;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.panel-head p {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.panel-body { padding: 12px 16px 16px; }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  background: #fff;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--ink);
+}
+.chip .swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+.pareto-wrap {
+  border: 1px solid var(--line);
+  background: #fff;
+  padding: 10px;
+}
+#pareto-chart {
+  width: 100%;
+  height: 420px;
+  display: block;
+}
+.bucket-list, .files { display: grid; gap: 8px; }
+.bucket-item {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+}
+.bucket-item.active {
+  border-color: var(--accent);
+  background: #fcfffe;
+}
+.bucket-head, .file-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+}
+.bucket-name, .detail-title {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.bucket-name {
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+.bucket-meta, .file-meta {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.bucket-sub, .file-sub {
+  margin-top: 6px;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.meter {
+  height: 10px;
+  margin-top: 10px;
+  background: #ece6db;
+  overflow: hidden;
+}
+.meter > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-soft));
+}
+.detail-meta {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.detail-card {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+.detail-card .label {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.detail-card .value {
+  display: block;
+  margin-top: 6px;
+  font-size: 20px;
+  font-weight: 700;
+}
+.file-item {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+.file-name {
+  font: 12px "Iosevka Term", "SFMono-Regular", monospace;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.empty {
+  padding: 20px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+}
+.help {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+@media (max-width: 1100px) {
+  .layout { grid-template-columns: 1fr; }
+  .detail-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 640px) {
+  header { padding: 16px; }
+  .layout { padding: 14px; }
+  header h1 { font-size: 22px; }
+  .detail-grid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
 <body>
 <header>
-  <h1>vmlinux .text rollup -- subsystem treemap</h1>
-  <p>Total: __TOTAL__ bytes. Hover for details. Special buckets:
+  <h1>vmlinux .text rollup -- subsystem breakdown</h1>
+  <p>Total: __TOTAL__ bytes. Top-level buckets are sorted descending, so the left column is the fastest way to compare subsystem proportions. Click a bucket to inspect which files dominate that bucket. Special buckets:
      <code>&lt;icf-merged&gt;</code>, <code>&lt;unknown&gt;</code>,
      <code>&lt;compiler-partition&gt;</code>, <code>&lt;external&gt;</code>.</p>
+  <div class="summary" id="summary"></div>
 </header>
-<svg id="chart"></svg>
-<div class="tooltip" id="tip"></div>
-<script src="https://d3js.org/d3.v7.min.js"></script>
+<main class="layout">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Pareto View</h2>
+      <p>橫條是各 subsystem 的 resident <code>.text</code> bytes，折線是累積百分比。先看前幾名就能抓到主要體積來源。</p>
+      <div class="legend">
+        <div class="chip"><span class="swatch" style="background:#1f6f78"></span>normal subsystem buckets</div>
+        <div class="chip"><span class="swatch" style="background:#b24a35"></span>special attribution buckets</div>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="pareto-wrap">
+        <svg id="pareto-chart" viewBox="0 0 960 420" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="bucket-list" id="bucket-list"></div>
+    </div>
+  </section>
+  <aside class="panel">
+    <div class="panel-head">
+      <h2>Selected Bucket</h2>
+      <p>Largest contributing files inside the chosen subsystem.</p>
+    </div>
+    <div class="panel-body">
+      <div id="detail"></div>
+      <div class="help">This view is optimized for comparing proportions, not spatial packing. Use the left column to rank buckets; use the right column to understand why a bucket is large.</div>
+    </div>
+  </aside>
+</main>
 <script>
 const data = __DATA__;
-const svg = d3.select("#chart");
-const tip = d3.select("#tip");
-const palette = d3.scaleOrdinal(d3.schemeTableau10);
+const summary = document.getElementById("summary");
+const paretoChart = document.getElementById("pareto-chart");
+const bucketList = document.getElementById("bucket-list");
+const detail = document.getElementById("detail");
+const normalPalette = ["#1f6f78", "#2f998d", "#3f8a58", "#2c5c84", "#7f8c3a", "#6f78b5"];
+const specialPalette = ["#b24a35", "#c7684f", "#9b5a26", "#8e3f2d"];
 
-function render() {
-  const w = svg.node().clientWidth;
-  const h = svg.node().clientHeight;
-  svg.selectAll("*").remove();
-
-  const root = d3.hierarchy(data)
-    .sum(d => d.value || 0)
-    .sort((a, b) => b.value - a.value);
-  d3.treemap().size([w, h]).paddingInner(1).round(true)(root);
-
-  const tile = svg.selectAll("g")
-    .data(root.leaves())
-    .join("g")
-    .attr("class", "tile")
-    .attr("transform", d => `translate(${d.x0},${d.y0})`);
-
-  tile.append("rect")
-    .attr("width", d => Math.max(0, d.x1 - d.x0))
-    .attr("height", d => Math.max(0, d.y1 - d.y0))
-    .attr("fill", d => palette(d.parent ? d.parent.data.name : "root"));
-
-  tile.append("text")
-    .attr("x", 4).attr("y", 12)
-    .text(d => {
-      const W = d.x1 - d.x0;
-      const H = d.y1 - d.y0;
-      if (W < 60 || H < 16) return "";
-      return `${d.parent.data.name}/${d.data.name}`;
-    });
-
-  tile.on("mousemove", function(event, d) {
-    tip.style("opacity", 1)
-       .style("left", (event.pageX + 14) + "px")
-       .style("top", (event.pageY + 14) + "px")
-       .html(
-         `<b>${d.parent.data.name}/${d.data.name}</b><br/>` +
-         `${d.value.toLocaleString()} bytes<br/>` +
-         `${(d.data.symbols || 0)} symbols`
-       );
-  }).on("mouseleave", () => tip.style("opacity", 0));
+function classify(name) {
+  return name.startsWith("<") ? "special" : "normal";
 }
 
-render();
-window.addEventListener("resize", render);
+function colorForBucket(name, index) {
+  const colors = classify(name) === "special" ? specialPalette : normalPalette;
+  return colors[index % colors.length];
+}
+
+function sum(items, fn) {
+  let total = 0;
+  for (const item of items) total += fn(item);
+  return total;
+}
+
+function pct(part, whole) {
+  return whole ? (part * 100 / whole) : 0;
+}
+
+function esc(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+const buckets = [...data.children]
+  .map((bucket, index) => {
+    const total = bucket.children.reduce((s, x) => s + x.value, 0);
+    const symbols = bucket.children.reduce((s, x) => s + (x.symbols || 0), 0);
+    return {
+      ...bucket,
+      total,
+      symbols,
+      colorIndex: index,
+      files: [...bucket.children].sort((a, b) => b.value - a.value),
+    };
+  })
+  .sort((a, b) => b.total - a.total)
+  .map((bucket, index) => ({...bucket, rank: index + 1}));
+
+const grandTotal = buckets.reduce((s, b) => s + b.total, 0);
+let selected = buckets[0] || null;
+
+function renderSummary() {
+  const special = buckets.filter(b => classify(b.name) === "special");
+  const largest = buckets[0];
+  const cards = [
+    { label: "Resident .text", value: grandTotal.toLocaleString(), sub: "bytes across all buckets" },
+    { label: "Buckets", value: buckets.length, sub: `${special.length} special attribution buckets` },
+    { label: "Largest Bucket", value: largest ? largest.name : "n/a", sub: largest ? `${largest.total.toLocaleString()} bytes` : "" },
+    { label: "Attributed Leaves", value: sum(buckets, b => b.files.length).toLocaleString(), sub: "file-level entries" },
+  ];
+  summary.innerHTML = cards.map(d =>
+    `<div class="card"><span class="label">${d.label}</span><span class="value">${d.value}</span><span class="sub">${d.sub}</span></div>`
+  ).join("");
+}
+
+function renderBucketList() {
+  const max = buckets.length ? buckets[0].total : 1;
+  bucketList.innerHTML = buckets.map(bucket => {
+    const share = pct(bucket.total, grandTotal);
+    const width = pct(bucket.total, max);
+    const active = selected && selected.name === bucket.name ? " active" : "";
+    const color = colorForBucket(bucket.name, bucket.colorIndex);
+    return `
+      <button class="bucket-item${active}" data-bucket="${bucket.name}">
+        <div class="bucket-head">
+          <div class="bucket-name">${bucket.rank}. ${esc(bucket.name)}</div>
+          <div class="bucket-meta">${bucket.total.toLocaleString()} bytes</div>
+        </div>
+        <div class="bucket-sub">
+          <span>${share.toFixed(1)}% of total .text</span>
+          <span>${bucket.symbols.toLocaleString()} symbols</span>
+          <span>${bucket.files.length} files</span>
+        </div>
+        <div class="meter"><span style="width:${width.toFixed(1)}%; background:${color};"></span></div>
+      </button>
+    `;
+  }).join("");
+
+  for (const node of bucketList.querySelectorAll(".bucket-item")) {
+    node.addEventListener("click", () => {
+      selected = buckets.find(b => b.name === node.dataset.bucket) || selected;
+      renderBucketList();
+      renderDetail();
+    });
+  }
+}
+
+function renderParetoChart() {
+  const w = 960;
+  const h = 420;
+  const margin = {top: 18, right: 64, bottom: 84, left: 76};
+  const innerW = w - margin.left - margin.right;
+  const innerH = h - margin.top - margin.bottom;
+  const maxBytes = buckets.length ? buckets[0].total : 1;
+  let cumulative = 0;
+  const points = [];
+  const barGap = 6;
+  const barW = buckets.length ? Math.max(6, (innerW - (buckets.length - 1) * barGap) / buckets.length) : innerW;
+
+  let html = `
+    <rect x="0" y="0" width="${w}" height="${h}" fill="#fffdf9"></rect>
+    <line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + innerH}" stroke="#bfb6a8" />
+    <line x1="${margin.left}" y1="${margin.top + innerH}" x2="${margin.left + innerW}" y2="${margin.top + innerH}" stroke="#bfb6a8" />
+  `;
+
+  for (let i = 0; i <= 4; i++) {
+    const y = margin.top + innerH - innerH * (i / 4);
+    const pctLabel = Math.round((i / 4) * 100);
+    html += `<line x1="${margin.left}" y1="${y}" x2="${margin.left + innerW}" y2="${y}" stroke="#eee7da" />`;
+    html += `<text x="${margin.left - 10}" y="${y + 4}" text-anchor="end" fill="#66757c" font-size="11">${pctLabel}%</text>`;
+  }
+
+  buckets.forEach((bucket, i) => {
+    const x = margin.left + i * (barW + barGap);
+    const barH = maxBytes ? (bucket.total / maxBytes) * innerH : 0;
+    const y = margin.top + innerH - barH;
+    cumulative += bucket.total;
+    const cumPct = pct(cumulative, grandTotal);
+    const py = margin.top + innerH - (cumPct / 100) * innerH;
+    points.push(`${x + barW / 2},${py}`);
+    const color = colorForBucket(bucket.name, bucket.colorIndex);
+    const active = selected && selected.name === bucket.name;
+    html += `<rect x="${x}" y="${y}" width="${barW}" height="${barH}" fill="${color}" stroke="${active ? '#111' : 'none'}" stroke-width="2" data-bucket="${esc(bucket.name)}"></rect>`;
+    html += `<text x="${x + barW / 2}" y="${margin.top + innerH + 14}" text-anchor="end" transform="rotate(-55 ${x + barW / 2} ${margin.top + innerH + 14})" fill="#66757c" font-size="10">${esc(bucket.name)}</text>`;
+  });
+
+  html += `<polyline fill="none" stroke="#111" stroke-width="2.5" points="${points.join(" ")}"></polyline>`;
+  points.forEach((pt, i) => {
+    const [cx, cy] = pt.split(",");
+    html += `<circle cx="${cx}" cy="${cy}" r="${selected && selected.name === buckets[i].name ? 4.5 : 3.5}" fill="#111"></circle>`;
+  });
+  html += `<text x="${margin.left}" y="${h - 8}" fill="#66757c" font-size="11">bars = bytes, line = cumulative share</text>`;
+  html += `<text x="${w - 8}" y="${margin.top + 12}" text-anchor="end" fill="#66757c" font-size="11">100%</text>`;
+  paretoChart.innerHTML = html;
+
+  paretoChart.querySelectorAll("[data-bucket]").forEach((node) => {
+    node.style.cursor = "pointer";
+    node.addEventListener("click", () => {
+      selected = buckets.find(b => b.name === node.getAttribute("data-bucket")) || selected;
+      renderParetoChart();
+      renderBucketList();
+      renderDetail();
+    });
+  });
+}
+
+function renderDetail() {
+  if (!selected) {
+    detail.innerHTML = '<div class="empty">No bucket data.</div>';
+    return;
+  }
+  const share = pct(selected.total, grandTotal);
+  const topFiles = selected.files.slice(0, 18);
+  const maxFile = topFiles.length ? topFiles[0].value : 1;
+  const color = colorForBucket(selected.name, selected.colorIndex);
+  detail.innerHTML = `
+    <h3 class="detail-title">${selected.name}</h3>
+    <div class="detail-meta">${selected.total.toLocaleString()} bytes, ${share.toFixed(2)}% of total resident .text, ${selected.files.length} file entries</div>
+    <div class="detail-grid">
+      <div class="detail-card"><span class="label">Bucket Bytes</span><span class="value">${selected.total.toLocaleString()}</span></div>
+      <div class="detail-card"><span class="label">Share of Total</span><span class="value">${share.toFixed(2)}%</span></div>
+      <div class="detail-card"><span class="label">Clones / ICF</span><span class="value">${selected.clones || 0} / ${selected.icf || 0}</span></div>
+    </div>
+    <div class="files">
+      ${topFiles.map((file, i) => {
+        const fileShareBucket = pct(file.value, selected.total);
+        const fileShareTotal = pct(file.value, grandTotal);
+        const width = pct(file.value, maxFile);
+        return `
+          <div class="file-item">
+            <div class="file-head">
+          <div class="file-name">${i + 1}. ${esc(file.name)}</div>
+              <div class="file-meta">${file.value.toLocaleString()} bytes</div>
+            </div>
+            <div class="file-sub">
+              <span>${fileShareBucket.toFixed(1)}% of bucket</span>
+              <span>${fileShareTotal.toFixed(2)}% of total</span>
+              <span>${file.symbols || 0} symbols</span>
+            </div>
+            <div class="meter"><span style="width:${width.toFixed(1)}%; background:${color};"></span></div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+renderSummary();
+renderParetoChart();
+renderBucketList();
+renderDetail();
 </script>
 </body>
 </html>
@@ -622,45 +1056,73 @@ DEEP_HTML = """<!DOCTYPE html>
 <meta charset="utf-8"/>
 <title>vmlinux .text rollup -- deep breakdown</title>
 <style>
-body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif;
-       background: #fafafa; color: #222; }
-header { padding: 12px 20px; border-bottom: 1px solid #ddd;
-         background: #fff; position: sticky; top: 0; z-index: 10; }
-header h1 { margin: 0; font-size: 15px; }
-header p { margin: 4px 0 0; font-size: 12px; color: #555; }
-header code { background: #eee; padding: 1px 4px; border-radius: 3px; }
-nav { margin-top: 6px; font-size: 12px; }
-nav a { margin-right: 12px; color: #2a4d8f; text-decoration: none; }
-nav a:hover { text-decoration: underline; }
-section { padding: 18px 20px; border-bottom: 1px solid #eee; }
-section h2 { margin: 0 0 4px; font-size: 14px; }
-section h3 { margin: 16px 0 6px; font-size: 12px; color: #555;
-             text-transform: uppercase; letter-spacing: 0.04em; }
-section .meta { font-size: 12px; color: #666; }
-table { border-collapse: collapse; width: 100%; max-width: 920px;
-        font: 12px ui-monospace, monospace; margin-top: 6px; }
-th, td { border-bottom: 1px solid #eee; padding: 4px 8px; text-align: left;
+:root {
+  --bg: #f5efe4;
+  --panel: rgba(255, 252, 246, 0.88);
+  --panel-border: rgba(74, 88, 92, 0.14);
+  --ink: #1f2e33;
+  --muted: #5a6a6f;
+  --accent: #1f6f78;
+  --accent-2: #2f998d;
+  --shadow: 0 18px 40px rgba(45, 44, 37, 0.12);
+}
+* { box-sizing: border-box; }
+body { margin: 0; font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+       background: linear-gradient(180deg, #f7f1e7 0%, var(--bg) 100%);
+       color: var(--ink); }
+header { padding: 18px 22px; border-bottom: 1px solid var(--panel-border);
+         background: var(--panel); position: sticky; top: 0; z-index: 10;
+         backdrop-filter: blur(10px); box-shadow: var(--shadow); }
+.eyebrow { display:inline-block; margin-bottom:8px; padding:5px 10px; border-radius:999px;
+           background: rgba(31,111,120,0.10); color: var(--accent);
+           font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; }
+header h1 { margin: 0; font-size: 24px; letter-spacing: -0.02em; }
+header p { margin: 8px 0 0; font-size: 13px; color: var(--muted); max-width: 980px; line-height: 1.45; }
+header code { background: rgba(33, 54, 59, 0.08); padding: 2px 6px; border-radius: 999px;
+              font-family: "Iosevka Term", "SFMono-Regular", monospace; }
+nav { margin-top: 12px; font-size: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+nav a { color: #1f4854; text-decoration: none; padding: 7px 10px; border-radius: 999px;
+        background: rgba(255,255,255,0.72); border: 1px solid rgba(74,88,92,0.10); }
+nav a:hover { background: rgba(31,111,120,0.10); }
+main { padding: 16px; display: grid; gap: 16px; }
+section { padding: 18px 20px; border: 1px solid var(--panel-border);
+          background: rgba(255,252,246,0.82); border-radius: 18px; box-shadow: var(--shadow); }
+section h2 { margin: 0 0 4px; font-size: 18px; letter-spacing: -0.02em; }
+section h3 { margin: 18px 0 8px; font-size: 11px; color: var(--muted);
+             text-transform: uppercase; letter-spacing: 0.08em; }
+section .meta { font-size: 13px; color: var(--muted); }
+table { border-collapse: collapse; width: 100%; max-width: 980px;
+        font: 12px "Iosevka Term", "SFMono-Regular", monospace; margin-top: 8px;
+        background: rgba(255,255,255,0.62); border-radius: 14px; overflow: hidden; }
+th, td { border-bottom: 1px solid rgba(74,88,92,0.10); padding: 7px 10px; text-align: left;
          vertical-align: top; white-space: nowrap; }
-th { font-weight: 600; color: #444; background: #f3f3f3; position: sticky;
-     top: 78px; }
+th { font-weight: 600; color: #3f4f55; background: rgba(226, 220, 209, 0.92); }
+tbody tr:nth-child(even) { background: rgba(245, 242, 235, 0.72); }
+tbody tr:hover { background: rgba(31, 111, 120, 0.08); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.bar { position: relative; height: 14px; background: #eaeaea;
-       border-radius: 2px; overflow: hidden; min-width: 120px; }
+.bar { position: relative; height: 14px; background: rgba(39, 58, 63, 0.10);
+       border-radius: 999px; overflow: hidden; min-width: 120px; }
 .bar > span { position: absolute; left: 0; top: 0; bottom: 0;
-              background: #4682b4; }
-tr.special td:first-child { color: #c84030; font-style: italic; }
-footer { padding: 10px 20px; font-size: 11px; color: #999; }
+              background: linear-gradient(90deg, var(--accent), var(--accent-2));
+              border-radius: 999px; }
+footer { padding: 10px 20px 18px; font-size: 11px; color: #7a827f; }
+@media (max-width: 700px) {
+  header { padding: 16px; }
+  main { padding: 12px; }
+  section { padding: 16px; }
+}
 </style>
 </head>
 <body>
 <header>
+  <div class="eyebrow">LTO-Aware Attribution</div>
   <h1>vmlinux .text rollup -- deep breakdown</h1>
   <p>Per-bucket 2nd-level subdirectory rollup and top source files.
      Same attribution rules as <code>subsystem-rollup.txt</code>;
      hover bars to read exact byte counts.</p>
   <nav>__NAV__</nav>
 </header>
-__BODY__
+<main>__BODY__</main>
 <footer>Generated by <code>scripts/subsystem-rollup.py --deep</code>.</footer>
 </body>
 </html>
