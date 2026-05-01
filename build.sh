@@ -23,7 +23,14 @@ LINUX_VERSION=7.0
 
 BINUTILS_URL=https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.xz
 GCC_URL=https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz
-UCLIBC_NG_URL=https://downloads.uclibc-ng.org/releases/${UCLIBC_NG_VERSION}/uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz
+# GitHub auto-archive. The canonical mirror at downloads.uclibc-ng.org
+# has been observed returning HTTP 522 (Cloudflare-to-origin failure)
+# for extended windows; GitHub's tag-based source archive is permanent
+# and byte-equivalent to the upstream tarball content (same 5,527-file
+# tree, only the top-level directory uses lowercase 'u' which we rename
+# back below to keep configs/uClibc-ng-*.config and the rest of this
+# script unchanged).
+UCLIBC_NG_URL=https://github.com/wbx-github/uclibc-ng/archive/refs/tags/v${UCLIBC_NG_VERSION}.tar.gz
 BUSYBOX_URL=https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
 LINUX_URL=https://www.kernel.org/pub/linux/kernel/v7.x/linux-${LINUX_VERSION}.tar.xz
 
@@ -63,7 +70,7 @@ mkdir -p "${LOGDIR}" "${STATE_DIR}"
 # To populate missing checksums: sha256sum downloads/*
 CHECKSUM_binutils="binutils-${BINUTILS_VERSION}.tar.xz=d75a94f4d73e7a4086f7513e67e439e8fcdcbb726ffe63f4661744e6256b2cf2"
 CHECKSUM_gcc="gcc-${GCC_VERSION}.tar.xz=438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
-CHECKSUM_uclibc="uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz=8bc734b584e23ff6ae3d0ebb4c0fb1d1d814c58c82822b93130d436afa7ace8b"
+CHECKSUM_uclibc="v${UCLIBC_NG_VERSION}.tar.gz=f49704e0affc75fde9ee4e870c20e53c1d807eca2a4683377b359b8361e84312"
 CHECKSUM_busybox="busybox-${BUSYBOX_VERSION}.tar.bz2=3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
 CHECKSUM_linux="linux-${LINUX_VERSION}.tar.xz=bb7f6d80b387c757b7d14bb93028fcb90f793c5c0d367736ee815a100b3891f0"
 
@@ -410,7 +417,12 @@ build_uClibc() {
     echo "BUILD: building uClibc-${UCLIBC_NG_VERSION}"
     fetch_file "${UCLIBC_NG_URL}" "${CHECKSUM_uclibc}"
 
-    extract_source "uClibc-ng-${UCLIBC_NG_VERSION}.tar.xz" "uClibc-ng-${UCLIBC_NG_VERSION}" -xJf
+    extract_source "v${UCLIBC_NG_VERSION}.tar.gz" "uClibc-ng-${UCLIBC_NG_VERSION}" -xzf
+    # GitHub source archive unpacks to lowercase 'uclibc-ng-X.Y.Z'; rename
+    # to the canonical-tarball capitalization so configs/ and stage_clean
+    # references stay valid. extract_source's own "reuse" check above
+    # already short-circuits on subsequent runs once the rename has taken.
+    [ -d "uClibc-ng-${UCLIBC_NG_VERSION}" ] || mv "uclibc-ng-${UCLIBC_NG_VERSION}" "uClibc-ng-${UCLIBC_NG_VERSION}"
     cp configs/uClibc-ng-${UCLIBC_NG_VERSION}-${FLAVOR}.config uClibc-ng-${UCLIBC_NG_VERSION}/.config
     cd uClibc-ng-${UCLIBC_NG_VERSION}
 
@@ -654,7 +666,7 @@ build_linux() {
     cd linux-${LINUX_VERSION}
 
     # Apply linux-tiny patches for reduced memory footprint and LTO support
-    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch; do
+    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch ../patches/0012-*.patch ../patches/0013-*.patch; do
         [ -f "${p}" ] || continue
         apply_patch_once "${p}"
     done
@@ -896,6 +908,29 @@ build_linux() {
     echo "# CONFIG_STACKPROTECTOR is not set" >>.config
     echo "# CONFIG_STACKPROTECTOR_STRONG is not set" >>.config
 
+    # Scheduler trim: Linux 7.0 removed CONFIG_SCHED_DEBUG and unified
+    # debug.c into build_utility.c.  Patch 0012 reintroduces a knob
+    # (SCHED_DEBUG_OUTPUT, default y) that wraps debug.c body in #ifdef
+    # and provides empty stubs for the externally-called symbols.
+    # /proc/<pid>/sched returns empty seq_file; OOPS sched_show_task
+    # path is unaffected (defined in core.c).  Measured: -4,278 bytes /
+    # 16 symbols on the production vmlinux .text.
+    echo "# CONFIG_SCHED_DEBUG_OUTPUT is not set" >>.config
+
+    # Patch 0013 mirrors 0012 for deadline.c: SCHED_DEADLINE_CLASS
+    # default y; set n to wrap deadline.c body in #ifdef and substitute
+    # a stub class (DEFINE_SCHED_CLASS(dl) with pick_task=NULL_returner,
+    # all other callbacks NULL).  __checkparam_dl returns false so
+    # sched_setattr with policy=6 is rejected with -EPERM and no task
+    # ever joins SCHED_DEADLINE.  Any later attempt to program a DL
+    # server is rejected with -EOPNOTSUPP, so the scheduler must also
+    # keep the cgroup-bandwidth/group-sched knobs below disabled.
+    # Measured: -10,530 bytes / 81 symbols.
+    echo "# CONFIG_SCHED_DEADLINE_CLASS is not set" >>.config
+    echo "# CONFIG_PSI is not set" >>.config
+    echo "# CONFIG_CGROUPS is not set" >>.config
+    echo "# CONFIG_SCHED_AUTOGROUP is not set" >>.config
+
     run_logged "olddefconfig" kernel_make olddefconfig
 
     # Verify critical config options survived olddefconfig resolution.
@@ -953,7 +988,12 @@ build_linux() {
         "# CONFIG_DEBUG_BUGVERBOSE is not set" \
         "# CONFIG_RD_ZSTD is not set" \
         "# CONFIG_RD_LZ4 is not set" \
-        "# CONFIG_RD_XZ is not set"; do
+        "# CONFIG_RD_XZ is not set" \
+        "# CONFIG_SCHED_DEBUG_OUTPUT is not set" \
+        "# CONFIG_SCHED_DEADLINE_CLASS is not set" \
+        "# CONFIG_PSI is not set" \
+        "# CONFIG_CGROUPS is not set" \
+        "# CONFIG_SCHED_AUTOGROUP is not set"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
             exit 1
@@ -1003,9 +1043,13 @@ build_linux() {
     #   STACKPROTECTOR_STRONG     -- depends on STACKPROTECTOR=y
     #   LOGO/A11Y_BRAILLE_CONSOLE -- depend on the VT stack
     #   DEVTMPFS_MOUNT            -- depends on DEVTMPFS=y
+    #   CGROUP_SCHED/*_GROUP_SCHED/CFS_BANDWIDTH -- depend on CGROUPS=y
     for sym in SHMEM AUDIT POSIX_MQUEUE SECURITY TASKSTATS PCI \
                STACKPROTECTOR_STRONG LOGO A11Y_BRAILLE_CONSOLE \
-               DEVTMPFS_MOUNT; do
+               DEVTMPFS_MOUNT \
+               CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH RT_GROUP_SCHED \
+               SCHED_CORE NUMA_BALANCING UCLAMP_TASK \
+               SCHED_THERMAL_PRESSURE SCHEDSTATS; do
         if grep -q "^CONFIG_${sym}=y\$" .config; then
             echo "ERROR: CONFIG_${sym}=y survived olddefconfig (subsystem disable broken?)"
             exit 1

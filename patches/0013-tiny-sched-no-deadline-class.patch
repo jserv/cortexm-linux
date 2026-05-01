@@ -1,0 +1,159 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] tiny: sched: gate deadline.c behind CONFIG_SCHED_DEADLINE_CLASS
+
+Linux 7.0 deleted the historical CONFIG_SCHED_DEADLINE gate; deadline.c
+is now unconditionally included via build_policy.c.  On a NOMMU image
+that never sets SCHED_DEADLINE policy (BusyBox CHRT applet is off, no
+init script issues sched_setattr with policy=6), the file is ~10.5KB of
+dead .text plus its DL bandwidth/server bookkeeping.
+
+Re-introduce a knob without resurrecting the old name.
+CONFIG_SCHED_DEADLINE_CLASS defaults to y so mainline behavior is
+preserved; setting it to n wraps the body of deadline.c in #ifdef and
+provides a minimal stub class plus stubs for every externally-called
+helper.  The stub class is registered via DEFINE_SCHED_CLASS(dl) so it
+lands in the __dl_sched_class linker section between stop and rt --
+core.c::sched_class_above() BUG_ON checks at sched_init pass.  Only
+.pick_task is implemented (returns NULL); all other callbacks remain
+NULL because they fire only for tasks already in the class, and
+__checkparam_dl() rejects every attribute set so no task can ever join.
+
+External-API stubs match include/linux/sched/deadline.h and
+kernel/sched/sched.h declarations:
+
+  Class chain:
+    dl_sched_class                  -- empty class with pick_task=NULL
+  Init paths (called from core.c, fair.c, topology.c):
+    init_dl_bw / init_dl_rq / init_dl_entity
+    init_sched_dl_class / sched_init_dl_servers
+  Sysctl/global validation (called from rt.c sysctl handler):
+    sched_dl_global_validate / sched_dl_do_global
+  Syscall path (sched_setattr / sched_getattr):
+    sched_dl_overflow      -- returns -EPERM, blocks DL admission
+    __checkparam_dl        -- returns false, blocks DL attribute sets
+    __setparam_dl / __getparam_dl / dl_param_changed
+  CPU hotplug / cpuset:
+    dl_cpuset_cpumask_can_shrink   -- cpuset shrink validation
+  DL server (used by fair.c to back SCHED_OTHER bandwidth):
+    dl_server_init / _start / _stop / _update / _update_idle
+    __dl_server_attach_root / dl_server_apply_params
+  Bandwidth scaling helper:
+    dl_scaled_delta_exec   -- returns delta_exec unchanged
+  Globals visible to topology.c / cgroup code:
+    dl_cookie / dl_bw_visited
+  Bandwidth-management helpers used by core.c / cpuset:
+    dl_bw_deactivate / dl_bw_alloc / dl_bw_free
+
+The DL-server feature backs CFS bandwidth via a deadline entity per
+runqueue.  When the class is disabled, any attempt to program a DL
+server fails with -EOPNOTSUPP instead of pretending to succeed; the
+build disables the scheduler cgroup bandwidth knobs accordingly.
+
+Measured on Cortex-M4 nommu mps2-an386 (linux-7.0): SCHED_DEADLINE_CLASS=n
+drops 10,530 bytes / 81 symbols from .text per nm --size-sort.
+
+---
+ init/Kconfig            | 13 +++++++++
+ kernel/sched/deadline.c | 60 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -933,6 +933,19 @@ config SCHED_PROXY_EXEC
+ 	  This option enables proxy execution, a mechanism for mutex-owning
+ 	  tasks to inherit the scheduling context of higher priority waiters.
+
++config SCHED_DEADLINE_CLASS
++	bool "SCHED_DEADLINE earliest-deadline-first scheduling class"
++	default y
++	help
++	  Build kernel/sched/deadline.c, which implements the SCHED_DEADLINE
++	  policy (EDF + Constant Bandwidth Server) and the deadline-server
++	  bandwidth backing for SCHED_OTHER.
++
++	  Say N on size-constrained NOMMU images that never set SCHED_DEADLINE
++	  policy and need every byte back.  __checkparam_dl rejects all DL
++	  attribute sets; sched_setattr with policy=6 returns -EPERM.  Any
++	  later attempt to program a DL server fails with -EOPNOTSUPP.
++
+ endmenu
+
+ #
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -20,6 +20,8 @@
+ #include <uapi/linux/sched/types.h>
+ #include "sched.h"
+ #include "pelt.h"
++
++#ifdef CONFIG_SCHED_DEADLINE_CLASS
+
+ /*
+  * Default limits for DL period; on the top end we guard against small util
+@@ -3841,3 +3843,64 @@ void print_dl_stats(struct seq_file *m, int cpu)
+ {
+ 	print_dl_rq(m, cpu, &cpu_rq(cpu)->dl);
+ }
++
++#else /* !CONFIG_SCHED_DEADLINE_CLASS */
++
++#include <linux/sched/deadline.h>
++
++/*
++ * Stub deadline scheduling class.  No task ever joins SCHED_DEADLINE
++ * because __checkparam_dl rejects every attribute set, so all callbacks
++ * except pick_task are unreachable and remain NULL.  pick_task is the
++ * one method the chain walk in pick_next_task_balance / pick_next_task
++ * invokes unconditionally per class; returning NULL forwards control to
++ * the next class (rt -> fair -> idle).
++ */
++
++static struct task_struct *pick_task_dl_stub(struct rq *rq, struct rq_flags *rf)
++{
++	return NULL;
++}
++
++DEFINE_SCHED_CLASS(dl) = {
++	.pick_task = pick_task_dl_stub,
++};
++
++u64 dl_cookie;
++
++bool dl_bw_visited(int cpu, u64 cookie) { return false; }
++int dl_bw_deactivate(int cpu) { return 0; }
++int dl_bw_alloc(int cpu, u64 dl_bw) { return 0; }
++void dl_bw_free(int cpu, u64 dl_bw) { }
++
++void init_dl_bw(struct dl_bw *dl_b) { }
++void init_dl_rq(struct dl_rq *dl_rq) { }
++void init_dl_entity(struct sched_dl_entity *dl_se) { }
++void __init init_sched_dl_class(void) { }
++void sched_init_dl_servers(void) { }
++
++int sched_dl_global_validate(void) { return 0; }
++void sched_dl_do_global(void) { }
++int sched_dl_overflow(struct task_struct *p, int policy,
++		      const struct sched_attr *attr) { return -EPERM; }
++void __setparam_dl(struct task_struct *p, const struct sched_attr *attr) { }
++void __getparam_dl(struct task_struct *p, struct sched_attr *attr) { }
++bool __checkparam_dl(const struct sched_attr *attr) { return false; }
++bool dl_param_changed(struct task_struct *p, const struct sched_attr *attr)
++{ return false; }
++int dl_cpuset_cpumask_can_shrink(const struct cpumask *cur,
++				 const struct cpumask *trial) { return 1; }
++s64 dl_scaled_delta_exec(struct rq *rq, struct sched_dl_entity *dl_se,
++			 s64 delta_exec) { return delta_exec; }
++
++void dl_server_init(struct sched_dl_entity *dl_se, struct rq *rq,
++		    dl_server_pick_f pick_task) { }
++void dl_server_start(struct sched_dl_entity *dl_se) { }
++void dl_server_stop(struct sched_dl_entity *dl_se) { }
++void dl_server_update(struct sched_dl_entity *dl_se, s64 delta_exec) { }
++void dl_server_update_idle(struct sched_dl_entity *dl_se, s64 delta_exec) { }
++void __dl_server_attach_root(struct sched_dl_entity *dl_se, struct rq *rq) { }
++int dl_server_apply_params(struct sched_dl_entity *dl_se, u64 runtime,
++			   u64 period, bool init) { return -EOPNOTSUPP; }
++
++#endif /* CONFIG_SCHED_DEADLINE_CLASS */
