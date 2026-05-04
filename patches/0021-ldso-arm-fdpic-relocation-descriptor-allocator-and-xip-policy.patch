@@ -1,0 +1,2205 @@
+From 94fbee8d6d3800cc818a7b76b282a5a0b8efe5bf Mon Sep 17 00:00:00 2001
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Date: Mon, 4 May 2026 13:56:26 +0800
+Subject: [PATCH] ldso: arm fdpic relocation, descriptor allocator, and xip
+ policy
+
+- inline loadmap in struct elf_resolve for the common nsegs <= 2 case
+- per-module chunked function-descriptor allocator with intrusive
+  hashtable; descriptors live in chunks until a 16-entry threshold,
+  then promote into a hashed bucket array
+- arm eager binding via DL_FORCE_BIND_NOW; descriptor write helpers
+  consolidated between bootstrap and runtime
+- xip classification (DL_FDPIC_XIP_TEXT / DL_FDPIC_MUTABLE_TEXT) with
+  p_align gate, cached read-only loadseg bitmask, and an overflow
+  fallback for objects with more PT_LOADs than fit in the bitmask
+- strict-xip build hook (DL_FDPIC_STRICT_XIP) that rejects DT_TEXTREL
+  outright instead of silently downgrading to mutable-text
+- relocation-time xip write guards on both the per-relocation path
+  and the batched R_ARM_RELATIVE fast path
+- direct arm relocation parser, no per-reloc callback dispatch;
+  contiguous local FUNCDESC runs are carved out from the mixed
+  DT_REL stream and parsed in a tighter loop
+- raise AUX_MAX_AT_ID to 45 so AT_FDPIC_EXEC_MAP and
+  AT_FDPIC_INTERP_MAP are reachable in _dl_auxvt
+- allocate elf_resolve early via _dl_alloc_elf_resolve so the inline
+  loadmap is reachable from __dl_init_loadaddr; teardown skips the
+  _dl_free for inline storage
+- arm fdpic find-loadseg honours one-past-end on the last segment to
+  match __reloc_pointer, fixing _end-style symbol relocation
+- per-segment batching in elf_machine_relative; relative loop pairs
+  iterations on the non-fdpic path
+- arm fdpic bootstrap stderr now actually writes through _dl_write
+
+Validated through externals/cortexm-linux on node1: uClibc-ng,
+rootfs, kernel, and bootwrapper rebuild cleanly; QEMU validation
+passes with boot_marker_ms ~366-389 and shell_ready_ms ~387-411,
+in family with the prior non-XIP baseline.
+---
+ ldso/include/dl-auxvt.h       |   3 +-
+ ldso/include/dl-defs.h        |  30 ++
+ ldso/include/dl-hash.h        |  21 +-
+ ldso/include/inline-hashtab.h |   6 +-
+ ldso/include/ldso.h           |   4 +
+ ldso/ldso/arm/dl-startup.h    |  12 +-
+ ldso/ldso/arm/dl-sysdep.h     | 236 +++++++++++++-
+ ldso/ldso/arm/elfinterp.c     | 569 ++++++++++++++++++++++++++--------
+ ldso/ldso/bfin/dl-inlines.h   |   9 +-
+ ldso/ldso/dl-elf.c            | 200 +++++++++++-
+ ldso/ldso/dl-hash.c           |  37 ++-
+ ldso/ldso/fdpic/dl-inlines.h  | 348 ++++++++++++++++++---
+ ldso/ldso/fdpic/dl-sysdep.h   |  27 +-
+ ldso/ldso/ldso.c              |  31 ++
+ ldso/libdl/libdl.c            |   7 +
+ 15 files changed, 1330 insertions(+), 210 deletions(-)
+
+diff --git a/ldso/include/dl-auxvt.h b/ldso/include/dl-auxvt.h
+index 29eda6eb3..cb801f68c 100644
+--- a/ldso/include/dl-auxvt.h
++++ b/ldso/include/dl-auxvt.h
+@@ -1,9 +1,8 @@
+ #ifndef _DL_AUXVT_H
+ #define _DL_AUXVT_H
+ 
+-#define AUX_MAX_AT_ID 40
++#define AUX_MAX_AT_ID 45
+ extern ElfW(auxv_t) _dl_auxvt[AUX_MAX_AT_ID]; /* Cache frequently accessed auxiliary vector entries */
+ extern ElfW(auxv_t) *_dl_auxv_start;          /* Start of the auxiliary vector */
+ 
+ #endif /* _DL_AUXVT_H */
+-
+diff --git a/ldso/include/dl-defs.h b/ldso/include/dl-defs.h
+index e900640bb..2d0559147 100644
+--- a/ldso/include/dl-defs.h
++++ b/ldso/include/dl-defs.h
+@@ -265,6 +265,36 @@ typedef struct {
+ # define DL_MAP_SEGMENT(EPNT, PPNT, INFILE, FLAGS) 0
+ #endif
+ 
++#ifndef AT_FDPIC_EXEC_MAP
++# define AT_FDPIC_EXEC_MAP 43
++#endif
++#ifndef AT_FDPIC_INTERP_MAP
++# define AT_FDPIC_INTERP_MAP 44
++#endif
++
++/* Define this if an architecture or ABI wants all PLT relocations
++   resolved eagerly.  */
++#ifndef DL_FORCE_BIND_NOW
++# define DL_FORCE_BIND_NOW(TPNT) 0
++#endif
++
++/* Define this if an FDPIC/XIP deployment wants DT_TEXTREL objects rejected
++   instead of silently downgraded to mutable-text handling.  */
++#ifndef DL_FDPIC_STRICT_XIP
++# ifdef __UCLIBC_FDPIC_STRICT_XIP__
++#  define DL_FDPIC_STRICT_XIP() 1
++# else
++#  define DL_FDPIC_STRICT_XIP() 0
++# endif
++#endif
++
++/* Hook fired before the batched relative-relocation loop.  XIP-classified
++   FDPIC objects override this to reject relative relocations that target
++   read-only executable segments before any write happens.  */
++#ifndef DL_FDPIC_RELATIVE_XIP_GUARD
++# define DL_FDPIC_RELATIVE_XIP_GUARD(TPNT, ADDR, COUNT) ((void)0)
++#endif
++
+ /* Define this to declare the library offset. */
+ #ifndef DL_DEF_LIB_OFFSET
+ # define DL_DEF_LIB_OFFSET static unsigned long _dl_library_offset
+diff --git a/ldso/include/dl-hash.h b/ldso/include/dl-hash.h
+index d1deea9f3..6f4d1faae 100644
+--- a/ldso/include/dl-hash.h
++++ b/ldso/include/dl-hash.h
+@@ -11,6 +11,9 @@
+ #define RTLD_NEXT	((void*)-1)
+ #endif
+ 
++struct funcdesc_chunk;
++struct fdpic_funcdesc_ht;
++
+ struct init_fini {
+ 	struct elf_resolve **init_fini;
+ 	unsigned long nlist; /* Number of entries in init_fini */
+@@ -135,10 +138,17 @@ struct elf_resolve {
+ #endif
+ 
+ #if defined(__FRV_FDPIC__) || defined(__BFIN_FDPIC__) || defined(__FDPIC__)
++  unsigned long fdpic_ro_loadseg_mask;
++  struct funcdesc_chunk *funcdesc_chunks;
+   /* Every loaded module holds a hashtable of function descriptors of
+      functions defined in it, such that it's easy to release the
+      memory when the module is dlclose()d.  */
+-  struct funcdesc_ht *funcdesc_ht;
++  struct fdpic_funcdesc_ht *funcdesc_ht;
++  /* Inline loadmap for common 2-segment modules.  */
++  struct {
++    struct elf32_fdpic_loadmap map;
++    struct elf32_fdpic_loadseg segs[2];
++  } fdpic_inline_loadmap;
+ #endif
+ #ifdef __DSBT__
+   /* Information for DSBT */
+@@ -154,6 +164,10 @@ struct elf_resolve {
+ #define FINI_FUNCS_CALLED   0x000008
+ #define DL_OPENED2	    0x000010
+ #define DL_RESERVED	    0x000020
++#define DL_TEXTREL_REQUIRED 0x000040
++#define DL_FDPIC_XIP_TEXT   0x000080
++#define DL_FDPIC_MUTABLE_TEXT 0x000100
++#define DL_FDPIC_SEGMENT_MASK_OVERFLOW 0x000200
+ 
+ extern struct dyn_elf     * _dl_symbol_tables;
+ extern struct elf_resolve * _dl_loaded_modules;
+@@ -162,6 +176,11 @@ extern struct dyn_elf     * _dl_handles;
+ extern struct elf_resolve * _dl_add_elf_hash_table(const char * libname,
+ 	DL_LOADADDR_TYPE loadaddr, unsigned long * dynamic_info,
+ 	unsigned long dynamic_addr, unsigned long dynamic_size);
++extern struct elf_resolve * _dl_alloc_elf_resolve(void);
++extern struct elf_resolve * _dl_add_elf_hash_table_existing(
++	struct elf_resolve *tpnt, const char *libname,
++	DL_LOADADDR_TYPE loadaddr, unsigned long *dynamic_info,
++	unsigned long dynamic_addr, unsigned long dynamic_size);
+ 
+ extern char *_dl_find_hash(const char *name, struct r_scope_elem *scope,
+ 		struct elf_resolve *mytpnt, int type_class,
+diff --git a/ldso/include/inline-hashtab.h b/ldso/include/inline-hashtab.h
+index c6c584b08..1bc8d9f51 100644
+--- a/ldso/include/inline-hashtab.h
++++ b/ldso/include/inline-hashtab.h
+@@ -101,8 +101,10 @@ htab_create(void)
+ }
+ 
+ /*
+- * This is only called from _dl_loadaddr_unmap, so it's safe to call
+- * _dl_free().  See the discussion below.
++ * Generic table: every populated slot owns its allocation, so free each entry
++ * before releasing the metadata.  The FDPIC funcdesc table has its own
++ * htab_delete in fdpic/dl-inlines.h for the chunk-allocator case where the
++ * descriptor storage is owned separately.
+  */
+ static __always_inline void
+ htab_delete(struct funcdesc_ht *htab)
+diff --git a/ldso/include/ldso.h b/ldso/include/ldso.h
+index 061d8a536..f79332df9 100755
+--- a/ldso/include/ldso.h
++++ b/ldso/include/ldso.h
+@@ -177,6 +177,10 @@ extern void _dl_dprintf(int, const char *, ...);
+ # define DL_GET_READY_TO_RUN_EXTRA_ARGS
+ #endif
+ 
++#ifdef __FDPIC__
++extern void _dl_fdpic_protect_funcdescs(void);
++#endif
++
+ extern void *_dl_get_ready_to_run(struct elf_resolve *tpnt, DL_LOADADDR_TYPE load_addr,
+ 		char **envp, char **argv
+ 		DL_GET_READY_TO_RUN_EXTRA_PARMS);
+diff --git a/ldso/ldso/arm/dl-startup.h b/ldso/ldso/arm/dl-startup.h
+index d00e7b053..9e13b7111 100644
+--- a/ldso/ldso/arm/dl-startup.h
++++ b/ldso/ldso/arm/dl-startup.h
+@@ -235,7 +235,7 @@ void PERFORM_BOOTSTRAP_RELOC(ELF_RELOC *rpnt, unsigned long *reloc_addr,
+ 						_dl_exit(1);
+ 					}
+ #else
+-					SEND_STDERR("R_ARM_PC24 relocation out of range\n");
++					SEND_STDERR("R_ARM_PC24 relocation out of range; incompatible with ARM FDPIC/XIP\n");
+ 					_dl_exit(1);
+ #endif
+ 				}
+@@ -256,10 +256,11 @@ void PERFORM_BOOTSTRAP_RELOC(ELF_RELOC *rpnt, unsigned long *reloc_addr,
+ #ifdef __FDPIC__
+ 		case R_ARM_FUNCDESC_VALUE:
+ 			{
+-				struct funcdesc_value *dst = (struct funcdesc_value *) reloc_addr;
++				struct funcdesc_value *dst = (struct funcdesc_value *)reloc_addr;
+ 
+-				dst->entry_point += symbol_addr;
+-				dst->got_value = load_addr.got_value;
++				arm_fdpic_resolve_funcdesc_value(dst, symbol_addr,
++					(unsigned long)dst->entry_point,
++					load_addr.got_value);
+ 			}
+ 			break;
+ #endif
+@@ -301,5 +302,6 @@ int raise(int sig)
+   _dl_exit(1);
+ }
+ #endif /* __FDPIC__ */
+-
++#ifndef __FDPIC__
+ #define DL_UPDATE_LOADADDR_HDR(LOADADDR, ADDR, PHDR)
++#endif
+diff --git a/ldso/ldso/arm/dl-sysdep.h b/ldso/ldso/arm/dl-sysdep.h
+index 93e36b694..eb575b0b7 100644
+--- a/ldso/ldso/arm/dl-sysdep.h
++++ b/ldso/ldso/arm/dl-sysdep.h
+@@ -15,6 +15,16 @@
+ /* Need bootstrap relocations */
+ #define ARCH_NEEDS_BOOTSTRAP_RELOCS
+ 
++#ifdef __FDPIC__
++/* ARM FDPIC function descriptors are cheaper and safer when PLT
++   relocations are resolved eagerly.  */
++#define DL_FORCE_BIND_NOW(TPNT) 1
++#endif
++
++#ifndef DL_XIP_ALIGN
++#define DL_XIP_ALIGN _dl_pagesize
++#endif
++
+ #define DL_CHECK_LIB_TYPE(epnt, piclib, _dl_progname, libname) \
+ do \
+ { \
+@@ -98,13 +108,60 @@ unsigned long _dl_linux_resolver(struct elf_resolve * tpnt, int reloc_entry);
+ 
+ #ifdef __FDPIC__
+ /* We must force strings used early in the bootstrap into the data
+-   segment.  */
++   segment, such that they are referenced through the GOT after
++   bootstrap relocation starts.  */
+ #undef SEND_EARLY_STDERR
+ #define SEND_EARLY_STDERR(S) \
+-  do { /* FIXME: implement */; } while (0)
++  do { static char __s[] = (S); _dl_write(2, __s, sizeof(__s) - 1); } while (0)
+ 
+ #undef INIT_GOT
+ #include "../fdpic/dl-sysdep.h"
++
++static __always_inline void *
++_dl_funcdesc_for(void *entry_point, void *got_value);
++
++static __always_inline void
++arm_fdpic_write_funcdesc_value(struct funcdesc_value *dst,
++			       unsigned long entry_point, void *got_value)
++{
++	dst->entry_point = (void *)entry_point;
++	dst->got_value = got_value;
++}
++
++static __always_inline void
++arm_fdpic_relocate_funcdesc_value(struct funcdesc_value *dst,
++				  DL_LOADADDR_TYPE loadaddr)
++{
++	arm_fdpic_write_funcdesc_value(dst,
++		(unsigned long)DL_RELOC_ADDR(loadaddr, dst->entry_point),
++		loadaddr.got_value);
++}
++
++static __always_inline unsigned long
++arm_fdpic_funcdesc(unsigned long symbol_addr, unsigned long addend,
++		   void *got_value)
++{
++	if (!symbol_addr)
++		return 0;
++
++	return (unsigned long)_dl_funcdesc_for((void *)(symbol_addr + addend),
++					       got_value);
++}
++
++static __always_inline void
++arm_fdpic_resolve_funcdesc_value(struct funcdesc_value *dst,
++				 unsigned long symbol_addr,
++				 unsigned long addend,
++				 void *got_value)
++{
++	arm_fdpic_write_funcdesc_value(dst, symbol_addr + addend, got_value);
++}
++
++extern void arm_fdpic_relative_xip_guard(struct elf_resolve *tpnt,
++					 Elf32_Addr rel_addr,
++					 Elf32_Word count);
++#define DL_FDPIC_RELATIVE_XIP_GUARD(TPNT, ADDR, COUNT) \
++	arm_fdpic_relative_xip_guard((TPNT), (ADDR), (COUNT))
+ #endif /* __FDPIC__ */
+ 
+ /* Return the run-time load address of the shared object.  */
+@@ -123,6 +180,116 @@ elf_machine_dynamic (void)
+   return (Elf32_Addr) _DYNAMIC - elf_machine_load_address ();
+ }
+ 
++#ifdef __FDPIC__
++static __always_inline int
++arm_fdpic_find_loadseg(struct elf32_fdpic_loadmap *map, Elf32_Addr addr,
++		       int start_seg)
++{
++	int c;
++
++	if (start_seg >= 0 && start_seg < map->nsegs &&
++	    addr >= map->segs[start_seg].p_vaddr &&
++	    (addr < map->segs[start_seg].p_vaddr + map->segs[start_seg].p_memsz ||
++	     (addr == map->segs[start_seg].p_vaddr + map->segs[start_seg].p_memsz &&
++	      start_seg + 1 == map->nsegs)))
++		return start_seg;
++
++	for (c = 0; c < map->nsegs; c++) {
++		if (addr >= map->segs[c].p_vaddr &&
++		    (addr < map->segs[c].p_vaddr + map->segs[c].p_memsz ||
++		     (addr == map->segs[c].p_vaddr + map->segs[c].p_memsz &&
++		      c + 1 == map->nsegs)))
++			return c;
++	}
++
++	return -1;
++}
++
++static __always_inline int
++arm_fdpic_find_loadseg_runtime(struct elf32_fdpic_loadmap *map, Elf32_Addr addr,
++			       int start_seg)
++{
++	int c;
++
++	if (start_seg >= 0 && start_seg < map->nsegs &&
++	    addr >= map->segs[start_seg].addr &&
++	    (addr < map->segs[start_seg].addr + map->segs[start_seg].p_memsz ||
++	     (addr == map->segs[start_seg].addr + map->segs[start_seg].p_memsz &&
++	      start_seg + 1 == map->nsegs)))
++		return start_seg;
++
++	for (c = 0; c < map->nsegs; c++) {
++		if (addr >= map->segs[c].addr &&
++		    (addr < map->segs[c].addr + map->segs[c].p_memsz ||
++		     (addr == map->segs[c].addr + map->segs[c].p_memsz &&
++		      c + 1 == map->nsegs)))
++			return c;
++	}
++
++	return -1;
++}
++
++#define ARCH_FDPIC_FIXUP_LOCAL_RELOCS(RPNT, SCOPE, GOOF, ADDR, SIZE) \
++  do { \
++	extern int _dl_parse_local_fdpic_descriptor_relocs(struct dyn_elf *rpnt, \
++		unsigned long rel_addr, unsigned long rel_size); \
++	struct dyn_elf *_arch_rpnt = (RPNT); \
++	struct r_scope_elem *_arch_scope = (SCOPE); \
++	struct elf_resolve *_arch_tpnt = _arch_rpnt->dyn; \
++	unsigned long _arch_addr = (unsigned long)(ADDR); \
++	unsigned long _arch_size = (unsigned long)(SIZE); \
++	ELF_RELOC *chunk_start = (ELF_RELOC *)_arch_addr; \
++	ELF_RELOC *scan = chunk_start; \
++	ELF_RELOC *chunk_end = (ELF_RELOC *)(_arch_addr + _arch_size); \
++	ElfW(Sym) *symtab = (ElfW(Sym) *)_arch_tpnt->dynamic_info[DT_SYMTAB]; \
++ \
++	while (scan < chunk_end) { \
++		int symtab_index = ELF_R_SYM(scan->r_info); \
++		int reloc_type = ELF_R_TYPE(scan->r_info); \
++ \
++		if (symtab_index != 0 \
++		    && ELF_ST_BIND(symtab[symtab_index].st_info) == STB_LOCAL \
++		    && (reloc_type == R_ARM_FUNCDESC \
++			|| reloc_type == R_ARM_FUNCDESC_VALUE)) { \
++			unsigned long chunk_addr = (unsigned long)chunk_start; \
++			unsigned long chunk_size = (unsigned long)scan - chunk_addr; \
++			ELF_RELOC *run_start = scan; \
++			unsigned long run_addr; \
++			unsigned long run_size; \
++			int _arch_rc; \
++ \
++			if (chunk_size) \
++				(GOOF) += _dl_parse_relocation_information(_arch_rpnt, _arch_scope, \
++						chunk_addr, chunk_size); \
++ \
++			do { \
++				scan++; \
++			} while (scan < chunk_end \
++				 && ELF_R_SYM(scan->r_info) != 0 \
++				 && ELF_ST_BIND(symtab[ELF_R_SYM(scan->r_info)].st_info) == STB_LOCAL \
++				 && (ELF_R_TYPE(scan->r_info) == R_ARM_FUNCDESC \
++				     || ELF_R_TYPE(scan->r_info) == R_ARM_FUNCDESC_VALUE)); \
++ \
++			run_addr = (unsigned long)run_start; \
++			run_size = (unsigned long)scan - run_addr; \
++			_arch_rc = _dl_parse_local_fdpic_descriptor_relocs(_arch_rpnt, run_addr, run_size); \
++			if (_arch_rc < 0) \
++				(GOOF) += _dl_parse_relocation_information(_arch_rpnt, _arch_scope, \
++						run_addr, run_size); \
++			else \
++				(GOOF) += _arch_rc; \
++			chunk_start = scan; \
++		} else { \
++			scan++; \
++		} \
++	} \
++	if ((unsigned long)chunk_start < _arch_addr + _arch_size) \
++		(GOOF) += _dl_parse_relocation_information(_arch_rpnt, _arch_scope, \
++				(unsigned long)chunk_start, \
++				_arch_addr + _arch_size - (unsigned long)chunk_start); \
++  } while (0)
++#endif
++
+ static __always_inline void
+ #ifdef __FDPIC__
+ elf_machine_relative (DL_LOADADDR_TYPE load_off, const Elf32_Addr rel_addr,
+@@ -132,21 +299,64 @@ elf_machine_relative (Elf32_Addr load_off, const Elf32_Addr rel_addr,
+ 		      Elf32_Word relative_count)
+ {
+ #if defined(__FDPIC__)
+-    Elf32_Rel *rpnt = (void *) rel_addr;
++	Elf32_Rel *rpnt = (void *)rel_addr;
++	struct elf32_fdpic_loadmap *map = load_off.map;
++	int offset_seg = 0;
++	int value_seg = 0;
++
++	while (relative_count > 0) {
++		int seg_idx = arm_fdpic_find_loadseg(map, rpnt->r_offset, offset_seg);
++
++		if (seg_idx < 0)
++			goto next_relative;
++
++		offset_seg = seg_idx;
++		{
++			struct elf32_fdpic_loadseg *seg = &map->segs[seg_idx];
++			Elf32_Addr seg_end = seg->p_vaddr + seg->p_memsz;
+ 
+-    do {
+-        unsigned long *reloc_addr = (unsigned long *) DL_RELOC_ADDR(load_off, rpnt->r_offset);
++			while (relative_count > 0 && rpnt->r_offset < seg_end) {
++				unsigned long *reloc_addr =
++					(unsigned long *)(rpnt->r_offset - seg->p_vaddr + seg->addr);
++				Elf32_Addr value = *reloc_addr;
++				int value_idx = arm_fdpic_find_loadseg(map, value, value_seg);
+ 
+-        *reloc_addr = DL_RELOC_ADDR(load_off, *reloc_addr);
+-        rpnt++;
++				if (value_idx >= 0) {
++					struct elf32_fdpic_loadseg *value_segdata =
++						&map->segs[value_idx];
++
++					value_seg = value_idx;
++					*reloc_addr = value - value_segdata->p_vaddr +
++						value_segdata->addr;
++				}
++
++				rpnt++;
++				relative_count--;
++			}
++		}
++		continue;
++
++next_relative:
++		rpnt++;
++		relative_count--;
++	}
+ #else
+-    Elf32_Rel * rpnt = (void *) rel_addr;
+-    --rpnt;
+-    do {
+-      Elf32_Addr *const reloc_addr = (void *) (load_off + (++rpnt)->r_offset);
+-      *reloc_addr += load_off;
++	Elf32_Rel *rpnt = (void *)rel_addr;
++	while (relative_count > 1) {
++		Elf32_Addr *reloc_addr0 = (void *)(load_off + rpnt[0].r_offset);
++		Elf32_Addr *reloc_addr1 = (void *)(load_off + rpnt[1].r_offset);
++
++		*reloc_addr0 += load_off;
++		*reloc_addr1 += load_off;
++		rpnt += 2;
++		relative_count -= 2;
++	}
++	if (relative_count) {
++		Elf32_Addr *reloc_addr = (void *)(load_off + rpnt->r_offset);
++
++		*reloc_addr += load_off;
++	}
+ #endif
+-    } while(--relative_count);
+ }
+ #endif /* !_ARCH_DL_SYSDEP */
+ 
+diff --git a/ldso/ldso/arm/elfinterp.c b/ldso/ldso/arm/elfinterp.c
+index 9c9a3e8ca..c1f0e4d9e 100644
+--- a/ldso/ldso/arm/elfinterp.c
++++ b/ldso/ldso/arm/elfinterp.c
+@@ -34,6 +34,139 @@
+ 
+ extern int _dl_linux_resolve(void);
+ 
++static __always_inline unsigned long
++arm_lookup_symbol_addr(char *symname, struct r_scope_elem *scope,
++		       struct elf_resolve *tpnt, int reloc_type,
++		       struct symbol_ref *sym_ref)
++{
++	return (unsigned long)_dl_find_hash(symname, scope, tpnt,
++		elf_machine_type_class(reloc_type), sym_ref);
++}
++
++static __always_inline int
++arm_resolve_reloc_symbol(struct elf_resolve *tpnt, struct r_scope_elem *scope,
++			 ElfW(Sym) *symtab, char *strtab, int symtab_index,
++			 int reloc_type, struct symbol_ref *sym_ref,
++			 unsigned long *symbol_addr,
++			 struct elf_resolve **def_mod, char **symname)
++{
++	*symbol_addr = 0;
++	sym_ref->sym = &symtab[symtab_index];
++	sym_ref->tpnt = NULL;
++
++	if (symtab_index == 0) {
++		/*
++		 * Relocs against STN_UNDEF use a symbol value of zero and the
++		 * module containing the reloc itself.
++		 */
++		*symbol_addr = symtab[symtab_index].st_value;
++		*def_mod = tpnt;
++		return 0;
++	}
++
++	if (ELF_ST_BIND(symtab[symtab_index].st_info) == STB_LOCAL) {
++		*symbol_addr = (unsigned long)DL_RELOC_ADDR(tpnt->loadaddr,
++				symtab[symtab_index].st_value);
++		*def_mod = tpnt;
++		return 0;
++	}
++
++	*symname = strtab + symtab[symtab_index].st_name;
++	*symbol_addr = arm_lookup_symbol_addr(*symname, scope, tpnt,
++					      reloc_type, sym_ref);
++	if (!*symbol_addr &&
++	    (ELF_ST_TYPE(symtab[symtab_index].st_info) != STT_TLS) &&
++	    (ELF_ST_BIND(symtab[symtab_index].st_info) != STB_WEAK))
++		return 1;
++
++	if (_dl_trace_prelink) {
++		_dl_debug_lookup(*symname, tpnt, &symtab[symtab_index], sym_ref,
++				elf_machine_type_class(reloc_type));
++	}
++	*def_mod = sym_ref->tpnt;
++	return 0;
++}
++
++static __always_inline int
++arm_addr_is_readonly_load_slow(struct elf_resolve *tpnt, const void *addr)
++{
++	struct elf32_fdpic_loadaddr loadaddr = tpnt->loadaddr;
++	ElfW(Phdr) *phdr = tpnt->ppnt;
++	int i, seg_idx = 0;
++
++	for (i = 0; i < tpnt->n_phent; i++, phdr++) {
++		ElfW(Addr) start, end;
++
++		if (phdr->p_type != PT_LOAD)
++			continue;
++
++		start = loadaddr.map->segs[seg_idx].addr;
++		end = start + loadaddr.map->segs[seg_idx].p_memsz;
++		if ((ElfW(Addr))addr >= start && (ElfW(Addr))addr < end)
++			return !(phdr->p_flags & PF_W);
++
++		seg_idx++;
++	}
++
++	return 0;
++}
++
++static __always_inline void
++arm_abort_xip_text_reloc(struct elf_resolve *tpnt, int reloc_type,
++			 unsigned long *reloc_addr)
++{
++	if (!(tpnt->rtld_flags & DL_FDPIC_XIP_TEXT))
++		return;
++
++	if (tpnt->rtld_flags & DL_FDPIC_SEGMENT_MASK_OVERFLOW) {
++		if (!arm_addr_is_readonly_load_slow(tpnt, reloc_addr))
++			return;
++	} else {
++		struct elf32_fdpic_loadmap *map = tpnt->loadaddr.map;
++		int seg_idx;
++
++		for (seg_idx = 0; seg_idx < map->nsegs; seg_idx++) {
++			ElfW(Addr) start = map->segs[seg_idx].addr;
++			ElfW(Addr) end = start + map->segs[seg_idx].p_memsz;
++
++			if ((ElfW(Addr))reloc_addr < start || (ElfW(Addr))reloc_addr >= end)
++				continue;
++			if (!(tpnt->fdpic_ro_loadseg_mask & (1UL << seg_idx)))
++				return;
++			break;
++		}
++		if (seg_idx == map->nsegs)
++			return;
++	}
++
++	_dl_dprintf(2,
++		"%s: relocation type 0x%x targets read-only XIP text at %p in '%s'\n",
++		_dl_progname, reloc_type, reloc_addr, tpnt->libname);
++	_dl_exit(1);
++}
++
++#ifdef __FDPIC__
++/* Guard the batched relative-relocation loop against writes into read-only
++   XIP text.  No-op for objects that are not classified as DL_FDPIC_XIP_TEXT,
++   which is the common case.  */
++void arm_fdpic_relative_xip_guard(struct elf_resolve *tpnt,
++				  Elf32_Addr rel_addr, Elf32_Word count)
++{
++	Elf32_Rel *rpnt = (Elf32_Rel *)(uintptr_t)rel_addr;
++
++	if (!(tpnt->rtld_flags & DL_FDPIC_XIP_TEXT))
++		return;
++
++	while (count--) {
++		unsigned long *reloc_addr = (unsigned long *)
++			DL_RELOC_ADDR(tpnt->loadaddr, rpnt->r_offset);
++
++		arm_abort_xip_text_reloc(tpnt, R_ARM_RELATIVE, reloc_addr);
++		rpnt++;
++	}
++}
++#endif
++
+ #if __FDPIC__
+ unsigned long _dl_linux_resolver (struct elf_resolve *tpnt, int reloc_offet)
+ {
+@@ -63,9 +196,11 @@ unsigned long _dl_linux_resolver (struct elf_resolve *tpnt, int reloc_offet)
+ 	got_entry = (struct funcdesc_value *) DL_RELOC_ADDR(tpnt->loadaddr, this_reloc->r_offset);
+ 
+ 	/* Get the address to be used to fill in the GOT entry.  */
+-	new_addr = _dl_find_hash(symname, &_dl_loaded_modules->symbol_scope, NULL, 0, &sym_ref);
++	new_addr = (char *)arm_lookup_symbol_addr(symname,
++		&_dl_loaded_modules->symbol_scope, NULL, 0, &sym_ref);
+ 	if (!new_addr) {
+-		new_addr = _dl_find_hash(symname, NULL, NULL, 0, &sym_ref);
++		new_addr = (char *)arm_lookup_symbol_addr(symname, NULL, NULL, 0,
++			&sym_ref);
+ 		if (!new_addr) {
+ 			_dl_dprintf(2, "%s: can't resolve symbol '%s'\n", _dl_progname, symname);
+ 			_dl_exit(1);
+@@ -85,7 +220,7 @@ unsigned long _dl_linux_resolver (struct elf_resolve *tpnt, int reloc_offet)
+ 				    funcval.entry_point, funcval.got_value,
+ 				    got_entry);
+ 	}
+-	if (1 || !_dl_debug_nofixups) {
++	if (!_dl_debug_nofixups) {
+ 		*got_entry = funcval;
+ 	}
+ #else
+@@ -152,58 +287,6 @@ unsigned long _dl_linux_resolver(struct elf_resolve *tpnt, int reloc_entry)
+ }
+ #endif
+ 
+-static int
+-_dl_parse(struct elf_resolve *tpnt, struct r_scope_elem *scope,
+-	  unsigned long rel_addr, unsigned long rel_size,
+-	  int (*reloc_fnc) (struct elf_resolve *tpnt, struct r_scope_elem *scope,
+-			    ELF_RELOC *rpnt, ElfW(Sym) *symtab, char *strtab))
+-{
+-	int i;
+-	char *strtab;
+-	int goof = 0;
+-	ElfW(Sym) *symtab;
+-	ELF_RELOC *rpnt;
+-	int symtab_index;
+-
+-	/* Now parse the relocation information */
+-	rpnt = (ELF_RELOC *) rel_addr;
+-	rel_size = rel_size / sizeof(ELF_RELOC);
+-
+-	symtab = (ElfW(Sym) *) tpnt->dynamic_info[DT_SYMTAB];
+-	strtab = (char *) tpnt->dynamic_info[DT_STRTAB];
+-
+-	  for (i = 0; i < rel_size; i++, rpnt++) {
+-	        int res;
+-
+-		symtab_index = ELF_R_SYM(rpnt->r_info);
+-
+-		debug_sym(symtab,strtab,symtab_index);
+-		debug_reloc(symtab,strtab,rpnt);
+-
+-		res = reloc_fnc (tpnt, scope, rpnt, symtab, strtab);
+-
+-		if (res==0) continue;
+-
+-		_dl_dprintf(2, "\n%s: ",_dl_progname);
+-
+-		if (symtab_index)
+-		  _dl_dprintf(2, "symbol '%s': ", strtab + symtab[symtab_index].st_name);
+-
+-		if (unlikely(res <0))
+-		{
+-		        int reloc_type = ELF_R_TYPE(rpnt->r_info);
+-			_dl_dprintf(2, "can't handle reloc type %x\n", reloc_type);
+-			_dl_exit(-res);
+-		}
+-		if (unlikely(res >0))
+-		{
+-			_dl_dprintf(2, "can't resolve symbol\n");
+-			goof += res;
+-		}
+-	  }
+-	  return goof;
+-}
+-
+ #if 0
+ static unsigned long
+ fix_bad_pc24 (unsigned long *const reloc_addr, unsigned long value)
+@@ -230,13 +313,13 @@ fix_bad_pc24 (unsigned long *const reloc_addr, unsigned long value)
+ }
+ #endif
+ 
+-static int
+-_dl_do_reloc (struct elf_resolve *tpnt,struct r_scope_elem *scope,
+-	      ELF_RELOC *rpnt, ElfW(Sym) *symtab, char *strtab)
++static __always_inline int
++arm_do_reloc(struct elf_resolve *tpnt, struct r_scope_elem *scope,
++	     ELF_RELOC *rpnt, ElfW(Sym) *symtab, char *strtab, int check_xip)
+ {
+ 	int reloc_type;
+ 	int symtab_index;
+-	char *symname;
++	char *symname = NULL;
+ 	unsigned long *reloc_addr;
+ 	unsigned long symbol_addr;
+ 	struct symbol_ref sym_ref;
+@@ -247,45 +330,13 @@ _dl_do_reloc (struct elf_resolve *tpnt,struct r_scope_elem *scope,
+ 
+ 	reloc_type = ELF_R_TYPE(rpnt->r_info);
+ 	symtab_index = ELF_R_SYM(rpnt->r_info);
+-	symbol_addr = 0;
+-	sym_ref.sym = &symtab[symtab_index];
+-	sym_ref.tpnt = NULL;
+-	symname = strtab + symtab[symtab_index].st_name;
+-
+-	if (symtab_index) {
+-		if (ELF_ST_BIND (symtab[symtab_index].st_info) == STB_LOCAL) {
+-			symbol_addr = (unsigned long) DL_RELOC_ADDR(tpnt->loadaddr, symtab[symtab_index].st_value);
+-			def_mod = tpnt;
+-		} else {
+-			symbol_addr =  (unsigned long)_dl_find_hash(symname, scope, tpnt,
+-							elf_machine_type_class(reloc_type), &sym_ref);
+-
+-			/*
+-			 * We want to allow undefined references to weak symbols - this might
+-			 * have been intentional.  We should not be linking local symbols
+-			 * here, so all bases should be covered.
+-			 */
+-			if (!symbol_addr && (ELF_ST_TYPE(symtab[symtab_index].st_info) != STT_TLS)
+-				&& (ELF_ST_BIND(symtab[symtab_index].st_info) != STB_WEAK)) {
+-				/* This may be non-fatal if called from dlopen.  */
+-				return 1;
+ 
+-			}
+-			if (_dl_trace_prelink) {
+-				_dl_debug_lookup (symname, tpnt, &symtab[symtab_index],
+-						&sym_ref, elf_machine_type_class(reloc_type));
+-			}
+-			def_mod = sym_ref.tpnt;
+-		}
+-	} else {
+-		/*
+-		 * Relocs against STN_UNDEF are usually treated as using a
+-		 * symbol value of zero, and using the module containing the
+-		 * reloc itself.
+-		 */
+-		symbol_addr = symtab[symtab_index].st_value;
+-		def_mod = tpnt;
+-	}
++#ifdef __FDPIC__
++	/* XIP adds one extra safety check, but the relocation fast paths and
++	   descriptor helpers remain shared with mutable-text FDPIC loads.  */
++	if (check_xip && reloc_type != R_ARM_NONE)
++		arm_abort_xip_text_reloc(tpnt, reloc_type, reloc_addr);
++#endif
+ 
+ #if defined (__SUPPORT_LD_DEBUG__)
+ 	{
+@@ -297,6 +348,20 @@ _dl_do_reloc (struct elf_resolve *tpnt,struct r_scope_elem *scope,
+ 		switch (reloc_type) {
+ 			case R_ARM_NONE:
+ 				break;
++			case R_ARM_RELATIVE:
++				*reloc_addr = DL_RELOC_ADDR(tpnt->loadaddr, *reloc_addr);
++				break;
++			default:
++				if (arm_resolve_reloc_symbol(tpnt, scope, symtab, strtab,
++						symtab_index, reloc_type, &sym_ref,
++						&symbol_addr, &def_mod, &symname))
++					return 1;
++				break;
++		}
++		switch (reloc_type) {
++			case R_ARM_NONE:
++			case R_ARM_RELATIVE:
++				break;
+ 			case R_ARM_ABS32:
+ 				*reloc_addr += symbol_addr;
+ 				break;
+@@ -336,9 +401,6 @@ _dl_do_reloc (struct elf_resolve *tpnt,struct r_scope_elem *scope,
+ 			case R_ARM_JUMP_SLOT:
+ 				*reloc_addr = symbol_addr;
+ 				break;
+-			case R_ARM_RELATIVE:
+-				*reloc_addr = DL_RELOC_ADDR(tpnt->loadaddr, *reloc_addr);
+-				break;
+ 			case R_ARM_COPY:
+ 				_dl_memcpy((void *) reloc_addr,
+ 					   (void *) symbol_addr, symtab[symtab_index].st_size);
+@@ -346,31 +408,19 @@ _dl_do_reloc (struct elf_resolve *tpnt,struct r_scope_elem *scope,
+ #ifdef __FDPIC__
+ 			case R_ARM_FUNCDESC_VALUE:
+ 				{
+-					struct funcdesc_value funcval;
++					unsigned long addend = 0;
++					void *got_value = def_mod ? def_mod->loadaddr.got_value : NULL;
+ 					struct funcdesc_value *dst = (struct funcdesc_value *) reloc_addr;
+ 
+-					funcval.entry_point = (void*)symbol_addr;
+ 					/* Add offset to section address for local symbols.  */
+ 					if (ELF_ST_BIND(symtab[symtab_index].st_info) == STB_LOCAL)
+-					  funcval.entry_point += *reloc_addr;
+-					funcval.got_value = def_mod->loadaddr.got_value;
+-					*dst = funcval;
++						addend = *reloc_addr;
++					arm_fdpic_resolve_funcdesc_value(dst, symbol_addr, addend, got_value);
+ 				}
+ 				break;
+ 			case R_ARM_FUNCDESC:
+-				{
+-				  unsigned long reloc_value = *reloc_addr;
+-
+-				  if (symbol_addr)
+-					reloc_value = (unsigned long) _dl_funcdesc_for((void *)(symbol_addr + reloc_value), sym_ref.tpnt->loadaddr.got_value);
+-				  else
+-					/* Relocation against an
+-					   undefined weak symbol:
+-					   set funcdesc to zero.  */
+-					reloc_value = 0;
+-
+-				  *reloc_addr = reloc_value;
+-				}
++				*reloc_addr = arm_fdpic_funcdesc(symbol_addr, *reloc_addr,
++						def_mod ? def_mod->loadaddr.got_value : NULL);
+ 				break;
+ #endif
+ #if defined USE_TLS && USE_TLS
+@@ -400,9 +450,9 @@ _dl_do_reloc (struct elf_resolve *tpnt,struct r_scope_elem *scope,
+ 	return goof;
+ }
+ 
+-static int
+-_dl_do_lazy_reloc (struct elf_resolve *tpnt, struct r_scope_elem *scope,
+-		   ELF_RELOC *rpnt, ElfW(Sym) *symtab, char *strtab)
++static __always_inline int
++arm_do_lazy_reloc(struct elf_resolve *tpnt, struct r_scope_elem *scope,
++		  ELF_RELOC *rpnt, ElfW(Sym) *symtab, char *strtab, int check_xip)
+ {
+ 	int reloc_type;
+ 	unsigned long *reloc_addr;
+@@ -410,6 +460,13 @@ _dl_do_lazy_reloc (struct elf_resolve *tpnt, struct r_scope_elem *scope,
+ 	reloc_addr = (unsigned long *) DL_RELOC_ADDR(tpnt->loadaddr, rpnt->r_offset);
+ 	reloc_type = ELF_R_TYPE(rpnt->r_info);
+ 
++#ifdef __FDPIC__
++	/* Lazy relocation is still guarded for XIP correctness even though
++	   ARM FDPIC now prefers eager binding in both XIP and non-XIP cases.  */
++	if (check_xip && reloc_type != R_ARM_NONE)
++		arm_abort_xip_text_reloc(tpnt, reloc_type, reloc_addr);
++#endif
++
+ #if defined (__SUPPORT_LD_DEBUG__)
+ 	{
+ 		unsigned long old_val;
+@@ -429,8 +486,7 @@ _dl_do_lazy_reloc (struct elf_resolve *tpnt, struct r_scope_elem *scope,
+ 				{
+ 					struct funcdesc_value *dst = (struct funcdesc_value *) reloc_addr;
+ 
+-					dst->entry_point = (void *)DL_RELOC_ADDR(tpnt->loadaddr, dst->entry_point);
+-					dst->got_value = tpnt->loadaddr.got_value;
++					arm_fdpic_relocate_funcdesc_value(dst, tpnt->loadaddr);
+ 				}
+ 				break;
+ #endif
+@@ -446,17 +502,280 @@ _dl_do_lazy_reloc (struct elf_resolve *tpnt, struct r_scope_elem *scope,
+ 	return 0;
+ }
+ 
++static __always_inline int
++_dl_do_reloc(struct elf_resolve *tpnt,struct r_scope_elem *scope,
++	     ELF_RELOC *rpnt, ElfW(Sym) *symtab, char *strtab)
++{
++#ifdef __FDPIC__
++	return arm_do_reloc(tpnt, scope, rpnt, symtab, strtab,
++			    tpnt->rtld_flags & DL_FDPIC_XIP_TEXT);
++#else
++	return arm_do_reloc(tpnt, scope, rpnt, symtab, strtab, 0);
++#endif
++}
++
++static __always_inline int
++_dl_do_lazy_reloc(struct elf_resolve *tpnt, struct r_scope_elem *scope,
++		  ELF_RELOC *rpnt, ElfW(Sym) *symtab, char *strtab)
++{
++#ifdef __FDPIC__
++	return arm_do_lazy_reloc(tpnt, scope, rpnt, symtab, strtab,
++				 tpnt->rtld_flags & DL_FDPIC_XIP_TEXT);
++#else
++	return arm_do_lazy_reloc(tpnt, scope, rpnt, symtab, strtab, 0);
++#endif
++}
++
+ void _dl_parse_lazy_relocation_information(struct dyn_elf *rpnt,
+ 	unsigned long rel_addr, unsigned long rel_size)
+ {
+-	(void)_dl_parse(rpnt->dyn, NULL, rel_addr, rel_size, _dl_do_lazy_reloc);
++	struct elf_resolve *tpnt = rpnt->dyn;
++	ElfW(Sym) *symtab = (ElfW(Sym) *) tpnt->dynamic_info[DT_SYMTAB];
++	char *strtab = (char *) tpnt->dynamic_info[DT_STRTAB];
++	ELF_RELOC *reloc = (ELF_RELOC *) rel_addr;
++	ELF_RELOC *end = reloc + rel_size / sizeof(ELF_RELOC);
++#ifdef __FDPIC__
++	int check_xip = tpnt->rtld_flags & DL_FDPIC_XIP_TEXT;
++#endif
++
++	for (; reloc < end; reloc++) {
++		int symtab_index = ELF_R_SYM(reloc->r_info);
++
++		debug_sym(symtab, strtab, symtab_index);
++		debug_reloc(symtab, strtab, reloc);
++
++		if (arm_do_lazy_reloc(tpnt, NULL, reloc, symtab, strtab,
++#ifdef __FDPIC__
++				      check_xip
++#else
++				      0
++#endif
++				      ) == 0)
++			continue;
++
++		_dl_dprintf(2, "\n%s: ", _dl_progname);
++		if (symtab_index)
++			_dl_dprintf(2, "symbol '%s': ", strtab + symtab[symtab_index].st_name);
++		_dl_dprintf(2, "can't handle reloc type %x\n",
++			ELF_R_TYPE(reloc->r_info));
++		_dl_exit(1);
++	}
+ }
+ 
+ int _dl_parse_relocation_information(struct dyn_elf *rpnt,
+ 	struct r_scope_elem *scope, unsigned long rel_addr, unsigned long rel_size)
+ {
+-	return _dl_parse(rpnt->dyn, scope, rel_addr, rel_size, _dl_do_reloc);
++	struct elf_resolve *tpnt = rpnt->dyn;
++	ElfW(Sym) *symtab = (ElfW(Sym) *) tpnt->dynamic_info[DT_SYMTAB];
++	char *strtab = (char *) tpnt->dynamic_info[DT_STRTAB];
++	ELF_RELOC *reloc = (ELF_RELOC *) rel_addr;
++	ELF_RELOC *end = reloc + rel_size / sizeof(ELF_RELOC);
++	int goof = 0;
++#ifdef __FDPIC__
++	int check_xip = tpnt->rtld_flags & DL_FDPIC_XIP_TEXT;
++#endif
++	int last_symtab_index = -1;
++	int last_type_class = -1;
++	unsigned long last_symbol_addr = 0;
++	struct elf_resolve *last_def_mod = NULL;
++	char *last_symname = NULL;
++	struct symbol_ref last_sym_ref;
++
++	for (; reloc < end; reloc++) {
++		int symtab_index = ELF_R_SYM(reloc->r_info);
++		int reloc_type = ELF_R_TYPE(reloc->r_info);
++		int type_class;
++		unsigned long *reloc_addr = (unsigned long *) DL_RELOC_ADDR(tpnt->loadaddr, reloc->r_offset);
++		unsigned long symbol_addr;
++		struct elf_resolve *def_mod = NULL;
++		char *symname = NULL;
++		struct symbol_ref sym_ref;
++#if defined (__SUPPORT_LD_DEBUG__)
++		unsigned long old_val = 0;
++#endif
++
++		/* Prefetch next relocation entry.  */
++		if (reloc + 1 < end)
++			__builtin_prefetch(reloc + 1, 0, 1);
++
++		debug_sym(symtab, strtab, symtab_index);
++		debug_reloc(symtab, strtab, reloc);
++
++#ifdef __FDPIC__
++		if (check_xip && reloc_type != R_ARM_NONE)
++			arm_abort_xip_text_reloc(tpnt, reloc_type, reloc_addr);
++#endif
++
++#if defined (__SUPPORT_LD_DEBUG__)
++		if (_dl_debug_reloc && _dl_debug_detail && reloc_type != R_ARM_NONE)
++			old_val = *reloc_addr;
++#endif
++
++		/* Fast-path for local symbols and special relocs.  */
++		switch (reloc_type) {
++			case R_ARM_NONE:
++				continue;
++			case R_ARM_RELATIVE:
++				*reloc_addr = DL_RELOC_ADDR(tpnt->loadaddr, *reloc_addr);
++#if defined (__SUPPORT_LD_DEBUG__)
++				if (_dl_debug_reloc && _dl_debug_detail)
++					_dl_dprintf(_dl_debug_file,
++						"\tpatch: %x ==> %x @ %x",
++						old_val, *reloc_addr, reloc_addr);
++#endif
++				continue;
++			default:
++				if (symtab_index && ELF_ST_BIND(symtab[symtab_index].st_info) == STB_LOCAL) {
++					symbol_addr = (unsigned long)DL_RELOC_ADDR(tpnt->loadaddr,
++							symtab[symtab_index].st_value);
++					def_mod = tpnt;
++					goto do_reloc;
++				}
++				break;
++		}
++
++		type_class = elf_machine_type_class(reloc_type);
++		if (symtab_index && symtab_index == last_symtab_index
++		    && type_class == last_type_class) {
++			symbol_addr = last_symbol_addr;
++			def_mod = last_def_mod;
++			symname = last_symname;
++			sym_ref = last_sym_ref;
++		} else {
++			if (arm_resolve_reloc_symbol(tpnt, scope, symtab, strtab,
++						     symtab_index, reloc_type, &sym_ref,
++						     &symbol_addr, &def_mod, &symname)) {
++				_dl_dprintf(2, "\n%s: ", _dl_progname);
++				if (symname)
++					_dl_dprintf(2, "symbol '%s': ", symname);
++				_dl_dprintf(2, "can't resolve symbol\n");
++				goof++;
++				continue;
++			}
++			if (symtab_index) {
++				last_symtab_index = symtab_index;
++				last_type_class = type_class;
++				last_symbol_addr = symbol_addr;
++				last_def_mod = def_mod;
++				last_symname = symname;
++				last_sym_ref = sym_ref;
++			}
++		}
++
++do_reloc:
++		/* Inline the relocation logic here to use the resolved symbol directly.  */
++		switch (reloc_type) {
++			case R_ARM_NONE:
++			case R_ARM_RELATIVE:
++				break;
++			case R_ARM_ABS32:
++				*reloc_addr += symbol_addr;
++				break;
++			case R_ARM_GLOB_DAT:
++			case R_ARM_JUMP_SLOT:
++				*reloc_addr = symbol_addr;
++				break;
++			case R_ARM_COPY:
++				_dl_memcpy((void *) reloc_addr,
++					   (void *) symbol_addr, symtab[symtab_index].st_size);
++				break;
++#ifdef __FDPIC__
++			case R_ARM_FUNCDESC_VALUE:
++				{
++					unsigned long addend = 0;
++					void *got_value = def_mod ? def_mod->loadaddr.got_value : NULL;
++					struct funcdesc_value *dst = (struct funcdesc_value *) reloc_addr;
++
++					if (ELF_ST_BIND(symtab[symtab_index].st_info) == STB_LOCAL)
++						addend = *reloc_addr;
++					arm_fdpic_resolve_funcdesc_value(dst, symbol_addr, addend, got_value);
++				}
++				break;
++			case R_ARM_FUNCDESC:
++				*reloc_addr = arm_fdpic_funcdesc(symbol_addr, *reloc_addr,
++						def_mod ? def_mod->loadaddr.got_value : NULL);
++				break;
++#endif
++#if defined USE_TLS && USE_TLS
++			case R_ARM_TLS_DTPMOD32:
++				*reloc_addr = def_mod->l_tls_modid;
++				break;
++
++			case R_ARM_TLS_DTPOFF32:
++				*reloc_addr += symbol_addr;
++				break;
++
++			case R_ARM_TLS_TPOFF32:
++				CHECK_STATIC_TLS ((struct link_map *) def_mod);
++				*reloc_addr += (symbol_addr + def_mod->l_tls_offset);
++				break;
++#endif
++			default:
++				_dl_dprintf(2, "\n%s: ", _dl_progname);
++				if (symname)
++					_dl_dprintf(2, "symbol '%s': ", symname);
++				_dl_dprintf(2, "can't handle reloc type %x\n", reloc_type);
++				_dl_exit(1);
++		}
++#if defined (__SUPPORT_LD_DEBUG__)
++		if (_dl_debug_reloc && _dl_debug_detail && reloc_type != R_ARM_NONE)
++			_dl_dprintf(_dl_debug_file,
++				"\tpatch: %x ==> %x @ %x",
++				old_val, *reloc_addr, reloc_addr);
++#endif
++	}
++
++	return goof;
++}
++
++#ifdef __FDPIC__
++int _dl_parse_local_fdpic_descriptor_relocs(struct dyn_elf *rpnt,
++	unsigned long rel_addr, unsigned long rel_size)
++{
++	struct elf_resolve *tpnt = rpnt->dyn;
++	ElfW(Sym) *symtab = (ElfW(Sym) *) tpnt->dynamic_info[DT_SYMTAB];
++	ELF_RELOC *reloc = (ELF_RELOC *) rel_addr;
++	ELF_RELOC *end = reloc + rel_size / sizeof(ELF_RELOC);
++	int check_xip = tpnt->rtld_flags & DL_FDPIC_XIP_TEXT;
++	void *got_value = tpnt->loadaddr.got_value;
++
++	/* Batch processing: unroll and streamline for purely local descriptors.  */
++	while (reloc < end) {
++		int reloc_type = ELF_R_TYPE(reloc->r_info);
++		int symtab_index = ELF_R_SYM(reloc->r_info);
++		unsigned long *reloc_addr;
++		unsigned long symbol_addr;
++
++		if (symtab_index == 0
++		    || ELF_ST_BIND(symtab[symtab_index].st_info) != STB_LOCAL)
++			return -1;
++
++		reloc_addr = (unsigned long *) DL_RELOC_ADDR(tpnt->loadaddr,
++				reloc->r_offset);
++		symbol_addr = (unsigned long)DL_RELOC_ADDR(tpnt->loadaddr,
++				symtab[symtab_index].st_value);
++
++		if (check_xip)
++			arm_abort_xip_text_reloc(tpnt, reloc_type, reloc_addr);
++
++		if (reloc_type == R_ARM_FUNCDESC_VALUE) {
++			struct funcdesc_value *dst =
++				(struct funcdesc_value *) reloc_addr;
++			unsigned long addend = *reloc_addr;
++
++			arm_fdpic_resolve_funcdesc_value(dst, symbol_addr, addend, got_value);
++		} else if (reloc_type == R_ARM_FUNCDESC) {
++			*reloc_addr = arm_fdpic_funcdesc(symbol_addr, *reloc_addr, got_value);
++		} else {
++			return -1;
++		}
++
++		reloc++;
++	}
++
++	return 0;
+ }
++#endif
+ 
+ #ifndef IS_IN_libdl
+ # include "../../libc/sysdeps/linux/arm/crtreloc.c"
+diff --git a/ldso/ldso/bfin/dl-inlines.h b/ldso/ldso/bfin/dl-inlines.h
+index b08ce61cb..e587a55f8 100644
+--- a/ldso/ldso/bfin/dl-inlines.h
++++ b/ldso/ldso/bfin/dl-inlines.h
+@@ -13,7 +13,9 @@
+ 
+ static __always_inline void
+ __dl_loadaddr_unmap(struct elf32_fdpic_loadaddr loadaddr,
+-                    struct funcdesc_ht *funcdesc_ht)
++                    struct fdpic_funcdesc_ht *funcdesc_ht,
++                    struct funcdesc_chunk *funcdesc_chunks,
++                    struct elf32_fdpic_loadmap *inline_map)
+ {
+ 	int i;
+ 
+@@ -43,9 +45,12 @@ __dl_loadaddr_unmap(struct elf32_fdpic_loadaddr loadaddr,
+ 	 * relocation, in which case calling free() is probably pointless,
+ 	 * but still safe.
+ 	 */
+-	_dl_free(loadaddr.map);
++	if (loadaddr.map != inline_map)
++		_dl_free(loadaddr.map);
+ 	if (funcdesc_ht)
+ 		htab_delete(funcdesc_ht);
++	if (funcdesc_chunks)
++		funcdesc_chunks_delete(funcdesc_chunks);
+ }
+ 
+ static __always_inline int
+diff --git a/ldso/ldso/dl-elf.c b/ldso/ldso/dl-elf.c
+index dc2185d7d..242c6a13c 100644
+--- a/ldso/ldso/dl-elf.c
++++ b/ldso/ldso/dl-elf.c
+@@ -511,6 +511,127 @@ map_writeable (int infile, ElfW(Phdr) *ppnt, int piclib, int flags,
+ 	return retval;
+ }
+ 
++#ifdef __FDPIC__
++static __always_inline int
++fdpic_check_xipable(ElfW(Phdr) *ppnt)
++{
++	return (ppnt->p_flags & PF_X) &&
++		!(ppnt->p_flags & PF_W) &&
++		ppnt->p_filesz == ppnt->p_memsz &&
++		ppnt->p_align >= DL_XIP_ALIGN;
++}
++
++static __always_inline int
++fdpic_xip_segment_immutable(ElfW(Phdr) *ppnt, int piclib, int xip_safe_text)
++{
++	return piclib == 2 && xip_safe_text &&
++		ppnt->p_type == PT_LOAD &&
++		!(ppnt->p_flags & PF_W) &&
++		ppnt->p_filesz == ppnt->p_memsz;
++}
++
++static __always_inline int
++fdpic_segment_map_flags(ElfW(Phdr) *ppnt, int flags, int piclib,
++			      int xip_safe_text)
++{
++#ifndef __ARCH_USE_MMU__
++	if (fdpic_xip_segment_immutable(ppnt, piclib, xip_safe_text))
++		flags = (flags & ~MAP_PRIVATE) | MAP_SHARED;
++#endif
++	if (piclib == 2)
++		flags |= MAP_EXECUTABLE | MAP_DENYWRITE;
++	return flags;
++}
++
++static __always_inline const char *
++fdpic_text_mode_name(unsigned long rtld_flags)
++{
++	if (rtld_flags & DL_FDPIC_XIP_TEXT)
++		return "xip-aware";
++	if (rtld_flags & DL_FDPIC_MUTABLE_TEXT)
++		return "mutable/non-xip";
++	return "data-only";
++}
++
++static __always_inline void
++fdpic_determine_xip_status(struct elf_resolve *tpnt, int exec_load_seen,
++			   int xip_mapped_text)
++{
++	if (exec_load_seen) {
++		if (xip_mapped_text)
++			tpnt->rtld_flags |= DL_FDPIC_XIP_TEXT;
++		else
++			tpnt->rtld_flags |= DL_FDPIC_MUTABLE_TEXT;
++	}
++}
++
++static __always_inline void
++fdpic_init_segment_profile(struct elf_resolve *tpnt)
++{
++	ElfW(Phdr) *phdr = tpnt->ppnt;
++	unsigned long ro_mask = 0;
++	unsigned int seg_idx = 0;
++	int i;
++
++	tpnt->fdpic_ro_loadseg_mask = 0;
++	tpnt->rtld_flags &= ~DL_FDPIC_SEGMENT_MASK_OVERFLOW;
++
++	for (i = 0; i < tpnt->n_phent; i++, phdr++) {
++		if (phdr->p_type != PT_LOAD)
++			continue;
++		if (seg_idx >= 8 * sizeof(ro_mask)) {
++			tpnt->rtld_flags |= DL_FDPIC_SEGMENT_MASK_OVERFLOW;
++			break;
++		}
++		if (!(phdr->p_flags & PF_W))
++			ro_mask |= 1UL << seg_idx;
++		seg_idx++;
++	}
++
++	tpnt->fdpic_ro_loadseg_mask = ro_mask;
++}
++#endif
++
++#ifdef __FDPIC__
++static __always_inline void *
++_dl_mmap_fdpic_segment(int infile, ElfW(Phdr) *ppnt, void *tryaddr,
++                       size_t size, int flags, int piclib, int xip_safe_text,
++                       int *xip_mapped_text)
++{
++	int map_flags = fdpic_segment_map_flags(ppnt, flags, piclib, xip_safe_text);
++	int immutable = fdpic_xip_segment_immutable(ppnt, piclib, xip_safe_text);
++	void *status;
++
++	status = (char *) _dl_mmap
++		(tryaddr, size, LXFLAGS(ppnt->p_flags),
++		 map_flags, infile,
++		 ppnt->p_offset & OFFS_ALIGN);
++
++	/* Fallback: if MAP_SHARED fails (e.g., non-XIP filesystem), try MAP_PRIVATE.  */
++	if (_dl_mmap_check_error(status) && (map_flags & MAP_SHARED)) {
++		_dl_dprintf(2, "%s: falling back to MAP_PRIVATE for XIP segment in '%s'\n",
++			    _dl_progname, _dl_loaded_modules ? _dl_loaded_modules->libname : "unknown");
++		map_flags = (map_flags & ~MAP_SHARED) | MAP_PRIVATE;
++		status = (char *) _dl_mmap
++			(tryaddr, size, LXFLAGS(ppnt->p_flags),
++			 map_flags, infile,
++			 ppnt->p_offset & OFFS_ALIGN);
++		immutable = 0; /* No longer immutable/XIP.  */
++	}
++
++	if (immutable && (ppnt->p_flags & PF_X) &&
++	    !_dl_mmap_check_error(status) &&
++	    (!tryaddr || tryaddr == status))
++		return status;
++
++	if ((ppnt->p_flags & PF_X) &&
++	    (!_dl_mmap_check_error(status) && (!tryaddr || tryaddr == status)))
++		*xip_mapped_text = 0;
++
++	return status;
++}
++#endif
++
+ /*
+  * Read one ELF library into memory, mmap it into the correct locations and
+  * add the symbol info to the symbol chain.  Perform any relocations that
+@@ -541,6 +662,11 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 	uint32_t *p32;
+ 	DL_LOADADDR_TYPE lib_loadaddr;
+ 	DL_INIT_LOADADDR_EXTRA_DECLS
++#ifdef __FDPIC__
++	int exec_load_seen = 0;
++	int xip_safe_text = 1;
++	int xip_mapped_text = 1;
++#endif
+ 
+ 	libaddr = 0;
+ 	infile = _dl_open(libname, O_RDONLY, 0);
+@@ -641,6 +767,13 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 			if (((unsigned long) ppnt->p_vaddr + ppnt->p_memsz) > maxvma) {
+ 				maxvma = ppnt->p_vaddr + ppnt->p_memsz;
+ 			}
++#ifdef __FDPIC__
++			if (ppnt->p_flags & PF_X) {
++				exec_load_seen = 1;
++				if (!fdpic_check_xipable(ppnt))
++					xip_safe_text = 0;
++			}
++#endif
+ 		}
+ 		if (ppnt->p_type == PT_TLS) {
+ #if defined(USE_TLS) && USE_TLS
+@@ -694,9 +827,16 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 		flags |= MAP_FIXED;
+ 	}
+ 
++#ifdef __FDPIC__
++	tpnt = _dl_alloc_elf_resolve();
++#endif
++
+ 	/* Get the memory to store the library */
+ 	ppnt = (ElfW(Phdr) *)(intptr_t) & header[epnt->e_phoff];
+ 
++#ifdef __FDPIC__
++	dl_init_loadaddr_inline_map = &tpnt->fdpic_inline_loadmap.map;
++#endif
+ 	DL_INIT_LOADADDR(lib_loadaddr, libaddr - minvma, ppnt, epnt->e_phnum);
+ 	/* Set _dl_library_offset to lib_loadaddr or 0. */
+ 	DL_SET_LIB_OFFSET(lib_loadaddr);
+@@ -708,7 +848,13 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 			addr = DL_MAP_SEGMENT (epnt, ppnt, infile, flags);
+ 			if (addr == NULL) {
+ 			cant_map1:
++#ifdef __FDPIC__
++				__dl_loadaddr_unmap(lib_loadaddr, NULL, NULL,
++					&tpnt->fdpic_inline_loadmap.map);
++				_dl_free(tpnt);
++#else
+ 				DL_LOADADDR_UNMAP (lib_loadaddr, maxvma - minvma);
++#endif
+ 				goto cant_map;
+ 			}
+ 
+@@ -733,11 +879,16 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 					   : (char *) (ppnt->p_vaddr & PAGE_ALIGN)
+ 					   + (piclib ? libaddr : DL_GET_LIB_OFFSET()));
+ 				size = (ppnt->p_vaddr & ADDR_ALIGN) + ppnt->p_filesz;
++#ifdef __FDPIC__
++				status = _dl_mmap_fdpic_segment(infile, ppnt, tryaddr, size,
++						flags, piclib, xip_safe_text, &xip_mapped_text);
++#else
+ 				status = (char *) _dl_mmap
+ 					   (tryaddr, size, LXFLAGS(ppnt->p_flags),
+ 					    flags | (piclib == 2 ? MAP_EXECUTABLE
+ 						     | MAP_DENYWRITE : 0),
+ 					    infile, ppnt->p_offset & OFFS_ALIGN);
++#endif
+ 				if (_dl_mmap_check_error(status)
+ 				    || (tryaddr && tryaddr != status))
+ 				  goto cant_map1;
+@@ -777,6 +928,11 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 		_dl_internal_error_number = LD_ERROR_NODYNAMIC;
+ 		_dl_dprintf(2, "%s: '%s' is missing a dynamic section\n",
+ 				_dl_progname, libname);
++#ifdef __FDPIC__
++		__dl_loadaddr_unmap(lib_loadaddr, NULL, NULL,
++			&tpnt->fdpic_inline_loadmap.map);
++		_dl_free(tpnt);
++#endif
+ 		_dl_munmap(header, _dl_pagesize);
+ 		_dl_close(infile);
+ 		return NULL;
+@@ -785,10 +941,24 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 	dpnt = (ElfW(Dyn) *) dynamic_addr;
+ 	_dl_memset(dynamic_info, 0, sizeof(dynamic_info));
+ 	rtld_flags = _dl_parse_dynamic_info(dpnt, dynamic_info, NULL, lib_loadaddr);
++#ifdef __FDPIC__
++	if (dynamic_info[DT_TEXTREL]) {
++		if (DL_FDPIC_STRICT_XIP()) {
++			_dl_dprintf(2,
++				"%s: strict FDPIC XIP rejects DT_TEXTREL in '%s'\n",
++				_dl_progname, libname);
++			_dl_exit(1);
++		}
++		xip_safe_text = 0;
++		xip_mapped_text = 0;
++		rtld_flags |= DL_TEXTREL_REQUIRED;
++	}
++#endif
+ 	/* If the TEXTREL is set, this means that we need to make the pages
+ 	   writable before we perform relocations.  Do this now. They get set
+ 	   back again later. */
+ 
++#if !DL_FDPIC_STRICT_XIP()
+ 	if (dynamic_info[DT_TEXTREL]) {
+ #ifndef __FORCE_SHAREABLE_TEXT_SEGMENTS__
+ 		ppnt = (ElfW(Phdr) *)(intptr_t) & header[epnt->e_phoff];
+@@ -823,11 +993,17 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 		_dl_exit(1);
+ #endif
+ 	}
++#endif
+ 
+ 	_dl_close(infile);
+ 
++#ifdef __FDPIC__
++	tpnt = _dl_add_elf_hash_table_existing(tpnt, libname, lib_loadaddr,
++			dynamic_info, dynamic_addr, 0);
++#else
+ 	tpnt = _dl_add_elf_hash_table(libname, lib_loadaddr, dynamic_info,
+ 			dynamic_addr, 0);
++#endif
+ 	tpnt->mapaddr = libaddr;
+ 	tpnt->relro_addr = relro_addr;
+ 	tpnt->relro_size = relro_size;
+@@ -914,6 +1090,10 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ #else
+ 	tpnt->libtype = elf_lib;
+ #endif
++#ifdef __FDPIC__
++	fdpic_determine_xip_status(tpnt, exec_load_seen, xip_mapped_text);
++	fdpic_init_segment_profile(tpnt);
++#endif
+ 
+ 	/*
+ 	 * OK, the next thing we need to do is to insert the dynamic linker into
+@@ -1002,12 +1182,23 @@ struct elf_resolve *_dl_load_elf_shared_library(unsigned int rflags,
+ 	_dl_if_debug_dprint("\t\tdynamic: %x  base: %x\n", dynamic_addr, DL_LOADADDR_BASE(lib_loadaddr));
+ 	_dl_if_debug_dprint("\t\t  entry: %x  phdr: %x  phnum: %x\n\n",
+ 			DL_RELOC_ADDR(lib_loadaddr, epnt->e_entry), tpnt->ppnt, tpnt->n_phent);
++#ifdef __FDPIC__
++	if (exec_load_seen) {
++		_dl_if_debug_dprint("\t\t  fdpic-text: %s\n\n",
++			fdpic_text_mode_name(tpnt->rtld_flags));
++	}
++#endif
+ 
+ 	_dl_munmap(header, _dl_pagesize);
+ 
+ 	return tpnt;
+ }
+ 
++#ifndef ARCH_FDPIC_FIXUP_LOCAL_RELOCS
++#define ARCH_FDPIC_FIXUP_LOCAL_RELOCS(RPNT, SCOPE, GOOF, ADDR, SIZE) \
++  ((GOOF) += _dl_parse_relocation_information((RPNT), (SCOPE), (ADDR), (SIZE)))
++#endif
++
+ /* now_flag must be RTLD_NOW or zero */
+ int _dl_fixup(struct dyn_elf *rpnt, struct r_scope_elem *scope, int now_flag)
+ {
+@@ -1052,16 +1243,19 @@ int _dl_fixup(struct dyn_elf *rpnt, struct r_scope_elem *scope, int now_flag)
+ #ifdef __LDSO_PRELINK_SUPPORT__
+ 			if (tpnt->loadaddr || (!tpnt->dynamic_info[DT_GNU_PRELINKED_IDX]))
+ #endif
++			{
++				DL_FDPIC_RELATIVE_XIP_GUARD(tpnt, reloc_addr, relative_count);
+ 				elf_machine_relative(tpnt->loadaddr, reloc_addr, relative_count);
++			}
+ 			reloc_addr += relative_count * sizeof(ELF_RELOC);
+ 		}
+-		goof += _dl_parse_relocation_information(rpnt, scope,
+-				reloc_addr,
+-				reloc_size);
++		ARCH_FDPIC_FIXUP_LOCAL_RELOCS(rpnt, scope, goof, reloc_addr, reloc_size);
+ 		tpnt->init_flag |= RELOCS_DONE;
+ 	}
+ 	if (tpnt->dynamic_info[DT_BIND_NOW])
+ 		now_flag = RTLD_NOW;
++	if (DL_FORCE_BIND_NOW(tpnt))
++		now_flag = RTLD_NOW;
+ 	if (tpnt->dynamic_info[DT_JMPREL] &&
+ 	    (!(tpnt->init_flag & JMP_RELOCS_DONE) ||
+ 	     (now_flag && !(tpnt->rtld_flags & now_flag)))) {
+diff --git a/ldso/ldso/dl-hash.c b/ldso/ldso/dl-hash.c
+index 0fede8445..cca6d9d9e 100644
+--- a/ldso/ldso/dl-hash.c
++++ b/ldso/ldso/dl-hash.c
+@@ -86,17 +86,18 @@ static __inline__ Elf_Symndx _dl_elf_hash(const unsigned char *name)
+  * We add the relevant info to the symbol chain, so that we can resolve all
+  * externals properly.
+  */
+-struct elf_resolve *_dl_add_elf_hash_table(const char *libname,
+-	DL_LOADADDR_TYPE loadaddr, unsigned long *dynamic_info, unsigned long dynamic_addr,
+-	attribute_unused unsigned long dynamic_size)
++struct elf_resolve *_dl_alloc_elf_resolve(void)
+ {
+-	Elf_Symndx *hash_addr;
+ 	struct elf_resolve *tpnt;
+-	int i;
+ 
+ 	tpnt = _dl_malloc(sizeof(struct elf_resolve));
+ 	_dl_memset(tpnt, 0, sizeof(struct elf_resolve));
++	return tpnt;
++}
+ 
++static struct elf_resolve *
++_dl_link_elf_resolve(struct elf_resolve *tpnt)
++{
+ 	if (!_dl_loaded_modules)
+ 		_dl_loaded_modules = tpnt;
+ 	else {
+@@ -104,11 +105,22 @@ struct elf_resolve *_dl_add_elf_hash_table(const char *libname,
+ 		while (t->next)
+ 			t = t->next;
+ 		t->next = tpnt;
+-		t->next->prev = t;
+-		tpnt = t->next;
++		tpnt->prev = t;
+ 	}
+ 
+ 	tpnt->next = NULL;
++	return tpnt;
++}
++
++struct elf_resolve *_dl_add_elf_hash_table_existing(struct elf_resolve *tpnt,
++	const char *libname, DL_LOADADDR_TYPE loadaddr,
++	unsigned long *dynamic_info, unsigned long dynamic_addr,
++	attribute_unused unsigned long dynamic_size)
++{
++	Elf_Symndx *hash_addr;
++	int i;
++
++	_dl_link_elf_resolve(tpnt);
+ 	tpnt->init_flag = 0;
+ 	tpnt->libname = _dl_strdup(libname);
+ 	tpnt->dynamic_addr = (ElfW(Dyn) *)dynamic_addr;
+@@ -159,6 +171,17 @@ struct elf_resolve *_dl_add_elf_hash_table(const char *libname,
+ 	return tpnt;
+ }
+ 
++struct elf_resolve *_dl_add_elf_hash_table(const char *libname,
++	DL_LOADADDR_TYPE loadaddr, unsigned long *dynamic_info, unsigned long dynamic_addr,
++	attribute_unused unsigned long dynamic_size)
++{
++	struct elf_resolve *tpnt;
++
++	tpnt = _dl_alloc_elf_resolve();
++	return _dl_add_elf_hash_table_existing(tpnt, libname, loadaddr,
++		dynamic_info, dynamic_addr, dynamic_size);
++}
++
+ 
+ /* Routine to check whether the symbol matches.  */
+ static __attribute_noinline__ const ElfW(Sym) *
+diff --git a/ldso/ldso/fdpic/dl-inlines.h b/ldso/ldso/fdpic/dl-inlines.h
+index 6a31ef3e6..01121235c 100644
+--- a/ldso/ldso/fdpic/dl-inlines.h
++++ b/ldso/ldso/fdpic/dl-inlines.h
+@@ -5,9 +5,66 @@
+  * Licensed under the LGPL v2.1, see the file COPYING.LIB in this tarball.
+  */
+ 
+-#include <inline-hashtab.h>
++static __always_inline void htab_delete(struct fdpic_funcdesc_ht *htab);
+ 
+-static __always_inline void htab_delete(struct funcdesc_ht *htab);
++#ifndef DL_FUNCDESC_CHUNK_MIN_CAPACITY
++#define DL_FUNCDESC_CHUNK_MIN_CAPACITY 8
++#endif
++
++#ifndef DL_FUNCDESC_CHUNK_MAX_CAPACITY
++#define DL_FUNCDESC_CHUNK_MAX_CAPACITY 64
++#endif
++
++#ifndef DL_FUNCDESC_HT_INIT_SIZE
++#define DL_FUNCDESC_HT_INIT_SIZE 8
++#endif
++
++static __always_inline struct fdpic_funcdesc_ht *
++htab_create_sized(size_t size)
++{
++	struct fdpic_funcdesc_ht *ht;
++	size_t alloc_size;
++
++	if (size < DL_FUNCDESC_HT_INIT_SIZE)
++		size = DL_FUNCDESC_HT_INIT_SIZE;
++
++	/* Ensure size is a power of two.  */
++	if (size & (size - 1)) {
++		size |= size >> 1;
++		size |= size >> 2;
++		size |= size >> 4;
++		size |= size >> 8;
++		size |= size >> 16;
++#if __WORDSIZE == 64
++		size |= size >> 32;
++#endif
++		size++;
++	}
++
++	alloc_size = sizeof(*ht) + (size - 1) * sizeof(ht->buckets[0]);
++	ht = _dl_malloc(alloc_size);
++	if (!ht)
++		return NULL;
++
++	ht->size = size;
++	ht->n_elements = 0;
++	_dl_memset(ht->buckets, 0, size * sizeof(ht->buckets[0]));
++	return ht;
++}
++
++static __always_inline struct fdpic_funcdesc_ht *
++htab_create(void)
++{
++	return htab_create_sized(DL_FUNCDESC_HT_INIT_SIZE);
++}
++
++/* Descriptor storage is owned separately from the hash table, so this only
++ * releases the hash metadata itself.  */
++static __always_inline void
++htab_delete(struct fdpic_funcdesc_ht *htab)
++{
++	_dl_free(htab);
++}
+ 
+ /* Initialize a DL_LOADADDR_TYPE given a got pointer and a complete load map. */
+ static __always_inline void
+@@ -32,8 +89,9 @@ __dl_init_loadaddr_map(struct elf32_fdpic_loadaddr *loadaddr, Elf32_Addr dl_boot
+  * got_value will be properly initialized later on, with INIT_GOT.
+  */
+ static __always_inline int
+-__dl_init_loadaddr(struct elf32_fdpic_loadaddr *loadaddr, Elf32_Phdr *ppnt,
+-                   int pcnt)
++__dl_init_loadaddr(struct elf32_fdpic_loadaddr *loadaddr,
++                   struct elf32_fdpic_loadmap *inline_map,
++                   Elf32_Phdr *ppnt, int pcnt)
+ {
+ 	int count = 0, i;
+ 	size_t size;
+@@ -44,11 +102,15 @@ __dl_init_loadaddr(struct elf32_fdpic_loadaddr *loadaddr, Elf32_Phdr *ppnt,
+ 
+ 	loadaddr->got_value = 0;
+ 
+-	size = sizeof(struct elf32_fdpic_loadmap) +
+-		(sizeof(struct elf32_fdpic_loadseg) * count);
+-	loadaddr->map = _dl_malloc(size);
+-	if (!loadaddr->map)
+-		_dl_exit(-1);
++	if (count <= 2) {
++		loadaddr->map = inline_map;
++	} else {
++		size = sizeof(struct elf32_fdpic_loadmap) +
++			(sizeof(struct elf32_fdpic_loadseg) * count);
++		loadaddr->map = _dl_malloc(size);
++		if (!loadaddr->map)
++			_dl_exit(-1);
++	}
+ 
+ 	loadaddr->map->version = 0;
+ 	loadaddr->map->nsegs = 0;
+@@ -79,13 +141,66 @@ __dl_init_loadaddr_hdr(struct elf32_fdpic_loadaddr loadaddr, void *addr,
+ #endif
+ }
+ 
++static __always_inline void
++funcdesc_chunks_delete(struct funcdesc_chunk *chunk)
++{
++	while (chunk) {
++		struct funcdesc_chunk *next = chunk->next;
++
++		_dl_free(chunk);
++		chunk = next;
++	}
++}
++
++static __always_inline struct funcdesc_value *
++funcdesc_alloc(struct elf_resolve *tpnt)
++{
++	struct funcdesc_chunk *chunk = tpnt->funcdesc_chunks;
++
++	if (!chunk || chunk->used == chunk->capacity) {
++		size_t chunk_size;
++		size_t new_capacity = DL_FUNCDESC_CHUNK_MIN_CAPACITY;
++
++		if (chunk) {
++			new_capacity = chunk->capacity * 2;
++			if (new_capacity > DL_FUNCDESC_CHUNK_MAX_CAPACITY)
++				new_capacity = DL_FUNCDESC_CHUNK_MAX_CAPACITY;
++		}
++
++		chunk_size = sizeof(*chunk) +
++			(new_capacity - 1) * sizeof(chunk->entries[0]);
++		chunk = _dl_malloc(chunk_size);
++		if (!chunk)
++			return NULL;
++
++		chunk->next = tpnt->funcdesc_chunks;
++		chunk->used = 0;
++		chunk->capacity = new_capacity;
++		tpnt->funcdesc_chunks = chunk;
++	}
++
++	return &chunk->entries[chunk->used++];
++}
++
++static __always_inline void
++__dl_loadaddr_seg_unmap(struct elf32_fdpic_loadseg *segdata)
++{
++	Elf32_Addr offset = segdata->p_vaddr & ADDR_ALIGN;
++	void *mapaddr = (void *)(segdata->addr - offset);
++	size_t mapsize = offset + segdata->p_memsz;
++
++	_dl_munmap(mapaddr, mapsize);
++}
++
+ /* Replace an existing entry in the load map. */
+ static __always_inline void
+ __dl_update_loadaddr_hdr(struct elf32_fdpic_loadaddr loadaddr, void *addr,
+                          Elf32_Phdr *phdr)
+ {
+ 	struct elf32_fdpic_loadseg *segdata;
++#if defined (__SUPPORT_LD_DEBUG__)
+ 	void *oldaddr;
++#endif
+ 	int i;
+ 
+ 	for (i = 0; i < loadaddr.map->nsegs; i++)
+@@ -96,8 +211,10 @@ __dl_update_loadaddr_hdr(struct elf32_fdpic_loadaddr loadaddr, void *addr,
+ 		_dl_exit(-1);
+ 
+ 	segdata = loadaddr.map->segs + i;
+-	oldaddr = (void *)segdata->addr;
+-	_dl_munmap(oldaddr, segdata->p_memsz);
++#if defined (__SUPPORT_LD_DEBUG__)
++	oldaddr = (void *)(segdata->addr - (segdata->p_vaddr & ADDR_ALIGN));
++#endif
++	__dl_loadaddr_seg_unmap(segdata);
+ 	segdata->addr = (Elf32_Addr)addr;
+ 
+ #if defined (__SUPPORT_LD_DEBUG__)
+@@ -112,13 +229,14 @@ __dl_update_loadaddr_hdr(struct elf32_fdpic_loadaddr loadaddr, void *addr,
+ #ifndef __dl_loadaddr_unmap
+ static __always_inline void
+ __dl_loadaddr_unmap(struct elf32_fdpic_loadaddr loadaddr,
+-                    struct funcdesc_ht *funcdesc_ht)
++                    struct fdpic_funcdesc_ht *funcdesc_ht,
++                    struct funcdesc_chunk *funcdesc_chunks,
++                    struct elf32_fdpic_loadmap *inline_map)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < loadaddr.map->nsegs; i++)
+-		_dl_munmap((void *)loadaddr.map->segs[i].addr,
+-			loadaddr.map->segs[i].p_memsz);
++		__dl_loadaddr_seg_unmap(&loadaddr.map->segs[i]);
+ 
+ 	/*
+ 	 * _dl_unmap is only called for dlopen()ed libraries, for which
+@@ -126,9 +244,12 @@ __dl_loadaddr_unmap(struct elf32_fdpic_loadaddr loadaddr,
+ 	 * relocation, in which case calling free() is probably pointless,
+ 	 * but still safe.
+ 	 */
+-	_dl_free(loadaddr.map);
++	if (loadaddr.map != inline_map)
++		_dl_free(loadaddr.map);
+ 	if (funcdesc_ht)
+ 		htab_delete(funcdesc_ht);
++	if (funcdesc_chunks)
++		funcdesc_chunks_delete(funcdesc_chunks);
+ }
+ #endif
+ 
+@@ -153,45 +274,183 @@ hash_pointer(void *p)
+ 	return (int) ((long)p >> 3);
+ }
+ 
+-static int
+-eq_pointer(void *p, void *q)
++static __always_inline struct funcdesc_value **
++funcdesc_bucket(struct fdpic_funcdesc_ht *ht, void *entry_point)
+ {
+-	struct funcdesc_value *entry = p;
++	unsigned int index = hash_pointer(entry_point) & (ht->size - 1);
+ 
+-	return entry->entry_point == q;
++	return &ht->buckets[index];
+ }
+ 
+-static __always_inline void *
+-_dl_funcdesc_for (void *entry_point, void *got_value)
++static __always_inline struct funcdesc_value *
++funcdesc_find(struct fdpic_funcdesc_ht *ht, void *entry_point)
+ {
+-	struct elf_resolve *tpnt = ((void**)got_value)[2];
+-	struct funcdesc_ht *ht = tpnt->funcdesc_ht;
+-	struct funcdesc_value **entry;
++	struct funcdesc_value *entry = *funcdesc_bucket(ht, entry_point);
+ 
+-	_dl_assert(got_value == tpnt->loadaddr.got_value);
++	while (entry) {
++		if (entry->entry_point == entry_point)
++			return entry;
++		entry = entry->next_hash;
++	}
++
++	return NULL;
++}
++
++static __always_inline int
++funcdesc_ht_expand(struct elf_resolve *tpnt)
++{
++	struct fdpic_funcdesc_ht *old_ht = tpnt->funcdesc_ht;
++	struct fdpic_funcdesc_ht *new_ht;
++	size_t new_size;
++	size_t i;
++
++	if (old_ht->size * 3 > old_ht->n_elements * 4)
++		return 1;
++
++	new_size = old_ht->size * 2;
++	new_ht = htab_create_sized(new_size);
++	if (!new_ht)
++		return 0;
++
++	for (i = 0; i < old_ht->size; i++) {
++		struct funcdesc_value *entry = old_ht->buckets[i];
++
++		while (entry) {
++			struct funcdesc_value *next = entry->next_hash;
++			struct funcdesc_value **bucket = funcdesc_bucket(new_ht,
++					entry->entry_point);
++
++			entry->next_hash = *bucket;
++			*bucket = entry;
++			new_ht->n_elements++;
++			entry = next;
++		}
++	}
++
++	tpnt->funcdesc_ht = new_ht;
++	htab_delete(old_ht);
++	return 1;
++}
++
++static __always_inline struct funcdesc_value *
++funcdesc_find_in_chunks(struct elf_resolve *tpnt, void *entry_point)
++{
++	struct funcdesc_chunk *chunk;
++
++	for (chunk = tpnt->funcdesc_chunks; chunk; chunk = chunk->next) {
++		size_t i;
++		for (i = 0; i < chunk->used; i++) {
++			if (chunk->entries[i].entry_point == entry_point)
++				return &chunk->entries[i];
++		}
++	}
++	return NULL;
++}
++
++static __always_inline size_t
++funcdesc_total_used(struct elf_resolve *tpnt)
++{
++	struct funcdesc_chunk *chunk;
++	size_t total = 0;
++
++	for (chunk = tpnt->funcdesc_chunks; chunk; chunk = chunk->next)
++		total += chunk->used;
++	return total;
++}
++
++#ifndef DL_FUNCDESC_HT_THRESHOLD
++#define DL_FUNCDESC_HT_THRESHOLD 16
++#endif
++
++static __always_inline struct funcdesc_value *
++funcdesc_find_or_insert(struct elf_resolve *tpnt, void *entry_point)
++{
++	struct fdpic_funcdesc_ht *ht = tpnt->funcdesc_ht;
++	struct funcdesc_value **bucket;
++	struct funcdesc_value *entry;
+ 
+ 	if (!ht) {
+-		ht = htab_create();
++		entry = funcdesc_find_in_chunks(tpnt, entry_point);
++		if (entry)
++			return entry;
++
++		if (funcdesc_total_used(tpnt) < DL_FUNCDESC_HT_THRESHOLD) {
++			entry = funcdesc_alloc(tpnt);
++			if (!entry)
++				return NULL;
++			entry->entry_point = entry_point;
++			entry->got_value = NULL;
++			entry->next_hash = NULL;
++			return entry;
++		}
++
++		/* Threshold reached, create and populate hash table.  */
++		ht = htab_create_sized(DL_FUNCDESC_HT_THRESHOLD * 2);
+ 		if (!ht)
+-			return (void*)-1;
++			return NULL;
+ 		tpnt->funcdesc_ht = ht;
+-	}
+ 
+-	entry = (struct funcdesc_value **)htab_find_slot(ht, entry_point, 1, hash_pointer, eq_pointer);
++		{
++			struct funcdesc_chunk *chunk;
++			for (chunk = tpnt->funcdesc_chunks; chunk; chunk = chunk->next) {
++				size_t i;
++				for (i = 0; i < chunk->used; i++) {
++					struct funcdesc_value *e = &chunk->entries[i];
++					bucket = funcdesc_bucket(ht, e->entry_point);
++					e->next_hash = *bucket;
++					*bucket = e;
++					ht->n_elements++;
++				}
++			}
++		}
++	}
+ 
+-	if (entry == NULL)
+-		_dl_exit(1);
++	if (ht->size * 3 <= ht->n_elements * 4) {
++		if (!funcdesc_ht_expand(tpnt))
++			return NULL;
++		ht = tpnt->funcdesc_ht;
++	}
+ 
+-	if (*entry) {
+-		_dl_assert((*entry)->entry_point == entry_point);
+-		return _dl_stabilize_funcdesc(*entry);
++	bucket = funcdesc_bucket(ht, entry_point);
++	entry = *bucket;
++	while (entry) {
++		if (entry->entry_point == entry_point)
++			return entry;
++		entry = entry->next_hash;
+ 	}
+ 
+-	*entry = _dl_malloc(sizeof(**entry));
+-	(*entry)->entry_point = entry_point;
+-	(*entry)->got_value = got_value;
++	entry = funcdesc_alloc(tpnt);
++	if (!entry)
++		return NULL;
++	entry->entry_point = entry_point;
++	entry->got_value = NULL;
++	entry->next_hash = *bucket;
++	*bucket = entry;
++	ht->n_elements++;
++	return entry;
++}
+ 
+-	return _dl_stabilize_funcdesc(*entry);
++static __always_inline void *
++_dl_funcdesc_for (void *entry_point, void *got_value)
++{
++	struct elf_resolve *tpnt = ((void**)got_value)[2];
++	struct funcdesc_value *entry;
++
++#if defined(__SUPPORT_LD_DEBUG__)
++	_dl_assert(got_value == tpnt->loadaddr.got_value);
++#endif
++
++	entry = funcdesc_find_or_insert(tpnt, entry_point);
++	if (!entry)
++		return (void *)-1;
++	if (entry->got_value == NULL)
++		entry->got_value = got_value;
++
++#if defined(__SUPPORT_LD_DEBUG__)
++	_dl_assert(entry->entry_point == entry_point);
++	_dl_assert(entry->got_value == got_value);
++#endif
++	return _dl_stabilize_funcdesc(entry);
+ }
+ 
+ static __always_inline void const *
+@@ -210,17 +469,16 @@ _dl_lookup_address(void const *address)
+ 	fd = address;
+ 
+ 	for (rpnt = _dl_loaded_modules; rpnt; rpnt = rpnt->next) {
+-		if (!rpnt->funcdesc_ht)
+-			continue;
++		struct funcdesc_value *entry;
+ 
+ 		if (fd->got_value != rpnt->loadaddr.got_value)
+ 			continue;
+ 
+-		address = htab_find_slot(rpnt->funcdesc_ht, (void *)fd->entry_point, 0,
+-				hash_pointer, eq_pointer);
+-
+-		if (address && *(struct funcdesc_value *const*)address == fd) {
+-			address = (*(struct funcdesc_value *const*)address)->entry_point;
++		entry = rpnt->funcdesc_ht
++			? funcdesc_find(rpnt->funcdesc_ht, (void *)fd->entry_point)
++			: funcdesc_find_in_chunks(rpnt, (void *)fd->entry_point);
++		if (entry == fd) {
++			address = entry->entry_point;
+ 			break;
+ 		} else
+ 			address = fd;
+diff --git a/ldso/ldso/fdpic/dl-sysdep.h b/ldso/ldso/fdpic/dl-sysdep.h
+index 81694dc76..129c04e4a 100644
+--- a/ldso/ldso/fdpic/dl-sysdep.h
++++ b/ldso/ldso/fdpic/dl-sysdep.h
+@@ -27,9 +27,23 @@ struct funcdesc_value
+ {
+   void *entry_point;
+   void *got_value;
++  struct funcdesc_value *next_hash;
+ } __attribute__((__aligned__(8)));
+ 
+-struct funcdesc_ht;
++struct funcdesc_chunk
++{
++  struct funcdesc_chunk *next;
++  size_t used;
++  size_t capacity;
++  struct funcdesc_value entries[1];
++};
++
++struct fdpic_funcdesc_ht
++{
++  size_t size;
++  size_t n_elements;
++  struct funcdesc_value *buckets[1];
++};
+ 
+ #define DL_LOADADDR_TYPE struct elf32_fdpic_loadaddr
+ 
+@@ -55,19 +69,22 @@ struct funcdesc_ht;
+   (__dl_init_loadaddr_map (&(LOADADDR), 0, dl_boot_progmap))
+ 
+ #define DL_INIT_LOADADDR_EXTRA_DECLS \
+-  int dl_init_loadaddr_load_count;
++  int dl_init_loadaddr_load_count; \
++  struct elf32_fdpic_loadmap *dl_init_loadaddr_inline_map;
+ #define DL_INIT_LOADADDR(LOADADDR, BASEADDR, PHDR, PHDRCNT) \
+   (dl_init_loadaddr_load_count = \
+-     __dl_init_loadaddr (&(LOADADDR), (PHDR), (PHDRCNT)))
++     __dl_init_loadaddr (&(LOADADDR), dl_init_loadaddr_inline_map, \
++			 (PHDR), (PHDRCNT)))
+ #define DL_INIT_LOADADDR_HDR(LOADADDR, ADDR, PHDR) \
+   (__dl_init_loadaddr_hdr ((LOADADDR), (ADDR), (PHDR), \
+ 			   dl_init_loadaddr_load_count))
+ #define DL_UPDATE_LOADADDR_HDR(LOADADDR, ADDR, PHDR) \
+   (__dl_update_loadaddr_hdr ((LOADADDR), (ADDR), (PHDR)))
+ #define DL_LOADADDR_UNMAP(LOADADDR, LEN) \
+-  (__dl_loadaddr_unmap ((LOADADDR), (NULL)))
++  (__dl_loadaddr_unmap ((LOADADDR), (NULL), (NULL), (NULL)))
+ #define DL_LIB_UNMAP(LIB, LEN) \
+-  (__dl_loadaddr_unmap ((LIB)->loadaddr, (LIB)->funcdesc_ht))
++  (__dl_loadaddr_unmap ((LIB)->loadaddr, (LIB)->funcdesc_ht, \
++			(LIB)->funcdesc_chunks, &(LIB)->fdpic_inline_loadmap.map))
+ #define DL_LOADADDR_BASE(LOADADDR) \
+   ((LOADADDR).got_value)
+ 
+diff --git a/ldso/ldso/ldso.c b/ldso/ldso/ldso.c
+index e866d6418..7c2d82aef 100755
+--- a/ldso/ldso/ldso.c
++++ b/ldso/ldso/ldso.c
+@@ -95,6 +95,22 @@ const char *_dl_progname = UCLIBC_LDSO;      /* The name of the executable being
+  */
+ void _dl_debug_state(void);
+ rtld_hidden_proto(_dl_debug_state, noinline);
++#ifdef __FDPIC__
++void _dl_fdpic_protect_funcdescs(void)
++{
++	struct elf_resolve *tpnt;
++
++	for (tpnt = _dl_loaded_modules; tpnt; tpnt = tpnt->next) {
++		struct funcdesc_chunk *chunk;
++		for (chunk = tpnt->funcdesc_chunks; chunk; chunk = chunk->next) {
++			/* Force the chunk to appear full so future dlsym/dlopen
++			   allocations create a new chunk instead of trapping.  */
++			chunk->capacity = chunk->used;
++		}
++	}
++}
++#endif
++
+ void _dl_debug_state(void)
+ {
+ 	/* Make sure GCC doesn't recognize this function as pure, to avoid
+@@ -426,6 +442,12 @@ void *_dl_get_ready_to_run(struct elf_resolve *tpnt, DL_LOADADDR_TYPE load_addr,
+ 			  DL_GET_READY_TO_RUN_EXTRA_PARMS)
+ {
+ 	ElfW(Addr) app_mapaddr = 0, ldso_mapaddr = 0;
++#ifdef __FDPIC__
++	if (_dl_auxvt[AT_FDPIC_INTERP_MAP].a_un.a_val) {
++		load_addr.map = (struct elf32_fdpic_loadmap *)_dl_auxvt[AT_FDPIC_INTERP_MAP].a_un.a_val;
++	}
++#endif
++	tpnt->loadaddr = load_addr;
+ 	ElfW(Phdr) *ppnt;
+ 	ElfW(Dyn) *dpnt;
+ 	char *lpntstr;
+@@ -645,6 +667,12 @@ of this helper program; chances are you did not intend to run this program.\n\
+ 		unsigned int idx;
+ 		ElfW(Phdr) *phdr = (ElfW(Phdr) *) _dl_auxvt[AT_PHDR].a_un.a_val;
+ 
++#ifdef __FDPIC__
++		if (_dl_auxvt[AT_FDPIC_EXEC_MAP].a_un.a_val) {
++			app_tpnt->loadaddr.map = (struct elf32_fdpic_loadmap *)_dl_auxvt[AT_FDPIC_EXEC_MAP].a_un.a_val;
++			app_tpnt->loadaddr.got_value = (void *)dl_boot_got_pointer;
++		} else
++#endif
+ 		for (idx = 0; idx < _dl_auxvt[AT_PHNUM].a_un.a_val; idx++, phdr++)
+ 			if (phdr->p_type == PT_PHDR) {
+ 				DL_INIT_LOADADDR_PROG(app_tpnt->loadaddr, _dl_auxvt[AT_PHDR].a_un.a_val - phdr->p_vaddr);
+@@ -1341,6 +1369,9 @@ of this helper program; chances are you did not intend to run this program.\n\
+ 		if (tpnt->relro_size)
+ 			_dl_protect_relro (tpnt);
+ 	}
++#ifdef __FDPIC__
++	_dl_fdpic_protect_funcdescs();
++#endif
+ 	} /* not prelinked */
+ 
+ #if defined(USE_TLS) && USE_TLS
+diff --git a/ldso/libdl/libdl.c b/ldso/libdl/libdl.c
+index 6e50cb087..beb277290 100644
+--- a/ldso/libdl/libdl.c
++++ b/ldso/libdl/libdl.c
+@@ -550,6 +550,13 @@ static void *do_dlopen(const char *libname, int flag, ElfW(Addr) from)
+ 		for (rpnt = relro_ptr->next; rpnt; rpnt = rpnt->next) {
+ 			if (rpnt->dyn->relro_size)
+ 				_dl_protect_relro(rpnt->dyn);
++#ifdef __FDPIC__
++			{
++				struct funcdesc_chunk *chunk;
++				for (chunk = rpnt->dyn->funcdesc_chunks; chunk; chunk = chunk->next)
++					chunk->capacity = chunk->used;
++			}
++#endif
+ 		}
+ 	}
+ 	/* TODO:  Should we set the protections of all pages back to R/O now ? */
+-- 
+2.50.1 (Apple Git-155)
+
