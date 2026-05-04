@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Date: Mon, 4 May 2026 15:30:00 +0800
+Subject: [PATCH] ldso: arm fdpic xip fallback and wraparound fix
+
+Follow-up to 0021 closing three review findings:
+
+- Broaden the writable-text gate in dl-elf.c so the mprotect /
+  map_writeable fallback fires for any XIP demotion, not only DT_TEXTREL.
+  Previously a non-DT_TEXTREL XIP-incompatible object (for example,
+  p_align < DL_XIP_ALIGN, or MAP_PRIVATE fallback in
+  _dl_mmap_fdpic_segment) cleared xip_mapped_text but stayed mapped
+  read-only; the next relocation faulted because neither the XIP guard
+  (no DL_FDPIC_XIP_TEXT) nor the writable-text remap fired.
+- Replace base + p_memsz end-address arithmetic in arm/dl-sysdep.h
+  arm_fdpic_find_loadseg{,_runtime} and arm/elfinterp.c
+  arm_addr_is_readonly_load_slow / arm_abort_xip_text_reloc with
+  subtraction-based bounds (offset = addr - base; offset < p_memsz).
+  Wraparound on malformed inputs no longer misclassifies segment
+  membership and routes a write past both the XIP guard and the
+  writable-text fallback.  The last-segment one-past-end allowance is
+  preserved via a small helper.
+- Classify FDPIC objects with no executable PT_LOAD as
+  DL_FDPIC_MUTABLE_TEXT instead of leaving them unclassified, so
+  callers always observe a defined text mode.  The XIP relocation
+  guard is keyed on DL_FDPIC_XIP_TEXT and stays a no-op for these
+  objects; the change is defensive.
+- Document that DL_FDPIC_STRICT_XIP() must expand to a preprocessor
+  constant because the macro is consumed by both a runtime if and a
+  compile-time #if gate.
+---
+diff -urN uclibc-ng-1.0.57.orig/ldso/include/dl-defs.h uclibc-ng-1.0.57/ldso/include/dl-defs.h
+--- uclibc-ng-1.0.57.orig/ldso/include/dl-defs.h	2026-05-04 15:05:39.153716400 +0800
++++ uclibc-ng-1.0.57/ldso/include/dl-defs.h	2026-05-04 15:08:06.700448527 +0800
+@@ -279,7 +279,11 @@
+ #endif
+ 
+ /* Define this if an FDPIC/XIP deployment wants DT_TEXTREL objects rejected
+-   instead of silently downgraded to mutable-text handling.  */
++   instead of silently downgraded to mutable-text handling.  Must expand to
++   a preprocessor constant (0 or 1): the macro is consumed both as a runtime
++   `if (DL_FDPIC_STRICT_XIP())` check and as a `#if !DL_FDPIC_STRICT_XIP()`
++   compile-time gate around the writable-text fallback.  An architecture
++   that wants a runtime predicate has to add a separate hook.  */
+ #ifndef DL_FDPIC_STRICT_XIP
+ # ifdef __UCLIBC_FDPIC_STRICT_XIP__
+ #  define DL_FDPIC_STRICT_XIP() 1
+diff -urN uclibc-ng-1.0.57.orig/ldso/ldso/arm/dl-sysdep.h uclibc-ng-1.0.57/ldso/ldso/arm/dl-sysdep.h
+--- uclibc-ng-1.0.57.orig/ldso/ldso/arm/dl-sysdep.h	2026-05-04 15:05:39.154716405 +0800
++++ uclibc-ng-1.0.57/ldso/ldso/arm/dl-sysdep.h	2026-05-04 15:08:06.414447254 +0800
+@@ -181,6 +181,25 @@
+ }
+ 
+ #ifdef __FDPIC__
++/* Subtraction-based bounds avoid (base + p_memsz) wraparound on malformed
++   inputs.  The last-segment one-past-end allowance is preserved so that
++   _end-style symbols still resolve to the trailing PT_LOAD.  */
++static __always_inline int
++arm_fdpic_find_loadseg_at(Elf32_Addr addr, Elf32_Addr base, Elf32_Addr memsz,
++			  int idx, int nsegs)
++{
++	Elf32_Addr offset;
++
++	if (addr < base)
++		return 0;
++	offset = addr - base;
++	if (offset < memsz)
++		return 1;
++	if (offset == memsz && idx + 1 == nsegs)
++		return 1;
++	return 0;
++}
++
+ static __always_inline int
+ arm_fdpic_find_loadseg(struct elf32_fdpic_loadmap *map, Elf32_Addr addr,
+ 		       int start_seg)
+@@ -188,17 +207,17 @@
+ 	int c;
+ 
+ 	if (start_seg >= 0 && start_seg < map->nsegs &&
+-	    addr >= map->segs[start_seg].p_vaddr &&
+-	    (addr < map->segs[start_seg].p_vaddr + map->segs[start_seg].p_memsz ||
+-	     (addr == map->segs[start_seg].p_vaddr + map->segs[start_seg].p_memsz &&
+-	      start_seg + 1 == map->nsegs)))
++	    arm_fdpic_find_loadseg_at(addr,
++				      map->segs[start_seg].p_vaddr,
++				      map->segs[start_seg].p_memsz,
++				      start_seg, map->nsegs))
+ 		return start_seg;
+ 
+ 	for (c = 0; c < map->nsegs; c++) {
+-		if (addr >= map->segs[c].p_vaddr &&
+-		    (addr < map->segs[c].p_vaddr + map->segs[c].p_memsz ||
+-		     (addr == map->segs[c].p_vaddr + map->segs[c].p_memsz &&
+-		      c + 1 == map->nsegs)))
++		if (arm_fdpic_find_loadseg_at(addr,
++					      map->segs[c].p_vaddr,
++					      map->segs[c].p_memsz,
++					      c, map->nsegs))
+ 			return c;
+ 	}
+ 
+@@ -212,17 +231,17 @@
+ 	int c;
+ 
+ 	if (start_seg >= 0 && start_seg < map->nsegs &&
+-	    addr >= map->segs[start_seg].addr &&
+-	    (addr < map->segs[start_seg].addr + map->segs[start_seg].p_memsz ||
+-	     (addr == map->segs[start_seg].addr + map->segs[start_seg].p_memsz &&
+-	      start_seg + 1 == map->nsegs)))
++	    arm_fdpic_find_loadseg_at(addr,
++				      map->segs[start_seg].addr,
++				      map->segs[start_seg].p_memsz,
++				      start_seg, map->nsegs))
+ 		return start_seg;
+ 
+ 	for (c = 0; c < map->nsegs; c++) {
+-		if (addr >= map->segs[c].addr &&
+-		    (addr < map->segs[c].addr + map->segs[c].p_memsz ||
+-		     (addr == map->segs[c].addr + map->segs[c].p_memsz &&
+-		      c + 1 == map->nsegs)))
++		if (arm_fdpic_find_loadseg_at(addr,
++					      map->segs[c].addr,
++					      map->segs[c].p_memsz,
++					      c, map->nsegs))
+ 			return c;
+ 	}
+ 
+diff -urN uclibc-ng-1.0.57.orig/ldso/ldso/arm/elfinterp.c uclibc-ng-1.0.57/ldso/ldso/arm/elfinterp.c
+--- uclibc-ng-1.0.57.orig/ldso/ldso/arm/elfinterp.c	2026-05-04 15:05:39.154716405 +0800
++++ uclibc-ng-1.0.57/ldso/ldso/arm/elfinterp.c	2026-05-04 15:08:06.116445926 +0800
+@@ -95,15 +95,20 @@
+ 	int i, seg_idx = 0;
+ 
+ 	for (i = 0; i < tpnt->n_phent; i++, phdr++) {
+-		ElfW(Addr) start, end;
++		ElfW(Addr) start, memsz, offset;
+ 
+ 		if (phdr->p_type != PT_LOAD)
+ 			continue;
+ 
+ 		start = loadaddr.map->segs[seg_idx].addr;
+-		end = start + loadaddr.map->segs[seg_idx].p_memsz;
+-		if ((ElfW(Addr))addr >= start && (ElfW(Addr))addr < end)
+-			return !(phdr->p_flags & PF_W);
++		memsz = loadaddr.map->segs[seg_idx].p_memsz;
++		/* Subtraction-based bounds avoid (start + memsz) wraparound on
++		   malformed inputs that could otherwise misclassify a hit.  */
++		if ((ElfW(Addr))addr >= start) {
++			offset = (ElfW(Addr))addr - start;
++			if (offset < memsz)
++				return !(phdr->p_flags & PF_W);
++		}
+ 
+ 		seg_idx++;
+ 	}
+@@ -127,9 +132,13 @@
+ 
+ 		for (seg_idx = 0; seg_idx < map->nsegs; seg_idx++) {
+ 			ElfW(Addr) start = map->segs[seg_idx].addr;
+-			ElfW(Addr) end = start + map->segs[seg_idx].p_memsz;
++			ElfW(Addr) memsz = map->segs[seg_idx].p_memsz;
++			ElfW(Addr) offset;
+ 
+-			if ((ElfW(Addr))reloc_addr < start || (ElfW(Addr))reloc_addr >= end)
++			if ((ElfW(Addr))reloc_addr < start)
++				continue;
++			offset = (ElfW(Addr))reloc_addr - start;
++			if (offset >= memsz)
+ 				continue;
+ 			if (!(tpnt->fdpic_ro_loadseg_mask & (1UL << seg_idx)))
+ 				return;
+diff -urN uclibc-ng-1.0.57.orig/ldso/ldso/dl-elf.c uclibc-ng-1.0.57/ldso/ldso/dl-elf.c
+--- uclibc-ng-1.0.57.orig/ldso/ldso/dl-elf.c	2026-05-04 15:05:39.160716438 +0800
++++ uclibc-ng-1.0.57/ldso/ldso/dl-elf.c	2026-05-04 15:08:05.818444596 +0800
+@@ -557,12 +557,13 @@
+ fdpic_determine_xip_status(struct elf_resolve *tpnt, int exec_load_seen,
+ 			   int xip_mapped_text)
+ {
+-	if (exec_load_seen) {
+-		if (xip_mapped_text)
+-			tpnt->rtld_flags |= DL_FDPIC_XIP_TEXT;
+-		else
+-			tpnt->rtld_flags |= DL_FDPIC_MUTABLE_TEXT;
+-	}
++	/* No executable PT_LOAD: classify as mutable so that callers never
++	   observe an unclassified text mode.  No text relocation guard fires
++	   since DL_FDPIC_XIP_TEXT remains clear.  */
++	if (exec_load_seen && xip_mapped_text)
++		tpnt->rtld_flags |= DL_FDPIC_XIP_TEXT;
++	else
++		tpnt->rtld_flags |= DL_FDPIC_MUTABLE_TEXT;
+ }
+ 
+ static __always_inline void
+@@ -959,7 +960,16 @@
+ 	   back again later. */
+ 
+ #if !DL_FDPIC_STRICT_XIP()
++#ifdef __FDPIC__
++	/* Broaden the writable-text gate so any XIP demotion (DT_TEXTREL or
++	   p_align/non-shareable mapping that cleared xip_mapped_text) walks the
++	   PF_X-without-PF_W segments and re-maps them writable before
++	   relocations run.  Otherwise a non-DT_TEXTREL XIP-incompatible object
++	   would relocate against a read-only mapping and fault.  */
++	if (dynamic_info[DT_TEXTREL] || (exec_load_seen && !xip_mapped_text)) {
++#else
+ 	if (dynamic_info[DT_TEXTREL]) {
++#endif
+ #ifndef __FORCE_SHAREABLE_TEXT_SEGMENTS__
+ 		ppnt = (ElfW(Phdr) *)(intptr_t) & header[epnt->e_phoff];
+ 		for (i = 0; i < epnt->e_phnum; i++, ppnt++) {

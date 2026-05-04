@@ -433,6 +433,14 @@ build_uClibc() {
     cp configs/uClibc-ng-${UCLIBC_NG_VERSION}-${FLAVOR}.config uClibc-ng-${UCLIBC_NG_VERSION}/.config
     cd uClibc-ng-${UCLIBC_NG_VERSION}
 
+    # FDPIC ldso refresh: descriptor allocator, eager binding, XIP policy
+    # plus 0022 follow-up that broadens the writable-text gate and
+    # replaces additive end-address checks with subtraction-based bounds.
+    for p in ../patches/0021-ldso-arm-fdpic-*.patch ../patches/0022-ldso-arm-fdpic-*.patch; do
+        [ -f "${p}" ] || continue
+        apply_patch_once "${p}"
+    done
+
     TOOLCHAIN_ESCAPED=$(echo ${TOOLCHAIN}/${TARGET} | sed 's/\//\\\//g')
     sed -i "s/^KERNEL_HEADERS=.*\$/KERNEL_HEADERS=\"${TOOLCHAIN_ESCAPED}\/include\"/" .config
     # Use a target-relative runtime prefix so PT_INTERP inside built ELFs
