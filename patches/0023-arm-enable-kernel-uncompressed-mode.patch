@@ -1,0 +1,26 @@
+From: Jim Huang <jserv@ccns.ncku.edu.tw>
+Subject: [PATCH] arm: expose uncompressed kernel image mode
+
+The current boot flow consumes arch/arm/boot/Image directly through the
+bootwrapper rather than the zImage self-decompressor. Future XIP work has
+the same requirement: kernel text must remain plaintext.
+
+ARM already wires the compressed image choices in init/Kconfig, but it does
+not select HAVE_KERNEL_UNCOMPRESSED, so CONFIG_KERNEL_UNCOMPRESSED is never
+offered and olddefconfig falls back to CONFIG_KERNEL_GZIP=y.
+
+Expose the uncompressed choice on ARM so build.sh can pin
+CONFIG_KERNEL_UNCOMPRESSED=y and keep the kernel image mode aligned with the
+actual boot path.
+
+diff -urN a/arch/arm/Kconfig b/arch/arm/Kconfig
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -117,6 +117,7 @@
+ 	select HAVE_KERNEL_GZIP
+ 	select HAVE_KERNEL_LZ4
+ 	select HAVE_KERNEL_LZMA
++	select HAVE_KERNEL_UNCOMPRESSED
+ 	select HAVE_KERNEL_LZO
+ 	select HAVE_KERNEL_XZ
+ 	select HAVE_KPROBES if !XIP_KERNEL && !CPU_ENDIAN_BE32 && !CPU_V7M

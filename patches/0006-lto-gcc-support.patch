@@ -1,8 +1,10 @@
 From: Jim Huang <jserv@ccns.ncku.edu.tw>
-Subject: [PATCH] arm: add GCC Link Time Optimization (LTO) support
+Subject: [PATCH] arm: add GCC/LLVM Link Time Optimization support
 
-Add CONFIG_LTO_GCC to enable GCC link-time optimization for ARM.
-The implementation routes the final link through a gcc-ld wrapper so
+Add CONFIG_LTO_GCC to enable GCC link-time optimization for ARM, and
+wire up the remaining ARM-side pieces needed to let Linux 7.0's
+existing Clang/ThinLTO machinery work on this Thumb-2 nommu target.
+The GCC implementation routes the final link through a gcc-ld wrapper so
 GCC can perform whole-program optimization across translation units,
 then emit native code in a single LTO pass.
 
@@ -67,7 +69,8 @@ Six ARM/Thumb-2-specific issues required workarounds:
 
 Additional infrastructure ported from the linux-lto project:
 
-- scripts/Makefile.lto: -flto, DISABLE_LTO_GCC, gcc-ar/gcc-nm,
+- scripts/Makefile.lto: -flto, DISABLE_LTO, DISABLE_LTO_GCC,
+  gcc-ar/gcc-nm,
   LDFINAL via gcc-ld wrapper, TMPDIR override
 - scripts/gcc-ld: translates ld command-line to gcc invocation
 - LDFINAL plumbing in Makefile.vmlinux_o, Makefile.vmlinux,
@@ -88,6 +91,23 @@ Additional infrastructure ported from the linux-lto project:
 - delay-objtool keyed on CONFIG_LTO (covers both Clang and GCC)
 - cond_syscall / SYSCALL_ALIAS compat_## aliases for LTO linking
 
+Additional ARM/LLVM support:
+
+- arch/arm now selects ARCH_SUPPORTS_LTO_CLANG and
+  ARCH_SUPPORTS_LTO_CLANG_THIN on little-endian builds, so the generic
+  LTO_CLANG_{FULL,THIN} Kconfig options become reachable.
+- arch/arm/Makefile forwards -plugin-opt=-arm-implicit-it=always under
+  CONFIG_LTO_CLANG+CONFIG_THUMB2_KERNEL so the ThinLTO backend accepts
+  the same implicit-IT inline asm sequences that compile-time Clang
+  already handles via -Wa,-mimplicit-it=always.
+- scripts/Makefile.lto now exports a generic DISABLE_LTO helper for
+  both GCC and Clang LTO modes, allowing standalone/metadata targets to
+  opt out without build.sh-level flag injections.
+
+Clang ThinLTO on this tree remains an experiment and does not improve
+size today, but the ARM support belongs in-tree in the patch rather than
+in build.sh.
+
 diff -urN a/arch/arm/boot/compressed/Makefile b/arch/arm/boot/compressed/Makefile
 --- a/arch/arm/boot/compressed/Makefile
 +++ b/arch/arm/boot/compressed/Makefile
@@ -96,7 +116,7 @@ diff -urN a/arch/arm/boot/compressed/Makefile b/arch/arm/boot/compressed/Makefil
  endif
 
 +# The decompressor runs standalone before the kernel; must not use LTO.
-+KBUILD_CFLAGS += $(DISABLE_LTO_GCC)
++KBUILD_CFLAGS += $(DISABLE_LTO)
 +
  #
  # Architecture dependencies
@@ -122,14 +142,31 @@ diff -urN a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
 diff -urN a/arch/arm/Kconfig b/arch/arm/Kconfig
 --- a/arch/arm/Kconfig
 +++ b/arch/arm/Kconfig
-@@ -3,6 +3,7 @@
+@@ -3,6 +3,9 @@
  	bool
  	default y
  	select ARCH_32BIT_OFF_T
 +	select ARCH_SUPPORTS_LTO_GCC if LD_IS_BFD
++	select ARCH_SUPPORTS_LTO_CLANG if !CPU_ENDIAN_BE32
++	select ARCH_SUPPORTS_LTO_CLANG_THIN if !CPU_ENDIAN_BE32
  	select ARCH_CORRECT_STACKTRACE_ON_KRETPROBE if HAVE_KRETPROBES && FRAME_POINTER && !ARM_UNWIND
  	select ARCH_HAS_BINFMT_FLAT
  	select ARCH_HAS_CACHE_LINE_SIZE if OF
+diff -urN a/arch/arm/Makefile b/arch/arm/Makefile
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -146,6 +146,11 @@
+ else
+ CFLAGS_ISA	:=$(call cc-option,-marm,) $(AFLAGS_NOWARN)
+ AFLAGS_ISA	:=$(CFLAGS_ISA)
++endif
++
++ifeq ($(CONFIG_LTO_CLANG)$(CONFIG_THUMB2_KERNEL),yy)
++# ThinLTO re-parses inline asm during link-time code generation.
++KBUILD_LDFLAGS	+= -plugin-opt=-arm-implicit-it=always
+ endif
+ 
+ # Need -Uarm for gcc < 3.x
 diff -urN a/arch/arm/mm/Makefile b/arch/arm/mm/Makefile
 --- a/arch/arm/mm/Makefile
 +++ b/arch/arm/mm/Makefile
@@ -263,7 +300,7 @@ diff -urN a/init/Makefile b/init/Makefile
 
  $(obj)/version-timestamp.o: include/generated/utsversion.h
  CFLAGS_version-timestamp.o := -include include/generated/utsversion.h
-+CFLAGS_version-timestamp.o += $(DISABLE_LTO_GCC)
++CFLAGS_version-timestamp.o += $(DISABLE_LTO)
 diff -urN a/Kbuild b/Kbuild
 --- a/Kbuild
 +++ b/Kbuild
@@ -271,7 +308,7 @@ diff -urN a/Kbuild b/Kbuild
  bounds-file := include/generated/bounds.h
 
  targets := kernel/bounds.s
-+CFLAGS_bounds.s += $(DISABLE_LTO_GCC)
++CFLAGS_bounds.s += $(DISABLE_LTO)
 
  $(bounds-file): kernel/bounds.s FORCE
  	$(call filechk,offsets,__LINUX_BOUNDS_H__)
@@ -370,7 +407,7 @@ diff -urN a/Makefile b/Makefile
  include-$(CONFIG_PROPELLER_CLANG)	+= scripts/Makefile.propeller
  include-$(CONFIG_WARN_CONTEXT_ANALYSIS) += scripts/Makefile.context-analysis
  include-$(CONFIG_GCC_PLUGINS)	+= scripts/Makefile.gcc-plugins
-+include-$(CONFIG_LTO_GCC)	+= scripts/Makefile.lto
++include-$(CONFIG_LTO)		+= scripts/Makefile.lto
 
  include $(addprefix $(srctree)/, $(include-y))
 
@@ -448,7 +485,7 @@ diff -urN a/scripts/bloat-o-meter b/scripts/bloat-o-meter
 diff -urN a/scripts/gcc-ld b/scripts/gcc-ld
 --- a/scripts/gcc-ld
 +++ b/scripts/gcc-ld
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,41 @@
 +#!/bin/sh
 +# SPDX-License-Identifier: GPL-2.0
 +# run gcc with ld options
@@ -466,6 +503,7 @@ diff -urN a/scripts/gcc-ld b/scripts/gcc-ld
 +while [ "$1" != "" ] ; do
 +	case "$1" in
 +	-save-temps*|-m32|-m64) N="$1" ;;
++	--param=*) N="$1" ;;
 +	-r) N="$1" ;;
 +	-flinker-output*) N="$1" ;;
 +	-[Wg]*) N="$1" ;;
@@ -536,17 +574,25 @@ diff -urN a/scripts/Makefile.lib b/scripts/Makefile.lib
 diff -urN a/scripts/Makefile.lto b/scripts/Makefile.lto
 --- a/scripts/Makefile.lto
 +++ b/scripts/Makefile.lto
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,67 @@
 +#
-+# Support for gcc link time optimization
++# Support for link time optimization
 +#
 +
++DISABLE_LTO :=
 +DISABLE_LTO_GCC :=
-+export DISABLE_LTO_GCC
++DISABLE_LTO_CLANG :=
++export DISABLE_LTO DISABLE_LTO_GCC DISABLE_LTO_CLANG
++
++ifdef CONFIG_LTO_CLANG
++	DISABLE_LTO := -fno-lto
++	DISABLE_LTO_CLANG := -fno-lto
++endif
 +
 +ifdef CONFIG_LTO_GCC
 +	CC_FLAGS_LTO_GCC := -flto
 +	DISABLE_LTO_GCC := -fno-lto
++	DISABLE_LTO := -fno-lto
 +
 +	KBUILD_CFLAGS += ${CC_FLAGS_LTO_GCC}
 +	# GCC LTO disambiguates statics as "file.c.HASH"; the dots
@@ -596,6 +642,7 @@ diff -urN a/scripts/Makefile.lto b/scripts/Makefile.lto
 +	AR = $(CROSS_COMPILE)gcc-ar
 +	NM = $(CROSS_COMPILE)gcc-nm
 +endif # CONFIG_LTO_GCC
+
 diff -urN a/scripts/Makefile.modfinal b/scripts/Makefile.modfinal
 --- a/scripts/Makefile.modfinal
 +++ b/scripts/Makefile.modfinal
@@ -619,7 +666,7 @@ diff -urN a/scripts/Makefile.vmlinux b/scripts/Makefile.vmlinux
 +	$< "$(LD)" "$(KBUILD_LDFLAGS)" "$(LDFLAGS_vmlinux)" "$@" "$(LDFINAL)";	\
  	$(if $(ARCH_POSTLINK), $(MAKE) -f $(ARCH_POSTLINK) $@, true)
 
-+CFLAGS_.vmlinux.export.o += $(DISABLE_LTO_GCC)
++CFLAGS_.vmlinux.export.o += $(DISABLE_LTO)
 +
  targets += vmlinux.unstripped .vmlinux.export.o
  vmlinux.unstripped: scripts/link-vmlinux.sh vmlinux.o .vmlinux.export.o $(KBUILD_LDS) FORCE
@@ -660,7 +707,7 @@ diff -urN a/scripts/mod/Makefile b/scripts/mod/Makefile
 @@ -1,5 +1,6 @@
  # SPDX-License-Identifier: GPL-2.0
  CFLAGS_REMOVE_empty.o += $(CC_FLAGS_LTO)
-+CFLAGS_empty.o += $(DISABLE_LTO_GCC)
++CFLAGS_empty.o += $(DISABLE_LTO)
 
  hostprogs-always-y	+= modpost mk_elfconfig
  always-y		+= empty.o
@@ -668,7 +715,6 @@ diff -urN a/scripts/mod/Makefile b/scripts/mod/Makefile
  	$(call filechk,offsets,__DEVICETABLE_OFFSETS_H__)
 
  targets += $(devicetable-offsets-file) devicetable-offsets.s
-+CFLAGS_devicetable-offsets.s += $(DISABLE_LTO_GCC)
++CFLAGS_devicetable-offsets.s += $(DISABLE_LTO)
 
  # dependencies on generated files need to be listed explicitly
-
