@@ -16,7 +16,7 @@ TARGET=arm-uclinuxfdpiceabi
 FLAVOR=cortexm-fdpic
 
 BINUTILS_VERSION=2.46.0
-GCC_VERSION=15.2.0
+GCC_VERSION=16.1.0
 UCLIBC_NG_VERSION=1.0.57
 BUSYBOX_VERSION=1.37.0
 LINUX_VERSION=7.0
@@ -42,10 +42,9 @@ LOGDIR=${ROOTDIR}/logs
 STATE_DIR=${ROOTDIR}/.build-state
 QUIET=${QUIET:-0}
 LOG_TAIL_LINES=${LOG_TAIL_LINES:-200}
-KERNEL_EXPERIMENT=${KERNEL_EXPERIMENT:-none}
-KERNEL_ORDER_FILE=${KERNEL_ORDER_FILE:-}
 KERNEL_SYSCALL_TABLE=${KERNEL_SYSCALL_TABLE:-}
 KERNEL_CONFIG_FRAGMENT=${KERNEL_CONFIG_FRAGMENT:-}
+KERNEL_LTO_MODE=${KERNEL_LTO_MODE:-none}
 # DWARF policy. The default ('none') matches the production image:
 # CONFIG_DEBUG_INFO_NONE=y, addr2line cannot resolve any symbol, and
 # scripts/subsystem-rollup.py exits with the documented "DWARF
@@ -57,6 +56,11 @@ KERNEL_DEBUG_INFO=${KERNEL_DEBUG_INFO:-none}
 KERNEL_REPORT_DIR=${KERNEL_REPORT_DIR:-${ROOTDIR}/profiles/kernel-pgo}
 PGO_WORKLOAD_FILE=${PGO_WORKLOAD_FILE:-${ROOTDIR}/configs/pgo-workload.txt}
 PGO_BASE_CONFIG_FRAGMENT=${PGO_BASE_CONFIG_FRAGMENT:-${ROOTDIR}/configs/kernel-pgo-prune.config}
+# Extra GCC-kernel-LTO link flags for controlled experiments. The local
+# CONFIG_LTO_GCC patch forwards this variable only at final link time.
+# Keep the default empty; production defaults to no kernel LTO because
+# the current pruned image is smaller without it.
+KERNEL_LTO_EXTRA_CFLAGS=${KERNEL_LTO_EXTRA_CFLAGS:-}
 
 NCPU=$(grep -c processor /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 MAKE_JOBS=${MAKE_JOBS:-${NCPU}}
@@ -69,7 +73,7 @@ mkdir -p "${LOGDIR}" "${STATE_DIR}"
 # Update these when bumping component versions.
 # To populate missing checksums: sha256sum downloads/*
 CHECKSUM_binutils="binutils-${BINUTILS_VERSION}.tar.xz=d75a94f4d73e7a4086f7513e67e439e8fcdcbb726ffe63f4661744e6256b2cf2"
-CHECKSUM_gcc="gcc-${GCC_VERSION}.tar.xz=438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
+CHECKSUM_gcc="gcc-${GCC_VERSION}.tar.xz=50efb4d94c3397aff3b0d61a5abd748b4dd31d9d3f2ab7be05b171d36a510f79"
 CHECKSUM_uclibc="v${UCLIBC_NG_VERSION}.tar.gz=f49704e0affc75fde9ee4e870c20e53c1d807eca2a4683377b359b8361e84312"
 CHECKSUM_busybox="busybox-${BUSYBOX_VERSION}.tar.bz2=3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
 CHECKSUM_linux="linux-${LINUX_VERSION}.tar.xz=bb7f6d80b387c757b7d14bb93028fcb90f793c5c0d367736ee815a100b3891f0"
@@ -85,14 +89,11 @@ toolchain_fingerprint() {
 image_fingerprint() {
     {
         printf '%s\n' "$1"
-        printf 'KERNEL_EXPERIMENT=%s\n' "${KERNEL_EXPERIMENT}"
-        printf 'KERNEL_ORDER_FILE=%s\n' "${KERNEL_ORDER_FILE}"
+        printf 'KERNEL_LTO_MODE=%s\n' "${KERNEL_LTO_MODE}"
+        printf 'KERNEL_LTO_EXTRA_CFLAGS=%s\n' "${KERNEL_LTO_EXTRA_CFLAGS}"
         printf 'KERNEL_SYSCALL_TABLE=%s\n' "${KERNEL_SYSCALL_TABLE}"
         printf 'KERNEL_CONFIG_FRAGMENT=%s\n' "${KERNEL_CONFIG_FRAGMENT}"
         printf 'KERNEL_DEBUG_INFO=%s\n' "${KERNEL_DEBUG_INFO}"
-        if [ -n "${KERNEL_ORDER_FILE}" ] && [ -f "${KERNEL_ORDER_FILE}" ]; then
-            sha256sum "${KERNEL_ORDER_FILE}"
-        fi
         if [ -n "${KERNEL_SYSCALL_TABLE}" ] && [ -f "${KERNEL_SYSCALL_TABLE}" ]; then
             sha256sum "${KERNEL_SYSCALL_TABLE}"
         fi
@@ -226,6 +227,11 @@ stage_verify_kernel_syscall_prune_cycle() {
         [ -f "${ROOTDIR}/bootwrapper/linux.axf" ]
 }
 
+stage_verify_kernel_lto_sweep() {
+    [ -f "${KERNEL_REPORT_DIR}/lto-sweep/final/summary.txt" ] &&
+        [ -f "${KERNEL_REPORT_DIR}/lto-sweep/final/candidate-matrix.txt" ]
+}
+
 stage_is_current() {
     STAGE=$1
     VERIFY_FUNC=stage_verify_${STAGE}
@@ -252,6 +258,7 @@ stage_clean() {
     bootwrapper)    rm -rf bootwrapper ;;
     kernel_pgo_cycle) rm -rf "${KERNEL_REPORT_DIR}/cycle" ;;
     kernel_syscall_prune_cycle) rm -rf "${KERNEL_REPORT_DIR}/syscall-prune-cycle" ;;
+    kernel_lto_sweep) rm -rf "${KERNEL_REPORT_DIR}/lto-sweep" ;;
     esac
 }
 
@@ -647,28 +654,8 @@ build_finalize_rootfs() {
 }
 
 kernel_make() {
-    if [ "${KERNEL_EXPERIMENT}" = "llvm-order-use" ]; then
-        if [ -n "${KERNEL_KBUILD_LDFLAGS:-}" ]; then
-            make ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
-                LLVM=1 LLVM_IAS=0 \
-                HOSTCC=clang HOSTCXX=clang++ \
-                CC=clang LD=ld.lld \
-                "KCFLAGS=${KERNEL_KCFLAGS:-}" \
-                "KBUILD_LDFLAGS+=${KERNEL_KBUILD_LDFLAGS}" \
-                "$@"
-            return
-        fi
-
-        make ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
-            LLVM=1 LLVM_IAS=0 \
-            HOSTCC=clang HOSTCXX=clang++ \
-            CC=clang LD=ld.lld \
-            "KCFLAGS=${KERNEL_KCFLAGS:-}" \
-            "$@"
-        return
-    fi
-
     make ARCH=${CPU} CROSS_COMPILE=${TARGET}- \
+        "LTO_EXTRA_CFLAGS=${KERNEL_LTO_EXTRA_CFLAGS:-}" \
         "KCFLAGS=${KERNEL_KCFLAGS:-}" \
         "$@"
 }
@@ -681,42 +668,19 @@ build_linux() {
     cd linux-${LINUX_VERSION}
 
     # Apply linux-tiny patches for reduced memory footprint and LTO support
-    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch ../patches/0012-*.patch ../patches/0013-*.patch ../patches/0014-*.patch ../patches/0015-*.patch ../patches/0016-*.patch ../patches/0017-*.patch ../patches/0018-*.patch ../patches/0019-*.patch ../patches/0020-*.patch; do
+    for p in ../patches/0002-*.patch ../patches/0003-*.patch ../patches/0004-*.patch ../patches/0005-*.patch ../patches/0006-*.patch ../patches/0010-*.patch ../patches/0011-*.patch ../patches/0012-*.patch ../patches/0013-*.patch ../patches/0014-*.patch ../patches/0015-*.patch ../patches/0016-*.patch ../patches/0017-*.patch ../patches/0018-*.patch ../patches/0019-*.patch ../patches/0020-*.patch ../patches/0023-*.patch; do
         [ -f "${p}" ] || continue
         apply_patch_once "${p}"
     done
 
     KERNEL_KCFLAGS=
-    KERNEL_KBUILD_LDFLAGS=
-
-    case "${KERNEL_EXPERIMENT}" in
-    none)
-        ;;
-    llvm-order-use)
-        if [ -z "${KERNEL_ORDER_FILE}" ]; then
-            echo "ERROR: KERNEL_ORDER_FILE is required when KERNEL_EXPERIMENT=llvm-order-use"
-            exit 1
-        fi
-        if [ ! -f "${KERNEL_ORDER_FILE}" ]; then
-            echo "ERROR: missing kernel order file: ${KERNEL_ORDER_FILE}"
-            exit 1
-        fi
-        KERNEL_KCFLAGS="-ffunction-sections -gmlt"
-        KERNEL_KBUILD_LDFLAGS="--symbol-ordering-file=${KERNEL_ORDER_FILE} --no-warn-symbol-ordering"
-        ;;
-    *)
-        echo "ERROR: unsupported KERNEL_EXPERIMENT='${KERNEL_EXPERIMENT}'"
-        echo "Supported values: none, llvm-order-use"
-        exit 1
-        ;;
-    esac
 
     if [ -n "${KERNEL_SYSCALL_TABLE}" ]; then
         if [ ! -f "${KERNEL_SYSCALL_TABLE}" ]; then
             echo "ERROR: missing kernel syscall table override: ${KERNEL_SYSCALL_TABLE}"
             exit 1
         fi
-        cp "${KERNEL_SYSCALL_TABLE}" arch/arm/tools/syscall.tbl
+        cp -- "${KERNEL_SYSCALL_TABLE}" arch/arm/tools/syscall.tbl
     fi
 
     run_logged "mps2_defconfig" kernel_make mps2_defconfig
@@ -725,6 +689,13 @@ build_linux() {
     sed -i "/CONFIG_INITRAMFS_SOURCE=/d" .config
     echo "CONFIG_INITRAMFS_SOURCE=\"${ROOTFS} ${ROOTDIR}/configs/rootfs.dev\"" >>.config
     echo "CONFIG_INITRAMFS_COMPRESSION_GZIP=y" >>.config
+    # Keep the kernel image itself uncompressed. The boot flow consumes the
+    # raw arch/arm/boot/Image via bootwrapper; the zImage self-decompressor
+    # in arch/arm/boot/compressed/ is not part of that path. This also lines
+    # up with future XIP work, where the kernel text must stay plaintext.
+    sed -i '/^CONFIG_KERNEL_/d' .config
+    sed -i '/^# CONFIG_KERNEL_.* is not set/d' .config
+    echo "CONFIG_KERNEL_UNCOMPRESSED=y" >>.config
     # NOTE: LZ4 and ZSTD have been evaluated on this 16 MiB SSRAM target
     # and both panic during initramfs unpack. lib/decompress_unlz4.c
     # hardcodes an 8 MiB output buffer (LZ4_DEFAULT_UNCOMPRESSED_CHUNK_SIZE)
@@ -741,7 +712,7 @@ build_linux() {
     # blocks (95k TB hits) -- the cost is real but the alternatives are
     # unbootable as wired today.
     if [ -n "${KERNEL_CONFIG_FRAGMENT}" ] && [ -f "${KERNEL_CONFIG_FRAGMENT}" ]; then
-        cat "${KERNEL_CONFIG_FRAGMENT}" >>.config
+        cat -- "${KERNEL_CONFIG_FRAGMENT}" >>.config
     fi
 
     # This board has no NIC and no remaining userspace networking needs.
@@ -758,12 +729,29 @@ build_linux() {
     echo "# CONFIG_BINFMT_SCRIPT is not set" >>.config
     echo "# CONFIG_COREDUMP is not set" >>.config
 
-    if [ "${KERNEL_EXPERIMENT}" = "none" ]; then
-        # Enable GCC LTO for whole-kernel optimization in the default build.
+    case "${KERNEL_LTO_MODE}" in
+    none)
+        # Production size baseline: the current pruned Cortex-M image is
+        # materially smaller without GCC whole-kernel LTO.
+        echo "CONFIG_LTO_NONE=y" >>.config
+        ;;
+    gcc)
+        # GCC LTO remains available for explicit experiments even though it
+        # regresses the current shipped image size. GCC 16.1 added
+        # -flto-toplevel-asm-heuristics, but this tree already carries
+        # explicit top-level-asm/linkage fixes in patch 0006; leave any
+        # heuristic tuning to KERNEL_LTO_EXTRA_CFLAGS opt-in runs.
         echo "CONFIG_LTO_GCC=y" >>.config
-    fi
-    # Disable KALLSYMS -- incompatible with LTO symbol mangling
-    # and unnecessary for this minimal target
+        ;;
+    *)
+        echo "ERROR: KERNEL_LTO_MODE must be 'none' or 'gcc' (got '${KERNEL_LTO_MODE}')"
+        exit 1
+        ;;
+    esac
+
+    # Disable KALLSYMS -- unnecessary for this minimal target, and also
+    # required when GCC LTO is selected because symbol mangling prevents
+    # kallsyms convergence on this tree.
     echo "# CONFIG_KALLSYMS is not set" >>.config
 
     # Dead code/data elimination: adds -ffunction-sections -fdata-sections
@@ -1001,6 +989,12 @@ build_linux() {
     # ITIMER_PROF / ITIMER_VIRTUAL become silent no-ops.
     echo "# CONFIG_POSIX_CPU_TIMERS is not set" >>.config
 
+    # Existing Kconfig follow-up from TODO.md: periodic ticks are cheaper
+    # than the nohz idle state machine on this target, and QEMU has no power
+    # story to protect. With the tiny scheduler and GCC LTO, this removes
+    # idle tick suppression paths that otherwise stay resident.
+    echo "# CONFIG_NO_HZ_IDLE is not set" >>.config
+
     # Patch 0018 introduces CONFIG_SCHED_PELT_RT_MINI (default n; set y).
     # Stubs CFS-side (__update_load_avg_blocked_se / _se / _cfs_rq) and
     # DL-side (update_dl_rq_load_avg) PELT entry points to return 0;
@@ -1099,11 +1093,43 @@ build_linux() {
         "CONFIG_SCHED_TOPOLOGY_MINIMAL=y" \
         "CONFIG_SCHED_NO_RICH_API=y" \
         "# CONFIG_POSIX_CPU_TIMERS is not set" \
+        "# CONFIG_NO_HZ_IDLE is not set" \
         "CONFIG_SCHED_PELT_RT_MINI=y" \
         "CONFIG_SCHED_RT_TINY=y" \
         "CONFIG_TIME_NO_SET_WALLCLOCK=y"; do
         if ! grep -q "^${opt}\$" .config; then
             echo "ERROR: expected '${opt}' in .config after olddefconfig"
+            exit 1
+        fi
+    done
+
+    case "${KERNEL_LTO_MODE}" in
+    none)
+        if ! grep -q "^CONFIG_LTO_NONE=y$" .config; then
+            echo "ERROR: expected 'CONFIG_LTO_NONE=y' in .config (KERNEL_LTO_MODE=none)"
+            exit 1
+        fi
+        if grep -q "^CONFIG_LTO_GCC=y$" .config; then
+            echo "ERROR: CONFIG_LTO_GCC=y survived olddefconfig despite KERNEL_LTO_MODE=none"
+            exit 1
+        fi
+        ;;
+    gcc)
+        if ! grep -q "^CONFIG_LTO_GCC=y$" .config; then
+            echo "ERROR: expected 'CONFIG_LTO_GCC=y' in .config (KERNEL_LTO_MODE=gcc)"
+            exit 1
+        fi
+        ;;
+    esac
+
+    if ! grep -q "^CONFIG_KERNEL_UNCOMPRESSED=y$" .config; then
+        echo "ERROR: expected 'CONFIG_KERNEL_UNCOMPRESSED=y' in .config"
+        exit 1
+    fi
+    for sym in KERNEL_GZIP KERNEL_BZIP2 KERNEL_LZMA KERNEL_XZ \
+               KERNEL_LZO KERNEL_LZ4 KERNEL_ZSTD; do
+        if grep -q "^CONFIG_${sym}=y$" .config; then
+            echo "ERROR: CONFIG_${sym}=y survived olddefconfig (kernel image must stay uncompressed)"
             exit 1
         fi
     done
@@ -1186,14 +1212,14 @@ build_linux() {
         fi
     done
 
-    if [ "${KERNEL_EXPERIMENT}" = "llvm-order-use" ]; then
-        run_logged "build" kernel_make -j${MAKE_JOBS} KALLSYMS_EXTRA_PASS=1
-    else
-        KERNEL_KCFLAGS="-mno-fdpic ${KERNEL_KCFLAGS}"
-        run_logged "build" kernel_make -j${MAKE_JOBS} KAFLAGS=-mno-fdpic KALLSYMS_EXTRA_PASS=1
-    fi
+    KERNEL_KCFLAGS="-mno-fdpic ${KERNEL_KCFLAGS}"
+    # Build only the artifacts this repo actually consumes. The
+    # bootwrapper stages arch/arm/boot/Image directly; zImage and the
+    # compressed self-decompressor are outside the boot path and do not
+    # work with CONFIG_KERNEL_UNCOMPRESSED.
+    run_logged "build" kernel_make -j${MAKE_JOBS} KAFLAGS=-mno-fdpic KALLSYMS_EXTRA_PASS=1 vmlinux Image
 
-    REPORT_SUBDIR=${KERNEL_REPORT_DIR}/${KERNEL_EXPERIMENT}
+    REPORT_SUBDIR=${KERNEL_REPORT_DIR}/none
     mkdir -p "${REPORT_SUBDIR}"
     run_logged "kernel size report" "${ROOTDIR}/scripts/kernel-size-report.sh" \
         "${ROOTDIR}" "${ROOTDIR}/linux-${LINUX_VERSION}" "${ROOTDIR}/bootwrapper" "${REPORT_SUBDIR}"
@@ -1219,6 +1245,24 @@ restore_kernel_artifacts() {
     cp "${SNAPDIR}/kernel.config" "linux-${LINUX_VERSION}/.config"
     cp "${SNAPDIR}/Image" "linux-${LINUX_VERSION}/arch/arm/boot/Image"
     cp "${SNAPDIR}/linux.axf" "bootwrapper/linux.axf"
+}
+
+snapshot_linux_artifacts() {
+    SNAPDIR=$1
+
+    mkdir -p "${SNAPDIR}"
+    cp "linux-${LINUX_VERSION}/vmlinux" "${SNAPDIR}/vmlinux"
+    cp "linux-${LINUX_VERSION}/System.map" "${SNAPDIR}/System.map"
+    cp "linux-${LINUX_VERSION}/.config" "${SNAPDIR}/kernel.config"
+    cp "linux-${LINUX_VERSION}/arch/arm/boot/Image" "${SNAPDIR}/Image"
+}
+
+linux_image_size() {
+    wc -c <"${ROOTDIR}/linux-${LINUX_VERSION}/arch/arm/boot/Image" | tr -d ' '
+}
+
+linux_vmlinux_size() {
+    wc -c <"${ROOTDIR}/linux-${LINUX_VERSION}/vmlinux" | tr -d ' '
 }
 
 linux_axf_size() {
@@ -1285,6 +1329,17 @@ read_boot_metric() {
         echo "${VALUE}"
         ;;
     esac
+}
+
+read_metric_value() {
+    METRICS_FILE=$1
+    METRIC_NAME=$2
+
+    if [ ! -f "${METRICS_FILE}" ]; then
+        return
+    fi
+
+    sed -n "s/^${METRIC_NAME}=//p" "${METRICS_FILE}" | tail -n 1
 }
 
 boot_not_regressed() {
@@ -1408,18 +1463,8 @@ write_final_summary() {
     SELECTED_SIZE=$6
     BASELINE_BOOT_MS=$7
     SELECTED_BOOT_MS=$8
-    LAYOUT_DECISION_FILE=$9
-    BASELINE_KERNEL_DIR=${10}
-    BEST_ORDER_NAME=${11}
-    BEST_ORDER_SIZE=${12}
-    BEST_ORDER_BOOT_MS=${13}
-    BEST_ORDER_FILE=${14}
-    BEST_ORDER_SIZE_DELTA=${15}
-    BEST_ORDER_BOOT_DELTA=${16}
-    BEST_ORDER_RESIDENT_DELTA=${17}
-    BEST_ORDER_INIT_BYTES=${18}
-    BEST_ORDER_INIT_DELTA=${19}
-    OBJECTIVE_SCORECARD=${20}
+    BASELINE_KERNEL_DIR=$9
+    OBJECTIVE_SCORECARD=${10}
 
     {
         echo "Kernel PGO cycle summary"
@@ -1429,41 +1474,10 @@ write_final_summary() {
         echo "selected_linux_axf_bytes=${SELECTED_SIZE}"
         echo "baseline_shell_ready_ms=${BASELINE_BOOT_MS}"
         echo "selected_shell_ready_ms=${SELECTED_BOOT_MS}"
-        echo "best_order_candidate=${BEST_ORDER_NAME:-none}"
-        echo "best_order_linux_axf_bytes=${BEST_ORDER_SIZE:-0}"
-        echo "best_order_shell_ready_ms=${BEST_ORDER_BOOT_MS:-0}"
-        echo "best_order_file=${BEST_ORDER_FILE:-none}"
-        echo "best_order_size_delta_vs_selected=${BEST_ORDER_SIZE_DELTA:-0}"
-        echo "best_order_shell_delta_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
-        echo "best_order_resident_delta_vs_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
-        echo "best_order_init_bytes=${BEST_ORDER_INIT_BYTES:-0}"
-        echo "best_order_init_delta_vs_selected=${BEST_ORDER_INIT_DELTA:-0}"
         if [ -f "${OBJECTIVE_SCORECARD}" ]; then
             echo
             echo "objective_scorecard:"
             cat "${OBJECTIVE_SCORECARD}"
-        fi
-        echo
-        echo "remaining_gap_to_trace_layout_win:"
-        if [ "${BEST_ORDER_NAME:-}" = "none" ] || [ -z "${BEST_ORDER_NAME:-}" ]; then
-            echo "best_order_candidate=none"
-            echo "trace_layout_candidate_available=no"
-            echo "trace_layout_win_remaining=yes"
-        else
-            echo "best_order_candidate=${BEST_ORDER_NAME}"
-            echo "trace_layout_candidate_available=yes"
-            if [ "${BEST_ORDER_SIZE_DELTA:-0}" -gt 0 ] ||
-                [ "${BEST_ORDER_RESIDENT_DELTA:-0}" -gt 0 ] ||
-                [ "${BEST_ORDER_INIT_DELTA:-0}" -gt 0 ] ||
-                [ "${BEST_ORDER_BOOT_DELTA:-0}" -gt 0 ]; then
-                echo "trace_layout_win_remaining=yes"
-            else
-                echo "trace_layout_win_remaining=no"
-            fi
-            echo "size_bytes_needed_to_tie_selected=${BEST_ORDER_SIZE_DELTA:-0}"
-            echo "resident_bytes_needed_to_tie_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
-            echo "init_bytes_needed_to_tie_selected=${BEST_ORDER_INIT_DELTA:-0}"
-            echo "shell_ready_ms_headroom_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
         fi
         echo
         echo "footprint_pareto_frontier_boot_eligible:"
@@ -1544,28 +1558,11 @@ write_final_summary() {
         echo
         echo "candidate_decisions:"
         cat "${DECISION_FILE}"
-        echo
-        echo "layout_profile:"
-        if [ -f "${LAYOUT_DECISION_FILE}" ]; then
-            echo "[layout_decision]"
-            cat "${LAYOUT_DECISION_FILE}"
-        else
-            echo "missing_layout_decision_file=1"
-        fi
         if [ -f "${BASELINE_KERNEL_DIR}/kernel_summary.txt" ]; then
+            echo
             echo "[baseline_profile]"
-            grep -E '^(ordering_symbol_count|ordering_hit_ratio|matched_ratio|top_32_ratio|top_64_ratio)=' \
+            grep -E '^(matched_ratio|top_32_ratio|top_64_ratio)=' \
                 "${BASELINE_KERNEL_DIR}/kernel_summary.txt" || true
-        fi
-        if [ -f "${BASELINE_KERNEL_DIR}/kernel_ld_profile.txt" ]; then
-            echo
-            echo "ordering_file_head:"
-            sed -n '1,12p' "${BASELINE_KERNEL_DIR}/kernel_ld_profile.txt"
-        fi
-        if [ -f "${BASELINE_KERNEL_DIR}/kernel_ld_profile_full.txt" ]; then
-            echo
-            echo "ordering_file_full_head:"
-            sed -n '1,8p' "${BASELINE_KERNEL_DIR}/kernel_ld_profile_full.txt"
         fi
     } >"${SUMMARY_PATH}"
 }
@@ -1607,11 +1604,9 @@ kernel_profile_cache_valid() {
     [ -f "${MANIFEST}" ] || return 1
     [ -f "${CACHE_DIR}/profile/kernel_summary.txt" ] || return 1
     [ -f "${CACHE_DIR}/profile/kernel_hits.txt" ] || return 1
-    [ -f "${CACHE_DIR}/profile/kernel_ld_profile.txt" ] || return 1
     [ -f "${CACHE_DIR}/profile/kernel_syscalls.txt" ] || return 1
     [ -f "${CACHE_DIR}/analysis/pgo-kernel.config" ] || return 1
     [ -f "${CACHE_DIR}/analysis/syscalls.txt" ] || return 1
-    [ -f "${CACHE_DIR}/analysis/pgo-layout-decision.env" ] || return 1
 
     [ "$(sed -n 's/^image_fingerprint=//p' "${MANIFEST}")" = "${IMAGE_FP}" ] || return 1
     [ "$(sed -n 's/^workload_sha256=//p' "${MANIFEST}")" = "${WORKLOAD_SHA}" ] || return 1
@@ -1692,26 +1687,20 @@ prepare_kernel_profile_analysis() {
 
 build_candidate_kernel() {
     NAME=$1
-    EXPERIMENT=$2
-    ORDER_FILE=$3
-    SYSCALL_TABLE=$4
-    CONFIG_FRAGMENT=$5
-    REPORT_ROOT=$6
-    SNAPDIR=$7
+    SYSCALL_TABLE=$2
+    CONFIG_FRAGMENT=$3
+    REPORT_ROOT=$4
+    SNAPDIR=$5
 
     stage_clean linux
     stage_clean bootwrapper
     (
-        KERNEL_EXPERIMENT="${EXPERIMENT}" \
-        KERNEL_ORDER_FILE="${ORDER_FILE}" \
         KERNEL_SYSCALL_TABLE="${SYSCALL_TABLE}" \
         KERNEL_CONFIG_FRAGMENT="${CONFIG_FRAGMENT}" \
         KERNEL_REPORT_DIR="${REPORT_ROOT}" \
         build_linux
     )
     (
-        KERNEL_EXPERIMENT="${EXPERIMENT}" \
-        KERNEL_ORDER_FILE="${ORDER_FILE}" \
         KERNEL_SYSCALL_TABLE="${SYSCALL_TABLE}" \
         KERNEL_CONFIG_FRAGMENT="${CONFIG_FRAGMENT}" \
         KERNEL_REPORT_DIR="${REPORT_ROOT}" \
@@ -1721,7 +1710,218 @@ build_candidate_kernel() {
     snapshot_kernel_artifacts "${SNAPDIR}"
     record_candidate_result "${NAME}" "${SNAPDIR}" "$(linux_axf_size)" \
         "${REPORT_ROOT}/validation/boot-metrics.txt" \
-        "${REPORT_ROOT}/${EXPERIMENT}/section-sizes.txt"
+        "${REPORT_ROOT}/none/section-sizes.txt"
+}
+
+record_lto_candidate_result() {
+    NAME=$1
+    OUTDIR=$2
+    SECTION_REPORT=$3
+
+    IMAGE_BYTES=$(linux_image_size)
+    VMLINUX_BYTES=$(linux_vmlinux_size)
+    TEXT_BYTES=$(sum_section_sizes "${SECTION_REPORT}" ".head.text" ".text")
+    RODATA_BYTES=$(sum_section_sizes "${SECTION_REPORT}" ".rodata" ".ARM.unwind_idx" ".ARM.unwind_tab" "__param" ".notes")
+    DATA_BYTES=$(read_section_size "${SECTION_REPORT}" ".data")
+    BSS_BYTES=$(read_section_size "${SECTION_REPORT}" ".bss")
+
+    {
+        echo "candidate=${NAME}"
+        echo "status=ok"
+        echo "image_bytes=${IMAGE_BYTES}"
+        echo "vmlinux_bytes=${VMLINUX_BYTES}"
+        echo "text_bytes=${TEXT_BYTES}"
+        echo "rodata_bytes=${RODATA_BYTES}"
+        echo "data_bytes=${DATA_BYTES}"
+        echo "bss_bytes=${BSS_BYTES}"
+        echo "note=-"
+    } >"${OUTDIR}/result.txt"
+}
+
+record_lto_candidate_failure() {
+    NAME=$1
+    OUTDIR=$2
+    NOTE=$3
+
+    {
+        echo "candidate=${NAME}"
+        echo "status=failed"
+        echo "image_bytes=-"
+        echo "vmlinux_bytes=-"
+        echo "text_bytes=-"
+        echo "rodata_bytes=-"
+        echo "data_bytes=-"
+        echo "bss_bytes=-"
+        echo "note=${NOTE}"
+    } >"${OUTDIR}/result.txt"
+}
+
+append_lto_candidate_summary() {
+    SUMMARY_FILE=$1
+    NAME=$2
+    RESULT_FILE=$3
+    BASELINE_RESULT=$4
+    STATUS=$(read_metric_value "${RESULT_FILE}" "status")
+    NOTE=$(read_metric_value "${RESULT_FILE}" "note")
+
+    if [ "${STATUS}" != "ok" ]; then
+        printf '%s %s - - - - - - - - - - - %s\n' \
+            "${NAME}" "${STATUS}" "${NOTE}" \
+            >>"${SUMMARY_FILE}"
+        return
+    fi
+
+    IMAGE_BYTES=$(read_boot_metric "${RESULT_FILE}" "image_bytes")
+    VMLINUX_BYTES=$(read_boot_metric "${RESULT_FILE}" "vmlinux_bytes")
+    TEXT_BYTES=$(read_boot_metric "${RESULT_FILE}" "text_bytes")
+    RODATA_BYTES=$(read_boot_metric "${RESULT_FILE}" "rodata_bytes")
+    DATA_BYTES=$(read_boot_metric "${RESULT_FILE}" "data_bytes")
+    BSS_BYTES=$(read_boot_metric "${RESULT_FILE}" "bss_bytes")
+
+    BASE_IMAGE=$(read_boot_metric "${BASELINE_RESULT}" "image_bytes")
+    BASE_VMLINUX=$(read_boot_metric "${BASELINE_RESULT}" "vmlinux_bytes")
+    BASE_TEXT=$(read_boot_metric "${BASELINE_RESULT}" "text_bytes")
+    BASE_RODATA=$(read_boot_metric "${BASELINE_RESULT}" "rodata_bytes")
+    BASE_DATA=$(read_boot_metric "${BASELINE_RESULT}" "data_bytes")
+    BASE_BSS=$(read_boot_metric "${BASELINE_RESULT}" "bss_bytes")
+
+    printf '%s %s %s %s %s %s %s %s %+d %+d %+d %+d %+d %+d %s\n' \
+        "${NAME}" "${STATUS}" "${IMAGE_BYTES}" "${VMLINUX_BYTES}" "${TEXT_BYTES}" "${RODATA_BYTES}" \
+        "${DATA_BYTES}" "${BSS_BYTES}" \
+        "$((IMAGE_BYTES - BASE_IMAGE))" \
+        "$((VMLINUX_BYTES - BASE_VMLINUX))" \
+        "$((TEXT_BYTES - BASE_TEXT))" \
+        "$((RODATA_BYTES - BASE_RODATA))" \
+        "$((DATA_BYTES - BASE_DATA))" \
+        "$((BSS_BYTES - BASE_BSS))" \
+        "${NOTE}" \
+        >>"${SUMMARY_FILE}"
+}
+
+build_lto_candidate() {
+    NAME=$1
+    LTO_MODE=$2
+    GCC_EXTRA=$3
+    REPORT_ROOT=$4
+    SNAPDIR=$5
+    SNAPSHOT_MODE=${6:-linux}
+
+    mkdir -p "${REPORT_ROOT}" "${SNAPDIR}"
+    stage_clean linux
+    if ! (
+        KERNEL_LTO_MODE="${LTO_MODE}" \
+        KERNEL_LTO_EXTRA_CFLAGS="${GCC_EXTRA}" \
+        KERNEL_REPORT_DIR="${REPORT_ROOT}" \
+        build_linux
+    ); then
+        cp -f "${LOGDIR}/linux.log" "${REPORT_ROOT}/build-failure.log" 2>/dev/null || true
+        record_lto_candidate_failure "${NAME}" "${SNAPDIR}" "build_linux_failed"
+        return 1
+    fi
+
+    if [ "${SNAPSHOT_MODE}" = "kernel" ]; then
+        stage_clean bootwrapper
+        if ! (
+            KERNEL_LTO_MODE="${LTO_MODE}" \
+            KERNEL_LTO_EXTRA_CFLAGS="${GCC_EXTRA}" \
+            KERNEL_REPORT_DIR="${REPORT_ROOT}" \
+            build_bootwrapper
+        ); then
+            cp -f "${LOGDIR}/bootwrapper.log" "${REPORT_ROOT}/build-failure.log" 2>/dev/null || true
+            record_lto_candidate_failure "${NAME}" "${SNAPDIR}" "build_bootwrapper_failed"
+            return 1
+        fi
+        snapshot_kernel_artifacts "${SNAPDIR}"
+    else
+        snapshot_linux_artifacts "${SNAPDIR}"
+    fi
+
+    record_lto_candidate_result "${NAME}" "${SNAPDIR}" "${REPORT_ROOT}/none/section-sizes.txt"
+}
+
+build_kernel_lto_sweep() {
+    SWEEP_DIR=${KERNEL_REPORT_DIR}/lto-sweep
+    FINAL_DIR=${SWEEP_DIR}/final
+    ARTIFACT_DIR=${SWEEP_DIR}/artifacts
+    SUMMARY_FILE=${FINAL_DIR}/candidate-matrix.txt
+    BASELINE_SNAP=${ARTIFACT_DIR}/baseline
+    BASELINE_ROOT=${SWEEP_DIR}/baseline
+
+    mkdir -p "${FINAL_DIR}" "${ARTIFACT_DIR}"
+    {
+        echo "candidate status image_bytes vmlinux_bytes text_bytes rodata_bytes data_bytes bss_bytes image_delta vmlinux_delta text_delta rodata_delta data_delta bss_delta note"
+    } >"${SUMMARY_FILE}"
+
+    echo "BUILD: LTO sweep baseline - no LTO"
+    if ! build_lto_candidate "baseline" "none" "" "${BASELINE_ROOT}" "${BASELINE_SNAP}" "kernel"; then
+        echo "ERROR: LTO sweep baseline build failed"
+        exit 1
+    fi
+    append_lto_candidate_summary "${SUMMARY_FILE}" "baseline" "${BASELINE_SNAP}/result.txt" "${BASELINE_SNAP}/result.txt"
+
+    echo "BUILD: LTO sweep candidate - gcc"
+    if ! build_lto_candidate "gcc" "gcc" "" \
+        "${SWEEP_DIR}/gcc" "${ARTIFACT_DIR}/gcc"; then
+        :
+    fi
+    append_lto_candidate_summary "${SUMMARY_FILE}" "gcc" "${ARTIFACT_DIR}/gcc/result.txt" "${BASELINE_SNAP}/result.txt"
+
+    echo "BUILD: LTO sweep candidate - gcc-inline-tight"
+    if ! build_lto_candidate "gcc-inline-tight" "gcc" \
+        "--param=inline-unit-growth=5 --param=max-inline-insns-single=32 --param=max-inline-insns-auto=16" \
+        "${SWEEP_DIR}/gcc-inline-tight" "${ARTIFACT_DIR}/gcc-inline-tight"; then
+        :
+    fi
+    append_lto_candidate_summary "${SUMMARY_FILE}" "gcc-inline-tight" "${ARTIFACT_DIR}/gcc-inline-tight/result.txt" "${BASELINE_SNAP}/result.txt"
+
+    echo "BUILD: LTO sweep candidate - gcc-ipa-off"
+    if ! build_lto_candidate "gcc-ipa-off" "gcc" \
+        "-fno-ipa-cp-clone -fno-ipa-sra -fno-inline-functions -fno-inline-small-functions" \
+        "${SWEEP_DIR}/gcc-ipa-off" "${ARTIFACT_DIR}/gcc-ipa-off"; then
+        :
+    fi
+    append_lto_candidate_summary "${SUMMARY_FILE}" "gcc-ipa-off" "${ARTIFACT_DIR}/gcc-ipa-off/result.txt" "${BASELINE_SNAP}/result.txt"
+
+    BEST_BY_IMAGE=$(awk '$2 == "ok" && (best == "" || $3+0 < best) { best=$3+0; name=$1 } END { print name }' "${SUMMARY_FILE}")
+    BEST_IMAGE_BYTES=$(awk -v name="${BEST_BY_IMAGE}" '$1==name { print $3 }' "${SUMMARY_FILE}")
+
+    {
+        echo "Kernel LTO sweep summary"
+        echo
+        echo "baseline_image_bytes=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "image_bytes")"
+        echo "baseline_vmlinux_bytes=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "vmlinux_bytes")"
+        echo "best_candidate_by_image=${BEST_BY_IMAGE}"
+        echo "best_candidate_image_bytes=${BEST_IMAGE_BYTES}"
+        echo
+        echo "candidate_matrix:"
+        cat "${SUMMARY_FILE}"
+        echo
+        echo "ranking_by_image:"
+        {
+            sed -n '1p' "${SUMMARY_FILE}"
+            awk 'NR == 1 || $2 == "ok"' "${SUMMARY_FILE}" | sed -n '2,$p' | sort -k3,3n -k5,5n -k6,6n -k1,1
+        }
+        echo
+        echo "ranking_by_text:"
+        {
+            sed -n '1p' "${SUMMARY_FILE}"
+            awk 'NR == 1 || $2 == "ok"' "${SUMMARY_FILE}" | sed -n '2,$p' | sort -k5,5n -k3,3n -k6,6n -k1,1
+        }
+        echo
+        echo "ranking_by_rodata:"
+        {
+            sed -n '1p' "${SUMMARY_FILE}"
+            awk 'NR == 1 || $2 == "ok"' "${SUMMARY_FILE}" | sed -n '2,$p' | sort -k6,6n -k3,3n -k5,5n -k1,1
+        }
+        echo
+        echo "failed_candidates:"
+        {
+            sed -n '1p' "${SUMMARY_FILE}"
+            awk '$2 != "ok" { print }' "${SUMMARY_FILE}"
+        }
+    } >"${FINAL_DIR}/summary.txt"
+
+    restore_kernel_artifacts "${BASELINE_SNAP}"
 }
 
 build_kernel_pgo_cycle() {
@@ -1736,8 +1936,6 @@ build_kernel_pgo_cycle() {
     BASELINE_SNAP=${CYCLE_DIR}/artifacts/baseline
     CONFIG_SNAP=${CYCLE_DIR}/artifacts/config-only
     SYSCALL_SNAP=${CYCLE_DIR}/artifacts/syscall-prune
-    ORDER_SNAP=${CYCLE_DIR}/artifacts/llvm-order
-    ORDER_FULL_SNAP=${CYCLE_DIR}/artifacts/llvm-order-full
     mkdir -p "${BASELINE_DIR}" "${FINAL_DIR}" "${CONFIG_DIR}" "${CYCLE_DIR}/artifacts"
     {
         echo "candidate linux_axf_bytes boot_marker_ms shell_ready_ms kernel_resident_bytes kernel_init_bytes"
@@ -1752,7 +1950,7 @@ build_kernel_pgo_cycle() {
     fi
 
     echo "BUILD: kernel PGO cycle step 1/3 - baseline kernel build"
-    build_candidate_kernel "baseline" "none" "" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
+    build_candidate_kernel "baseline" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
     BASELINE_SIZE=$(linux_axf_size)
     BASELINE_BOOT_MS=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "shell_ready_ms")
     append_candidate_summary "${SUMMARY_FILE}" "baseline" "${BASELINE_SNAP}/result.txt"
@@ -1762,13 +1960,12 @@ build_kernel_pgo_cycle() {
         "${QEMU_LOG:-exec,in_asm}" "profile-analysis"
 
     MERGED_CONFIG=${CONFIG_DIR}/pgo-kernel.merged.config
-    LAYOUT_DECISION_FILE=${CONFIG_DIR}/pgo-layout-decision.env
     compose_kernel_config_fragment "${MERGED_CONFIG}" \
         "${PGO_BASE_CONFIG_FRAGMENT}" \
         "${CONFIG_DIR}/pgo-kernel.config"
 
     echo "BUILD: kernel PGO cycle step 3/3 - PGO rebuild with generated config fragment"
-    build_candidate_kernel "config-only" "none" "" "" "${MERGED_CONFIG}" \
+    build_candidate_kernel "config-only" "" "${MERGED_CONFIG}" \
         "${CYCLE_DIR}/config-only" "${CONFIG_SNAP}"
     CONFIG_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${CONFIG_SNAP}/result.txt")
     CONFIG_SIZE=${CONFIG_SIZE:-0}
@@ -1787,7 +1984,7 @@ build_kernel_pgo_cycle() {
             --syscall-table "${ROOTDIR}/linux-${LINUX_VERSION}/arch/arm/tools/syscall.tbl" \
             --output-table "${SYSCALL_TABLE_PATCH}"
 
-        build_candidate_kernel "syscall-prune" "none" "" "${SYSCALL_TABLE_PATCH}" "${MERGED_CONFIG}" \
+        build_candidate_kernel "syscall-prune" "${SYSCALL_TABLE_PATCH}" "${MERGED_CONFIG}" \
             "${CYCLE_DIR}/syscall-prune" "${SYSCALL_SNAP}"
         SYSCALL_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${SYSCALL_SNAP}/result.txt")
         SYSCALL_SIZE=${SYSCALL_SIZE:-0}
@@ -1795,44 +1992,6 @@ build_kernel_pgo_cycle() {
         append_candidate_summary "${SUMMARY_FILE}" "syscall-prune" "${SYSCALL_SNAP}/result.txt"
     else
         echo "PGO: skipping syscall-prune candidate: no syscalls detected (set QEMU_LOG=exec,cpu,in_asm to enable)"
-    fi
-
-    ORDER_SIZE=0
-    ORDER_BOOT_MS=0
-    ORDER_RESIDENT=0
-    ORDER_INIT=0
-    ORDER_FULL_SIZE=0
-    ORDER_FULL_BOOT_MS=0
-    ORDER_FULL_RESIDENT=0
-    ORDER_FULL_INIT=0
-    if [ -f "${LAYOUT_DECISION_FILE}" ]; then
-        # Generated by analyze-kernel-pgo.py with simple shell-safe key=value lines.
-        . "${LAYOUT_DECISION_FILE}"
-    fi
-
-    if [ "${layout_ordering_recommended:-no}" = "yes" ]; then
-        build_candidate_kernel "llvm-order" "llvm-order-use" "${BASELINE_DIR}/kernel/kernel_ld_profile.txt" \
-            "" "${MERGED_CONFIG}" "${CYCLE_DIR}/llvm-order" "${ORDER_SNAP}"
-        ORDER_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${ORDER_SNAP}/result.txt")
-        ORDER_SIZE=${ORDER_SIZE:-0}
-        ORDER_BOOT_MS=$(read_boot_metric "${ORDER_SNAP}/result.txt" "shell_ready_ms")
-        ORDER_RESIDENT=$(read_boot_metric "${ORDER_SNAP}/result.txt" "kernel_resident_bytes")
-        ORDER_INIT=$(read_boot_metric "${ORDER_SNAP}/result.txt" "kernel_init_bytes")
-        append_candidate_summary "${SUMMARY_FILE}" "llvm-order" "${ORDER_SNAP}/result.txt"
-
-        if [ -f "${BASELINE_DIR}/kernel/kernel_ld_profile_full.txt" ]; then
-            build_candidate_kernel "llvm-order-full" "llvm-order-use" \
-                "${BASELINE_DIR}/kernel/kernel_ld_profile_full.txt" \
-                "" "${MERGED_CONFIG}" "${CYCLE_DIR}/llvm-order-full" "${ORDER_FULL_SNAP}"
-            ORDER_FULL_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${ORDER_FULL_SNAP}/result.txt")
-            ORDER_FULL_SIZE=${ORDER_FULL_SIZE:-0}
-            ORDER_FULL_BOOT_MS=$(read_boot_metric "${ORDER_FULL_SNAP}/result.txt" "shell_ready_ms")
-            ORDER_FULL_RESIDENT=$(read_boot_metric "${ORDER_FULL_SNAP}/result.txt" "kernel_resident_bytes")
-            ORDER_FULL_INIT=$(read_boot_metric "${ORDER_FULL_SNAP}/result.txt" "kernel_init_bytes")
-            append_candidate_summary "${SUMMARY_FILE}" "llvm-order-full" "${ORDER_FULL_SNAP}/result.txt"
-        fi
-    else
-        echo "PGO: skipping llvm-order candidate: ${layout_ordering_reason:-trace too diffuse}"
     fi
 
     BEST_NAME=baseline
@@ -1862,74 +2021,11 @@ build_kernel_pgo_cycle() {
         BEST_INIT_BYTES=$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_init_bytes")
     fi
 
-    if [ "${ORDER_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${ORDER_BOOT_MS}" &&
-        [ "${ORDER_SIZE}" -lt "${BEST_SIZE}" ]; then
-        BEST_NAME=llvm-order
-        BEST_SNAP=${ORDER_SNAP}
-        BEST_SIZE=${ORDER_SIZE}
-        BEST_BOOT_MS=${ORDER_BOOT_MS}
-        BEST_RESIDENT_BYTES=${ORDER_RESIDENT}
-        BEST_INIT_BYTES=${ORDER_INIT}
-    fi
-
-    if [ "${ORDER_FULL_SIZE}" -gt 0 ] && boot_not_regressed "${BASELINE_BOOT_MS}" "${ORDER_FULL_BOOT_MS}" &&
-        [ "${ORDER_FULL_SIZE}" -lt "${BEST_SIZE}" ]; then
-        BEST_NAME=llvm-order-full
-        BEST_SNAP=${ORDER_FULL_SNAP}
-        BEST_SIZE=${ORDER_FULL_SIZE}
-        BEST_BOOT_MS=${ORDER_FULL_BOOT_MS}
-        BEST_RESIDENT_BYTES=${ORDER_FULL_RESIDENT}
-        BEST_INIT_BYTES=${ORDER_FULL_INIT}
-    fi
-
     if [ "${BEST_NAME}" = "baseline" ]; then
         echo "PGO: no candidate improved linux.axf size without regressing shell_ready_ms; keeping baseline"
         echo "  baseline:      ${BASELINE_SIZE} bytes, ${BASELINE_BOOT_MS} ms"
         echo "  config-only:   ${CONFIG_SIZE} bytes, ${CONFIG_BOOT_MS} ms"
         echo "  syscall-prune: ${SYSCALL_SIZE} bytes, ${SYSCALL_BOOT_MS} ms"
-        echo "  llvm-order:    ${ORDER_SIZE} bytes, ${ORDER_BOOT_MS} ms"
-        echo "  llvm-order-full: ${ORDER_FULL_SIZE} bytes, ${ORDER_FULL_BOOT_MS} ms"
-    fi
-
-    BEST_ORDER_NAME=
-    BEST_ORDER_SNAP=
-    BEST_ORDER_FILE=
-    BEST_ORDER_SIZE=0
-    BEST_ORDER_BOOT_MS=0
-    BEST_ORDER_SIZE_DELTA=0
-    BEST_ORDER_BOOT_DELTA=0
-    BEST_ORDER_RESIDENT_DELTA=0
-    BEST_ORDER_INIT_BYTES=0
-    BEST_ORDER_INIT_DELTA=0
-    if [ "${ORDER_SIZE}" -gt 0 ]; then
-        BEST_ORDER_NAME=llvm-order
-        BEST_ORDER_SNAP=${ORDER_SNAP}
-        BEST_ORDER_FILE=${BASELINE_DIR}/kernel/kernel_ld_profile.txt
-        BEST_ORDER_SIZE=${ORDER_SIZE}
-        BEST_ORDER_BOOT_MS=${ORDER_BOOT_MS}
-        BEST_ORDER_INIT_BYTES=${ORDER_INIT}
-    fi
-    if [ "${ORDER_FULL_SIZE}" -gt 0 ] &&
-        { [ "${ORDER_SIZE}" -eq 0 ] || [ "${ORDER_FULL_SIZE}" -lt "${ORDER_SIZE}" ]; }; then
-        BEST_ORDER_NAME=llvm-order-full
-        BEST_ORDER_SNAP=${ORDER_FULL_SNAP}
-        BEST_ORDER_FILE=${BASELINE_DIR}/kernel/kernel_ld_profile_full.txt
-        BEST_ORDER_SIZE=${ORDER_FULL_SIZE}
-        BEST_ORDER_BOOT_MS=${ORDER_FULL_BOOT_MS}
-        BEST_ORDER_INIT_BYTES=${ORDER_FULL_INIT}
-    fi
-
-    if [ -n "${BEST_ORDER_NAME}" ]; then
-        BEST_ORDER_SIZE_DELTA=$((BEST_ORDER_SIZE - BEST_SIZE))
-        BEST_ORDER_BOOT_DELTA=$((BEST_ORDER_BOOT_MS - BEST_BOOT_MS))
-        BEST_ORDER_RESIDENT_DELTA=$(( $(read_boot_metric "${BEST_ORDER_SNAP}/result.txt" "kernel_resident_bytes") - BEST_RESIDENT_BYTES ))
-        BEST_ORDER_INIT_DELTA=$((BEST_ORDER_INIT_BYTES - BEST_INIT_BYTES))
-        run_logged "compare ordered kernel layout" python3 "${ROOTDIR}/scripts/compare-kernel-layout.py" \
-            --baseline-vmlinux "${BASELINE_SNAP}/vmlinux" \
-            --candidate-vmlinux "${BEST_ORDER_SNAP}/vmlinux" \
-            --hits "${BASELINE_DIR}/kernel/kernel_hits.txt" \
-            --order-file "${BEST_ORDER_FILE}" \
-            --output-dir "${CYCLE_DIR}/layout"
     fi
 
     restore_kernel_artifacts "${BEST_SNAP}"
@@ -1942,15 +2038,6 @@ build_kernel_pgo_cycle() {
         echo "selected_shell_ready_ms=${BEST_BOOT_MS}"
         echo "candidate_matrix=${SUMMARY_FILE}"
         echo "candidate_decisions=${DECISION_FILE}"
-        echo "best_order_candidate=${BEST_ORDER_NAME:-none}"
-        echo "best_order_linux_axf_bytes=${BEST_ORDER_SIZE:-0}"
-        echo "best_order_shell_ready_ms=${BEST_ORDER_BOOT_MS:-0}"
-        echo "best_order_file=${BEST_ORDER_FILE:-none}"
-        echo "best_order_size_delta_vs_selected=${BEST_ORDER_SIZE_DELTA:-0}"
-        echo "best_order_shell_delta_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
-        echo "best_order_resident_delta_vs_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
-        echo "best_order_init_bytes=${BEST_ORDER_INIT_BYTES:-0}"
-        echo "best_order_init_delta_vs_selected=${BEST_ORDER_INIT_DELTA:-0}"
     } >"${FINAL_DIR}/selected-candidate.txt"
     append_candidate_decision "${DECISION_FILE}" "baseline" "${BASELINE_SIZE}" "${BASELINE_BOOT_MS}" \
         "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
@@ -1964,12 +2051,6 @@ build_kernel_pgo_cycle() {
         "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
         "$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_resident_bytes")" "${BEST_RESIDENT_BYTES}" \
         "$(read_boot_metric "${SYSCALL_SNAP}/result.txt" "kernel_init_bytes")" "${BEST_INIT_BYTES}"
-    append_candidate_decision "${DECISION_FILE}" "llvm-order" "${ORDER_SIZE}" "${ORDER_BOOT_MS}" \
-        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
-        "${ORDER_RESIDENT}" "${BEST_RESIDENT_BYTES}" "${ORDER_INIT}" "${BEST_INIT_BYTES}"
-    append_candidate_decision "${DECISION_FILE}" "llvm-order-full" "${ORDER_FULL_SIZE}" "${ORDER_FULL_BOOT_MS}" \
-        "${BEST_NAME}" "${BEST_SIZE}" "${BEST_BOOT_MS}" "${BASELINE_BOOT_MS}" \
-        "${ORDER_FULL_RESIDENT}" "${BEST_RESIDENT_BYTES}" "${ORDER_FULL_INIT}" "${BEST_INIT_BYTES}"
 
     BASELINE_RESIDENT_BYTES=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_resident_bytes")
     BASELINE_INIT_BYTES=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_init_bytes")
@@ -1977,24 +2058,6 @@ build_kernel_pgo_cycle() {
     SELECTED_BOOT_DELTA_VS_BASELINE=$((BEST_BOOT_MS - BASELINE_BOOT_MS))
     SELECTED_RESIDENT_DELTA_VS_BASELINE=$((BEST_RESIDENT_BYTES - BASELINE_RESIDENT_BYTES))
     SELECTED_INIT_DELTA_VS_BASELINE=$((BEST_INIT_BYTES - BASELINE_INIT_BYTES))
-    TRACE_LAYOUT_GOAL_MET=no
-    BEST_ORDER_SIZE_DELTA_VS_BASELINE=0
-    BEST_ORDER_BOOT_DELTA_VS_BASELINE=0
-    BEST_ORDER_RESIDENT_DELTA_VS_BASELINE=0
-    BEST_ORDER_INIT_DELTA_VS_BASELINE=0
-    if [ -n "${BEST_ORDER_NAME}" ]; then
-        BEST_ORDER_RESIDENT_BYTES=$(read_boot_metric "${BEST_ORDER_SNAP}/result.txt" "kernel_resident_bytes")
-        BEST_ORDER_SIZE_DELTA_VS_BASELINE=$((BEST_ORDER_SIZE - BASELINE_SIZE))
-        BEST_ORDER_BOOT_DELTA_VS_BASELINE=$((BEST_ORDER_BOOT_MS - BASELINE_BOOT_MS))
-        BEST_ORDER_RESIDENT_DELTA_VS_BASELINE=$((BEST_ORDER_RESIDENT_BYTES - BASELINE_RESIDENT_BYTES))
-        BEST_ORDER_INIT_DELTA_VS_BASELINE=$((BEST_ORDER_INIT_BYTES - BASELINE_INIT_BYTES))
-        if [ "${BEST_ORDER_SIZE}" -le "${BEST_SIZE}" ] &&
-            [ "${BEST_ORDER_RESIDENT_BYTES}" -le "${BEST_RESIDENT_BYTES}" ] &&
-            [ "${BEST_ORDER_INIT_BYTES}" -le "${BEST_INIT_BYTES}" ] &&
-            boot_not_regressed "${BASELINE_BOOT_MS}" "${BEST_ORDER_BOOT_MS}"; then
-            TRACE_LAYOUT_GOAL_MET=yes
-        fi
-    fi
 
     {
         echo "selected_candidate=${BEST_NAME}"
@@ -2014,29 +2077,11 @@ build_kernel_pgo_cycle() {
         else
             echo "selected_systematic_goal_met=no"
         fi
-        echo "trace_layout_goal_met=${TRACE_LAYOUT_GOAL_MET}"
-        echo "best_order_candidate=${BEST_ORDER_NAME:-none}"
-        echo "best_order_size_delta_vs_baseline=${BEST_ORDER_SIZE_DELTA_VS_BASELINE}"
-        echo "best_order_shell_delta_vs_baseline=${BEST_ORDER_BOOT_DELTA_VS_BASELINE}"
-        echo "best_order_resident_delta_vs_baseline=${BEST_ORDER_RESIDENT_DELTA_VS_BASELINE}"
-        echo "best_order_init_delta_vs_baseline=${BEST_ORDER_INIT_DELTA_VS_BASELINE}"
-        echo "best_order_size_delta_vs_selected=${BEST_ORDER_SIZE_DELTA:-0}"
-        echo "best_order_shell_delta_vs_selected=${BEST_ORDER_BOOT_DELTA:-0}"
-        echo "best_order_resident_delta_vs_selected=${BEST_ORDER_RESIDENT_DELTA:-0}"
-        echo "best_order_init_delta_vs_selected=${BEST_ORDER_INIT_DELTA:-0}"
-        if [ "${TRACE_LAYOUT_GOAL_MET}" = "yes" ]; then
-            echo "best_order_competitive_on_systematic_goal=yes"
-        else
-            echo "best_order_competitive_on_systematic_goal=no"
-        fi
     } >"${OBJECTIVE_SCORECARD}"
 
     write_final_summary "${FINAL_SUMMARY}" "${SUMMARY_FILE}" "${DECISION_FILE}" "${BEST_NAME}" \
         "${BASELINE_SIZE}" "${BEST_SIZE}" "${BASELINE_BOOT_MS}" "${BEST_BOOT_MS}" \
-        "${LAYOUT_DECISION_FILE}" "${BASELINE_DIR}/kernel" \
-        "${BEST_ORDER_NAME}" "${BEST_ORDER_SIZE}" "${BEST_ORDER_BOOT_MS}" "${BEST_ORDER_FILE}" \
-        "${BEST_ORDER_SIZE_DELTA}" "${BEST_ORDER_BOOT_DELTA}" "${BEST_ORDER_RESIDENT_DELTA}" \
-        "${BEST_ORDER_INIT_BYTES}" "${BEST_ORDER_INIT_DELTA}" "${OBJECTIVE_SCORECARD}"
+        "${BASELINE_DIR}/kernel" "${OBJECTIVE_SCORECARD}"
 
     run_logged "collect final kernel profile" "${ROOTDIR}/scripts/collect-kernel-profile.sh" \
         "${ROOTDIR}/bootwrapper/linux.axf" \
@@ -2075,7 +2120,7 @@ build_kernel_syscall_prune_cycle() {
     fi
 
     echo "BUILD: syscall-prune cycle step 1/3 - baseline kernel build"
-    build_candidate_kernel "baseline" "none" "" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
+    build_candidate_kernel "baseline" "" "" "${BASELINE_DIR}" "${BASELINE_SNAP}"
     BASELINE_SIZE=$(linux_axf_size)
     BASELINE_BOOT_MS=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "shell_ready_ms")
     BASELINE_RESIDENT=$(read_boot_metric "${BASELINE_SNAP}/result.txt" "kernel_resident_bytes")
@@ -2092,7 +2137,7 @@ build_kernel_syscall_prune_cycle() {
         "${CONFIG_DIR}/pgo-kernel.config"
 
     echo "BUILD: syscall-prune cycle step 3/3 - candidate rebuilds"
-    build_candidate_kernel "config-only" "none" "" "" "${MERGED_CONFIG}" \
+    build_candidate_kernel "config-only" "" "${MERGED_CONFIG}" \
         "${CYCLE_DIR}/config-only" "${CONFIG_SNAP}"
     CONFIG_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${CONFIG_SNAP}/result.txt")
     CONFIG_SIZE=${CONFIG_SIZE:-0}
@@ -2115,7 +2160,7 @@ build_kernel_syscall_prune_cycle() {
         --syscall-table "${ROOTDIR}/linux-${LINUX_VERSION}/arch/arm/tools/syscall.tbl" \
         --output-table "${SYSCALL_TABLE_PATCH}"
 
-    build_candidate_kernel "syscall-prune" "none" "" "${SYSCALL_TABLE_PATCH}" "${MERGED_CONFIG}" \
+    build_candidate_kernel "syscall-prune" "${SYSCALL_TABLE_PATCH}" "${MERGED_CONFIG}" \
         "${CYCLE_DIR}/syscall-prune" "${SYSCALL_SNAP}"
     SYSCALL_SIZE=$(sed -n 's/^linux_axf_bytes=//p' "${SYSCALL_SNAP}/result.txt")
     SYSCALL_SIZE=${SYSCALL_SIZE:-0}
@@ -2242,7 +2287,7 @@ build_bootwrapper() {
         LD="${TOOLCHAIN}/bin/${TARGET}-ld" \
         AS="${TOOLCHAIN}/bin/${TARGET}-as"
 
-    REPORT_SUBDIR=${KERNEL_REPORT_DIR}/${KERNEL_EXPERIMENT}
+    REPORT_SUBDIR=${KERNEL_REPORT_DIR}/none
     mkdir -p "${REPORT_SUBDIR}"
     # vmlinux did not change between the kernel build and the bootwrapper
     # build, so this refresh only needs to capture linux.axf in filesizes.txt.
@@ -2272,7 +2317,7 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 DEFAULT_STAGES="binutils gcc linux_headers uClibc busybox finalize_rootfs linux bootwrapper"
-ALL_STAGES="${DEFAULT_STAGES} kernel_pgo_cycle kernel_syscall_prune_cycle"
+ALL_STAGES="${DEFAULT_STAGES} kernel_pgo_cycle kernel_syscall_prune_cycle kernel_lto_sweep"
 
 if [ "$#" = 0 ]; then
     STAGES="${DEFAULT_STAGES}"
@@ -2280,7 +2325,7 @@ else
     STAGES=""
     for arg in "$@"; do
         case "${arg}" in
-        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper | kernel_pgo_cycle | kernel_syscall_prune_cycle)
+        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper | kernel_pgo_cycle | kernel_syscall_prune_cycle | kernel_lto_sweep)
             STAGES="${STAGES} ${arg}"
             ;;
         *)
