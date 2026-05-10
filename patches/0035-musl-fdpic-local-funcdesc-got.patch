@@ -1,0 +1,15 @@
+diff -uNr musl-patch-old/ldso/dynlink.c musl-patch-new/ldso/dynlink.c
+--- musl-patch-old/ldso/dynlink.c	2026-05-10 03:00:12.907595304 +0800
++++ musl-patch-new/ldso/dynlink.c	2026-05-10 03:00:12.908054428 +0800
+@@ -515,7 +515,10 @@
+ 		case REL_FUNCDESC_VAL:
+ 			if ((sym->st_info&0xf) == STT_SECTION) *reloc_addr += sym_val;
+ 			else *reloc_addr = sym_val;
+-			reloc_addr[1] = def.sym ? (size_t)def.dso->got : 0;
++			if ((sym->st_info&0xf) == STT_SECTION)
++				reloc_addr[1] = (size_t)dso->got;
++			else
++				reloc_addr[1] = def.sym ? (size_t)def.dso->got : 0;
+ 			break;
+ 		case REL_DTPMOD:
+ 			*reloc_addr = def.dso->tls_id;

@@ -1,0 +1,95 @@
+--- a/src/time/__tz.c	2026-05-10 00:36:50.701456468 +0800
++++ b/src/time/__tz.c	2026-05-10 00:38:48.865708297 +0800
+@@ -2,8 +2,10 @@
+ #include <stdint.h>
+ #include <limits.h>
+ #include <stdlib.h>
+-#include <string.h>
++#ifndef MUSL_BUSYBOX_ONLY_NO_TZFILE
+ #include <sys/mman.h>
++#endif
++#include <string.h>
+ #include <ctype.h>
+ #include "libc.h"
+ #include "lock.h"
+@@ -125,22 +127,30 @@
+ 
+ static void do_tzset()
+ {
++#ifndef MUSL_BUSYBOX_ONLY_NO_TZFILE
+ 	char buf[NAME_MAX+25], *pathname=buf+24;
+ 	const char *try, *s, *p;
+ 	const unsigned char *map = 0;
+-	size_t i;
+ 	static const char search[] =
+ 		"/usr/share/zoneinfo/\0/share/zoneinfo/\0/etc/zoneinfo/\0";
++#else
++	const char *s, *p;
++#endif
++	size_t i;
+ 
+ 	s = getenv("TZ");
++#ifndef MUSL_BUSYBOX_ONLY_NO_TZFILE
+ 	if (!s) s = "/etc/localtime";
++#endif
+ 	if (!*s) s = __utc;
+ 
+ 	if (old_tz && !strcmp(s, old_tz)) return;
+ 
+ 	for (i=0; i<5; i++) r0[i] = r1[i] = 0;
+ 
++#ifndef MUSL_BUSYBOX_ONLY_NO_TZFILE
+ 	if (zi) __munmap((void *)zi, map_size);
++#endif
+ 
+ 	/* Cache the old value of TZ to check if it has changed. Avoid
+ 	 * free so as not to pull it into static programs. Growth
+@@ -164,12 +174,13 @@
+ 		             || !strcmp(dummy_name, "UTC")
+ 		             || !strcmp(dummy_name, "GMT")))
+ 			posix_form = 1;
+-	}	
++	}
+ 
+-	/* Non-suid can use an absolute tzfile pathname or a relative
+-	 * pathame beginning with "."; in secure mode, only the
+-	 * standard path will be searched. */
+ 	if (!posix_form) {
++#ifndef MUSL_BUSYBOX_ONLY_NO_TZFILE
++		/* Non-suid can use an absolute tzfile pathname or a relative
++		 * pathname beginning with "."; in secure mode, only the
++		 * standard path will be searched. */
+ 		if (*s == ':') s++;
+ 		if (*s == '/' || *s == '.') {
+ 			if (!libc.secure || !strcmp(s, "/etc/localtime"))
+@@ -187,7 +198,12 @@
+ 			}
+ 		}
+ 		if (!map) s = __utc;
++#else
++		s = __utc;
++#endif
+ 	}
++
++#ifndef MUSL_BUSYBOX_ONLY_NO_TZFILE
+ 	if (map && (map_size < 44 || memcmp(map, "TZif", 4))) {
+ 		__munmap((void *)map, map_size);
+ 		map = 0;
+@@ -235,6 +251,9 @@
+ 			return;
+ 		}
+ 	}
++#else
++	zi = 0;
++#endif
+ 
+ 	if (!s) s = __utc;
+ 	getname(std_name, &s);
+@@ -256,7 +275,6 @@
+ 	if (*s == ',') s++, getrule(&s, r0);
+ 	if (*s == ',') s++, getrule(&s, r1);
+ }
+-
+ /* Search zoneinfo rules to find the one that applies to the given time,
+  * and determine alternate opposite-DST-status rule that may be needed. */
+ 

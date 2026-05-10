@@ -1,0 +1,37 @@
+diff -uNr musl-patch-old/ldso/dynlink.c musl-patch-new/ldso/dynlink.c
+--- musl-patch-old/ldso/dynlink.c
++++ musl-patch-new/ldso/dynlink.c
+@@ -1507,8 +1507,14 @@
+ 		decode_vec(p->dynv, dyn, DYN_CNT);
+ 		if (dyn[0] & (1<<DT_FINI_ARRAY)) {
+ 			size_t n = dyn[DT_FINI_ARRAYSZ]/sizeof(size_t);
+-			size_t *fn = (size_t *)laddr(p, dyn[DT_FINI_ARRAY])+n;
+-			while (n--) ((void (*)(void))*--fn)();
++			size_t *fn = (size_t *)laddr(p, dyn[DT_FINI_ARRAY]) + n;
++			while (n--) {
++#if DL_FDPIC
++				fpaddr(p, *--fn)();
++#else
++				((void (*)(void))*--fn)();
++#endif
++			}
+ 		}
+ #ifndef NO_LEGACY_INITFINI
+ 		if ((dyn[0] & (1<<DT_FINI)) && dyn[DT_FINI])
+@@ -1626,8 +1632,14 @@
+ #endif
+ 		if (dyn[0] & (1<<DT_INIT_ARRAY)) {
+ 			size_t n = dyn[DT_INIT_ARRAYSZ]/sizeof(size_t);
+-			size_t *fn = laddr(p, dyn[DT_INIT_ARRAY]);
+-			while (n--) ((void (*)(void))*fn++)();
++			size_t *fn = (size_t *)laddr(p, dyn[DT_INIT_ARRAY]);
++			while (n--) {
++#if DL_FDPIC
++				fpaddr(p, *fn++)();
++#else
++				((void (*)(void))*fn++)();
++#endif
++			}
+ 		}
+ 
+ 		pthread_mutex_lock(&init_fini_lock);

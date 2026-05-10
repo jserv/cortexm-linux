@@ -1,0 +1,26 @@
+diff -uNr musl-patch-old/ldso/dlstart.c musl-patch-new/ldso/dlstart.c
+--- musl-patch-old/ldso/dlstart.c	2026-05-10 03:00:12.907595304 +0800
++++ musl-patch-new/ldso/dlstart.c	2026-05-10 03:00:12.908054428 +0800
+@@ -15,6 +15,10 @@
+ 	__asm__ __volatile__ ( "" : "+m"(static_func_ptr) : : "memory"); \
+ 	*(fp) = static_func_ptr; } while(0)
+ #endif
++
++#if DL_FDPIC
++hidden void __dls2(unsigned char *, size_t *);
++#endif
+ 
+ hidden void _dlstart_c(size_t *sp, size_t *dynv)
+ {
+@@ -154,7 +158,11 @@
+ 	}
+ #endif
+ 
++#if DL_FDPIC
++	__dls2((void *)base, sp);
++#else
+ 	stage2_func dls2;
+ 	GETFUNCSYM(&dls2, __dls2, base+dyn[DT_PLTGOT]);
+ 	dls2((void *)base, sp);
++#endif
+ }

@@ -1,0 +1,162 @@
+diff -uNr musl-patch-old/arch/arm/crt_arch.h musl-patch-new/arch/arm/crt_arch.h
+--- musl-patch-old/arch/arm/crt_arch.h	2026-05-10 03:00:12.907245512 +0800
++++ musl-patch-new/arch/arm/crt_arch.h	2026-05-10 03:00:12.907745845 +0800
+@@ -1,3 +1,61 @@
++#ifdef __FDPIC__
++
++#if !defined(__thumb__) || defined(__thumb2__)
++__asm__(
++".text \n"
++".global " START " \n"
++".type " START ",%function \n"
++".thumb \n"
++".thumb_func \n"
++START ": \n"
++#ifdef SHARED
++"	mov r4, sp \n"
++"	sub r5, pc, #4 \n"
++"	ldr r1, 1f \n"
++"	add r1, r1, r5 \n"
++"	ldr r2, 2f \n"
++"	add r2, r2, r5 \n"
++"	movs r0, r8 \n"
++"	it eq \n"
++"	moveq r0, r7 \n"
++"	push {r7, r8, r9, r10} \n"
++"	bl __fdpic_fixup \n"
++"	pop {r7, r8, r9, r10} \n"
++"	push {r7, r8} \n"
++"	mov r1, r9 \n"
++"	mov r9, r0 \n"
++"	mov r0, r4 \n"
++"	bl " START "_c \n"
++".align 2 \n"
++"1:	.word __ROFIXUP_LIST__ - " START " \n"
++"2:	.word __ROFIXUP_END__ - " START " \n"
++#else
++"	sub r4, pc, #4 \n"
++"	ldr r1, 1f \n"
++"	add r1, r1, r4 \n"
++"	ldr r2, 2f \n"
++"	add r2, r2, r4 \n"
++"	mov r0, r7 \n"
++"	bl __self_reloc \n"
++"	mov r9, r0 \n"
++"	mov r0, sp \n"
++"	movs r3, #0 \n"
++"	mov fp, r3 \n"
++"	bl " START "_c \n"
++".align 2 \n"
++"1:	.word __ROFIXUP_LIST__ - " START " \n"
++"2:	.word __ROFIXUP_END__ - " START " \n"
++#endif
++);
++
++#include "fdpic_crt.h"
++
++#else
++#error ARM FDPIC requires Thumb-2 or ARM mode support in crt startup
++#endif
++
++#else
++
+ __asm__(
+ ".text \n"
+ ".global " START " \n"
+@@ -16,3 +74,5 @@
+ ".align 2 \n"
+ "1:	.word _DYNAMIC-2b \n"
+ );
++
++#endif
+diff -uNr musl-patch-old/arch/arm/pthread_arch.h musl-patch-new/arch/arm/pthread_arch.h
+--- musl-patch-old/arch/arm/pthread_arch.h	2026-05-10 03:00:12.907347137 +0800
++++ musl-patch-new/arch/arm/pthread_arch.h	2026-05-10 03:00:12.907821595 +0800
+@@ -30,3 +30,8 @@
+ #define GAP_ABOVE_TP 8
+ 
+ #define MC_PC arm_pc
++
++#ifdef __FDPIC__
++#define MC_GOT arm_r9
++#define CANCEL_GOT (*(uintptr_t *)((char *)__syscall_cp_asm+sizeof(uintptr_t)))
++#endif
+diff -uNr musl-patch-old/arch/arm/reloc.h musl-patch-new/arch/arm/reloc.h
+--- musl-patch-old/arch/arm/reloc.h	2026-05-10 03:00:12.907433137 +0800
++++ musl-patch-new/arch/arm/reloc.h	2026-05-10 03:00:12.907897512 +0800
+@@ -10,7 +10,13 @@
+ #define FP_SUFFIX ""
+ #endif
+ 
+-#define LDSO_ARCH "arm" ENDIAN_SUFFIX FP_SUFFIX
++#if __FDPIC__
++#define ABI_SUFFIX "-fdpic"
++#else
++#define ABI_SUFFIX ""
++#endif
++
++#define LDSO_ARCH "arm" ENDIAN_SUFFIX FP_SUFFIX ABI_SUFFIX
+ 
+ #define NO_LEGACY_INITFINI
+ 
+@@ -28,5 +34,41 @@
+ 
+ #define TLSDESC_BACKWARDS 1
+ 
++#if __FDPIC__
++#ifndef R_ARM_FUNCDESC
++#define R_ARM_FUNCDESC 163
++#endif
++#ifndef R_ARM_FUNCDESC_VALUE
++#define R_ARM_FUNCDESC_VALUE 164
++#endif
++#define REL_FUNCDESC    R_ARM_FUNCDESC
++#define REL_FUNCDESC_VAL R_ARM_FUNCDESC_VALUE
++#define DL_FDPIC 1
++#define DL_NOMMU_SUPPORT 1
++#define FDPIC_IS_RELATIVE(x,s) ( \
++	(R_TYPE(x) == REL_RELATIVE) || \
++	((((R_TYPE(x) == REL_FUNCDESC_VAL) || \
++	   (R_TYPE(x) == REL_SYMBOLIC)) && \
++	  (((s)[R_SYM(x)].st_info & 0xf) == STT_SECTION))) )
++#define CRTJMP(pc,sp) do { \
++	register size_t r7 __asm__("r7") = ((size_t *)(sp))[-2]; \
++	__asm__ __volatile__( \
++		"mov sp,%1 ; bx %0" \
++		: \
++		: "r"(pc), "r"(sp), "r"(r7) \
++		: "memory"); \
++} while(0)
++#define GETFUNCSYM(fp, sym, got) __asm__ ( \
++	"ldr %0, 1f \n" \
++	"ldr %0, [%1, %0] \n" \
++	"add %0, %0, %1 \n" \
++	"b 2f \n" \
++	".align 2 \n" \
++	"1: .word " #sym "(GOTFUNCDESC) \n" \
++	"2: \n" \
++	: "=&r"(*fp) : "r"(got) : "memory" )
++#else
++
+ #define CRTJMP(pc,sp) __asm__ __volatile__( \
+ 	"mov sp,%1 ; bx %0" : : "r"(pc), "r"(sp) : "memory" )
++#endif
+diff -uNr musl-patch-old/src/internal/dynlink.h musl-patch-new/src/internal/dynlink.h
+--- musl-patch-old/src/internal/dynlink.h	2026-05-10 03:00:12.907595304 +0800
++++ musl-patch-new/src/internal/dynlink.h	2026-05-10 03:00:12.908054428 +0800
+@@ -82,11 +82,14 @@
+ 	(R_TYPE(x) == REL_RELATIVE) || \
+ 	(R_TYPE(x) == REL_SYM_OR_REL && !R_SYM(x)) )
+ #else
+-#define IS_RELATIVE(x,s) ( ( \
++#ifndef FDPIC_IS_RELATIVE
++#define FDPIC_IS_RELATIVE(x,s) ( ( \
+ 	(R_TYPE(x) == REL_FUNCDESC_VAL) || \
+ 	(R_TYPE(x) == REL_SYMBOLIC) ) \
+ 	&& (((s)[R_SYM(x)].st_info & 0xf) == STT_SECTION) )
+ #endif
++#define IS_RELATIVE(x,s) FDPIC_IS_RELATIVE(x,s)
++#endif
+ 
+ #ifndef NEED_MIPS_GOT_RELOCS
+ #define NEED_MIPS_GOT_RELOCS 0

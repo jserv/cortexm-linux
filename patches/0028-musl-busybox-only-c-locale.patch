@@ -1,0 +1,136 @@
+diff --git a/src/misc/busybox_c_locale.c b/src/misc/busybox_c_locale.c
+new file mode 100644
+--- /dev/null
++++ b/src/misc/busybox_c_locale.c
+@@ -0,0 +1,131 @@
++#include <langinfo.h>
++#include <limits.h>
++#include <locale.h>
++#include <stdint.h>
++#include <string.h>
++#include "locale_impl.h"
++
++static const uint32_t empty_mo[] = { 0x950412de, 0, -1, -1, -1 };
++
++const struct __locale_map __c_dot_utf8 = {
++	.map = empty_mo,
++	.map_size = sizeof empty_mo,
++	.name = "C.UTF-8"
++};
++
++const struct __locale_struct __c_locale = { 0 };
++const struct __locale_struct __c_dot_utf8_locale = {
++	.cat[LC_CTYPE] = &__c_dot_utf8
++};
++
++static const char c_time[] =
++	"Sun\0" "Mon\0" "Tue\0" "Wed\0" "Thu\0" "Fri\0" "Sat\0"
++	"Sunday\0" "Monday\0" "Tuesday\0" "Wednesday\0"
++	"Thursday\0" "Friday\0" "Saturday\0"
++	"Jan\0" "Feb\0" "Mar\0" "Apr\0" "May\0" "Jun\0"
++	"Jul\0" "Aug\0" "Sep\0" "Oct\0" "Nov\0" "Dec\0"
++	"January\0" "February\0" "March\0" "April\0"
++	"May\0" "June\0" "July\0" "August\0"
++	"September\0" "October\0" "November\0" "December\0"
++	"AM\0" "PM\0"
++	"%a %b %e %T %Y\0"
++	"%m/%d/%y\0"
++	"%H:%M:%S\0"
++	"%I:%M:%S %p\0"
++	"\0"
++	"\0"
++	"%m/%d/%y\0"
++	"0123456789\0"
++	"%a %b %e %T %Y\0"
++	"%H:%M:%S";
++
++static const char c_messages[] = "^[yY]\0" "^[nN]\0" "yes\0" "no";
++static const char c_numeric[] = ".\0" "";
++
++static struct lconv c_lconv = {
++	.decimal_point = ".",
++	.thousands_sep = "",
++	.grouping = "",
++	.int_curr_symbol = "",
++	.currency_symbol = "",
++	.mon_decimal_point = "",
++	.mon_thousands_sep = "",
++	.mon_grouping = "",
++	.positive_sign = "",
++	.negative_sign = "",
++	.int_frac_digits = CHAR_MAX,
++	.frac_digits = CHAR_MAX,
++	.p_cs_precedes = CHAR_MAX,
++	.p_sep_by_space = CHAR_MAX,
++	.n_cs_precedes = CHAR_MAX,
++	.n_sep_by_space = CHAR_MAX,
++	.p_sign_posn = CHAR_MAX,
++	.n_sign_posn = CHAR_MAX,
++	.int_p_cs_precedes = CHAR_MAX,
++	.int_p_sep_by_space = CHAR_MAX,
++	.int_n_cs_precedes = CHAR_MAX,
++	.int_n_sep_by_space = CHAR_MAX,
++	.int_p_sign_posn = CHAR_MAX,
++	.int_n_sign_posn = CHAR_MAX,
++};
++
++char *setlocale(int cat, const char *name)
++{
++	if ((unsigned)cat > LC_ALL) return 0;
++	if (!name || !*name) return "C";
++	if (!strcmp(name, "C") || !strcmp(name, "POSIX") || !strcmp(name, "C.UTF-8"))
++		return "C";
++	return 0;
++}
++
++struct lconv *localeconv(void)
++{
++	return &c_lconv;
++}
++
++char *__nl_langinfo_l(nl_item item, locale_t loc)
++{
++	int cat = item >> 16;
++	int idx = item & 65535;
++	const char *str;
++	(void)loc;
++
++	if (item == CODESET) return "ASCII";
++	if (idx == 65535 && cat < LC_ALL) return "C";
++
++	switch (cat) {
++	case LC_NUMERIC:
++		if (idx > 1) return "";
++		str = c_numeric;
++		break;
++	case LC_TIME:
++		if (idx > 0x31) return "";
++		str = c_time;
++		break;
++	case LC_MESSAGES:
++		if (idx > 3) return "";
++		str = c_messages;
++		break;
++	default:
++		return "";
++	}
++
++	for (; idx; idx--, str++) for (; *str; str++) {}
++	return (char *)str;
++}
++
++char *nl_langinfo(nl_item item)
++{
++	return __nl_langinfo_l(item, 0);
++}
++
++hidden const char *__lctrans(const char *msg, const struct __locale_map *lm)
++{
++	(void)lm;
++	return msg;
++}
++
++hidden const char *__lctrans_cur(const char *msg) { return msg; }
++int strcoll(const char *l, const char *r) { return strcmp(l, r); }
++int strcoll_l(const char *l, const char *r, locale_t loc) { (void)loc; return strcmp(l, r); }
++

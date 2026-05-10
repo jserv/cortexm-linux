@@ -1,0 +1,16 @@
+# label|command|expected regex
+#
+# Musl-specific runtime smoke layered on top of the generic BusyBox workload.
+# Keep commands restricted to applets already enabled in configs/busybox-1.37.0.config.
+loader-path|busybox ls -l /lib/ld-musl-arm-fdpic.so.1 >/dev/null && busybox echo ok|ok
+libc-path|busybox ls /lib/libc.so >/dev/null && busybox echo ok|ok
+shell-link|busybox ls -l /bin/sh >/dev/null && busybox echo ok|ok
+uname|busybox uname -s >/dev/null && busybox echo ok|ok
+list-bin|busybox ls /bin >/dev/null && busybox echo ok|ok
+proc-version|busybox cat /proc/version >/dev/null && busybox echo ok|ok
+proc-self-stat|busybox cat /proc/self/stat >/dev/null && busybox echo ok|ok
+create-file|busybox sh -c 'busybox echo alpha >/tmp/musl-file && busybox cat /tmp/musl-file >/dev/null' && busybox echo ok|ok
+copy-file|busybox sh -c 'busybox cp /bin/busybox /tmp/musl-copy && busybox ls /tmp/musl-copy >/dev/null' && busybox echo ok|ok
+rename-file|busybox sh -c 'busybox mv /tmp/musl-file /tmp/musl-file-renamed && busybox cat /tmp/musl-file-renamed >/dev/null' && busybox echo ok|ok
+hardlink-file|busybox sh -c 'busybox ln /tmp/musl-file-renamed /tmp/musl-file-link && busybox ls /tmp/musl-file-link >/dev/null' && busybox echo ok|ok
+cleanup-tmp|busybox sh -c 'busybox rm -f /tmp/musl-file-renamed /tmp/musl-file-link /tmp/musl-copy' && busybox echo ok|ok

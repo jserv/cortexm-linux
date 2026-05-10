@@ -1,0 +1,48 @@
+--- a/coreutils/printf.c
++++ b/coreutils/printf.c
+@@ -117,6 +117,7 @@
+ 		arg++;
+ 	*(long long*)result = bb_strtoll(arg, NULL, 0);
+ }
++#ifndef BUSYBOX_ONLY_NO_PRINTF_FLOAT
+ static void FAST_FUNC conv_strtod(const char *arg, void *result)
+ {
+ 	char *end;
+@@ -130,6 +131,7 @@
+ 		*(double*)result = 0;
+ 	}
+ }
++#endif
+ 
+ /* Callers should check errno to detect errors */
+ static unsigned long long my_xstrtoull(const char *arg)
+@@ -147,6 +149,7 @@
+ 		result = 0;
+ 	return result;
+ }
++#ifndef BUSYBOX_ONLY_NO_PRINTF_FLOAT
+ static double my_xstrtod(const char *arg)
+ {
+ 	double result;
+@@ -154,6 +157,7 @@
+ 	multiconvert(arg, &result, conv_strtod);
+ 	return result;
+ }
++#endif
+ 
+ /* Handles %b; return 1 if output is to be short-circuited by \c */
+ static int print_esc_string(const char *str)
+@@ -256,7 +260,13 @@
+ 	case 'E':
+ 	case 'g':
+ 	case 'G':
++#ifdef BUSYBOX_ONLY_NO_PRINTF_FLOAT
++		errno = ERANGE;
++		dv = 0;
++		bb_error_msg("floating point formats are disabled");
++#else
+ 		dv = my_xstrtod(argument);
++#endif
+ 		if (!have_width) {
+ 			if (!have_prec)
+ 				printf(format, dv);
