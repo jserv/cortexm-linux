@@ -1,0 +1,35 @@
+patches/0037-musl-fdpic-init-array-fpaddr.patch
+  s_b4785df786ceb8::t_1adac1e1f6c0c5 4
+  s_b4785df786ceb8::t_ecf8dc7561c875 21
+patches/0040-musl-fdpic-laddr-idempotent.patch
+  s_b4785df786ceb8::t_d25e2dd3bbc82f 1-21
+patches/0036-musl-fdpic-dlstart-handle-rel.patch
+  s_b4785df786ceb8::t_49315bb98aecdd 4,6-25
+  s_b4785df786ceb8::t_3da87b0da262ff 26
+  s_b4785df786ceb8::t_f533d0a480136f 62
+  s_b4785df786ceb8::t_ca0b67c1fc0696 34-47,68-81
+  s_b4785df786ceb8::t_6d230ab83195bc 5,27-29
+build.sh
+  s_b4785df786ceb8::t_347cea29a6a094 119
+  s_b4785df786ceb8::t_6f84b9490e0835 174
+  s_b4785df786ceb8::t_eef4508be791d7 596
+  s_b4785df786ceb8::t_0a42fdaaea0e1d 599
+  s_b4785df786ceb8::t_90e2f1b885eefb 35
+  s_b4785df786ceb8::t_dfd86b1c36e5e9 171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "f1ad60cdcc367647c88b5fd1e8f6c7f09a62886f",
+  "prompts": {},
+  "sessions": {
+    "s_b4785df786ceb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eb6a81fb-42d3-45ff-a82c-9dd7e20b562d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
