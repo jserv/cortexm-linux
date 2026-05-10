@@ -11,12 +11,85 @@ MODE=${5:-full}
 TARGET=arm-uclinuxfdpiceabi
 SIZE_TOOL=${ROOTDIR}/toolchain/bin/${TARGET}-size
 NM_TOOL=${ROOTDIR}/toolchain/bin/${TARGET}-nm
+READELF_TOOL=${ROOTDIR}/toolchain/bin/${TARGET}-readelf
 SUBSYSTEM_ROLLUP=${ROOTDIR}/scripts/subsystem-rollup.py
 SUBSYSTEM_BUDGET_CHECK=${ROOTDIR}/scripts/check-subsystem-budget.py
 SUBSYSTEM_BUDGET_FILE=${ROOTDIR}/configs/subsystem-budget.txt
 BLOAT_O_METER=${LINUXDIR}/scripts/bloat-o-meter
+ROOTFS_DIR=${ROOTDIR}/rootfs
 
 mkdir -p "${OUTDIR}"
+
+resolve_rootfs_path() {
+    path=$1
+    depth=${2:-0}
+
+    [ "${depth}" -lt 32 ] || return 1
+    [ -e "${path}" ] || [ -L "${path}" ] || return 1
+
+    if [ -L "${path}" ]; then
+        target=$(readlink "${path}")
+        case "${target}" in
+        /*)
+            next=${ROOTFS_DIR}${target}
+            ;;
+        *)
+            next=$(dirname "${path}")/${target}
+            ;;
+        esac
+        resolve_rootfs_path "${next}" $((depth + 1))
+        return 0
+    fi
+
+    readlink -f "${path}"
+}
+
+resolve_runtime_elf() {
+    name=$1
+
+    case "${name}" in
+    /*)
+        candidate=${ROOTFS_DIR}${name}
+        resolve_rootfs_path "${candidate}" && return 0
+        ;;
+    esac
+
+    for dir in \
+        "${ROOTFS_DIR}/lib" \
+        "${ROOTFS_DIR}/usr/lib" \
+        "${ROOTDIR}/toolchain/${TARGET}/lib" \
+        "${ROOTDIR}/toolchain/${TARGET}/usr/lib"; do
+        candidate=${dir}/$(basename "${name}")
+        if [ "${dir#${ROOTFS_DIR}/}" != "${dir}" ]; then
+            resolve_rootfs_path "${candidate}" && return 0
+        elif [ -e "${candidate}" ] || [ -L "${candidate}" ]; then
+            readlink -f "${candidate}" && return 0
+        fi
+    done
+
+    return 1
+}
+
+runtime_elf_artifacts() {
+    [ -x "${READELF_TOOL}" ] || return 0
+    [ -f "${ROOTFS_DIR}/bin/busybox" ] || return 0
+
+    {
+        LC_ALL=C "${READELF_TOOL}" -l "${ROOTFS_DIR}/bin/busybox" |
+            sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' |
+            while IFS= read -r interp; do
+                [ -n "${interp}" ] || continue
+                resolve_runtime_elf "${interp}" || true
+            done
+
+        LC_ALL=C "${READELF_TOOL}" -d "${ROOTFS_DIR}/bin/busybox" |
+            sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' |
+            while IFS= read -r needed; do
+                [ -n "${needed}" ] || continue
+                resolve_runtime_elf "${needed}" || true
+            done
+    } | awk 'NF && !seen[$0]++'
+}
 
 report_file_sizes() {
     {
@@ -24,13 +97,25 @@ report_file_sizes() {
         for f in \
             "${LINUXDIR}/vmlinux" \
             "${LINUXDIR}/arch/arm/boot/Image" \
-            "${ROOTDIR}/rootfs/bin/busybox" \
-            "${ROOTDIR}/toolchain/${TARGET}/lib/libc.so" \
-            "${ROOTDIR}/toolchain/${TARGET}/lib/ld-uClibc.so.0" \
+            "${ROOTFS_DIR}/bin/busybox" \
             "${BOOTWRAPPERDIR}/linux.axf"; do
             [ -f "${f}" ] || continue
             printf '%s %s\n' "${f}" "$(wc -c <"${f}" | tr -d ' ')"
         done
+
+        runtime_elf_artifacts | while IFS= read -r f; do
+            [ -f "${f}" ] || continue
+            printf '%s %s\n' "${f}" "$(wc -c <"${f}" | tr -d ' ')"
+        done
+
+        if [ -d "${ROOTFS_DIR}/lib" ]; then
+            printf '%s %s\n' "${ROOTFS_DIR}/lib-total" \
+                "$(du -sb "${ROOTFS_DIR}/lib" | cut -f1)"
+        fi
+        if [ -d "${ROOTFS_DIR}/usr/lib" ]; then
+            printf '%s %s\n' "${ROOTFS_DIR}/usr/lib-total" \
+                "$(du -sb "${ROOTFS_DIR}/usr/lib" | cut -f1)"
+        fi
 
         if [ -f "${LINUXDIR}/arch/arm/boot/Image" ]; then
             printf '%s %s\n' "${LINUXDIR}/arch/arm/boot/Image.gz" \
@@ -58,9 +143,16 @@ report_sections() {
     {
         for f in \
             "${LINUXDIR}/vmlinux" \
-            "${ROOTDIR}/rootfs/bin/busybox" \
-            "${ROOTDIR}/toolchain/${TARGET}/lib/libc.so" \
-            "${ROOTDIR}/toolchain/${TARGET}/lib/ld-uClibc.so.0"; do
+            "${ROOTFS_DIR}/bin/busybox"; do
+            [ -f "${f}" ] || continue
+            echo "== ${f} =="
+            if ! "${SIZE_TOOL}" -A "${f}" 2>&1; then
+                echo "[size tool skipped unsupported file]"
+            fi
+            echo
+        done
+
+        runtime_elf_artifacts | while IFS= read -r f; do
             [ -f "${f}" ] || continue
             echo "== ${f} =="
             if ! "${SIZE_TOOL}" -A "${f}" 2>&1; then

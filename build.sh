@@ -4,7 +4,7 @@
 #
 # This script produces a self-contained, bootable Linux image targeting the Arm
 # MPS2-AN386 FPGA platform (Cortex-M4, no MMU, Thumb-2 only).
-# It builds a first-pass GCC cross-compiler (C only), shared FDPIC uClibc-ng,
+# It builds a first-pass GCC cross-compiler (C only), a shared FDPIC libc,
 # BusyBox for a minimal userspace, and a Linux kernel with embedded initramfs.
 
 set -e
@@ -18,6 +18,7 @@ FLAVOR=cortexm-fdpic
 BINUTILS_VERSION=2.46.0
 GCC_VERSION=16.1.0
 UCLIBC_NG_VERSION=1.0.57
+MUSL_VERSION=1.2.5
 BUSYBOX_VERSION=1.37.0
 LINUX_VERSION=7.0
 
@@ -31,6 +32,7 @@ GCC_URL=https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz
 # back below to keep configs/uClibc-ng-*.config and the rest of this
 # script unchanged).
 UCLIBC_NG_URL=https://github.com/wbx-github/uclibc-ng/archive/refs/tags/v${UCLIBC_NG_VERSION}.tar.gz
+MUSL_URL=https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz
 BUSYBOX_URL=https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
 LINUX_URL=https://www.kernel.org/pub/linux/kernel/v7.x/linux-${LINUX_VERSION}.tar.xz
 
@@ -61,6 +63,45 @@ PGO_BASE_CONFIG_FRAGMENT=${PGO_BASE_CONFIG_FRAGMENT:-${ROOTDIR}/configs/kernel-p
 # Keep the default empty; production defaults to no kernel LTO because
 # the current pruned image is smaller without it.
 KERNEL_LTO_EXTRA_CFLAGS=${KERNEL_LTO_EXTRA_CFLAGS:-}
+LIBC_IMPL_EXPLICIT=0
+if [ "${LIBC_IMPL+x}" = x ]; then
+    LIBC_IMPL_EXPLICIT=1
+fi
+EXPERIMENTAL_MUSL_DEFAULT=${EXPERIMENTAL_MUSL_DEFAULT:-0}
+if [ "${LIBC_IMPL_EXPLICIT}" = "0" ]; then
+    if [ "${EXPERIMENTAL_MUSL_DEFAULT}" = "1" ]; then
+        LIBC_IMPL=musl
+    else
+        LIBC_IMPL=uclibc-ng
+    fi
+fi
+# Closest musl-side matches for the size-oriented uClibc-ng config:
+# simple allocator, section-friendly codegen, GNU hash-only dynamic
+# linker metadata, no legacy time32 compatibility shims, and a
+# BusyBox-only source set that drops unused subsystems plus most of
+# musl's locale/multibyte/wide-char machinery in favor of tiny
+# ASCII/C-locale replacements.
+MUSL_MALLOC_DIR=${MUSL_MALLOC_DIR:-oldmalloc}
+MUSL_DISABLE_COMPAT_TIME32=${MUSL_DISABLE_COMPAT_TIME32:-1}
+# GCC 15 on this target shrinks musl materially with -Oz and
+# -fno-semantic-interposition. The latter is safe for this BusyBox-only
+# shared-libc profile and reduces internal PIC call overhead/size by
+# letting the compiler assume musl's own global definitions are final.
+MUSL_EXTRA_CFLAGS=${MUSL_EXTRA_CFLAGS:--Oz -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -fno-semantic-interposition}
+MUSL_EXTRA_LDFLAGS=${MUSL_EXTRA_LDFLAGS:--Wl,--gc-sections -Wl,--hash-style=gnu}
+MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL=${MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL:-1}
+MUSL_BUSYBOX_ONLY_NO_TZFILE=${MUSL_BUSYBOX_ONLY_NO_TZFILE:-1}
+# Experimental: generate a BusyBox-derived musl export map and relink
+# libc against it. This is currently useful as a size-analysis tool, but
+# the pruned-export FDPIC runtime is not yet proven bootable enough to be
+# the default build path on this target.
+MUSL_BUSYBOX_ONLY_EXPORT_MAP=${MUSL_BUSYBOX_ONLY_EXPORT_MAP:-0}
+MUSL_BUSYBOX_EXPORT_MAP_PATH=${MUSL_BUSYBOX_EXPORT_MAP_PATH:-${STATE_DIR}/musl-busybox-exports.map}
+MUSL_BUSYBOX_EXPORT_MAP_MAX_PASSES=${MUSL_BUSYBOX_EXPORT_MAP_MAX_PASSES:-2}
+MUSL_PRUNE_UNUSED_MATH=${MUSL_PRUNE_UNUSED_MATH:-1}
+MUSL_KEEP_MATH_SRCS=${MUSL_KEEP_MATH_SRCS:-copysign.c copysignl.c fabs.c fabsl.c fmod.c fmodl.c frexp.c frexpl.c scalbn.c scalbnf.c scalbnl.c}
+MUSL_OMIT_SRCS_GLOBS=${MUSL_OMIT_SRCS_GLOBS:-./src/aio/*.c ./src/complex/*.c ./src/crypt/*.c ./src/mq/*.c ./src/locale/*.c ./src/multibyte/*.c ./src/ctype/isw*.c ./src/ctype/tow*.c ./src/ctype/wc*.c ./src/misc/wordexp.c ./src/misc/nftw.c ./src/legacy/ftw.c ./src/time/__map_file.c ./src/regex/regcomp.c ./src/regex/regerror.c ./src/regex/regexec.c ./src/regex/tre-mem.c ./src/stdlib/atof.c ./src/stdlib/strtod.c ./src/stdlib/wcstod.c}
+BUSYBOX_ONLY_NO_PRINTF_FLOAT=${BUSYBOX_ONLY_NO_PRINTF_FLOAT:-1}
 
 NCPU=$(grep -c processor /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 MAKE_JOBS=${MAKE_JOBS:-${NCPU}}
@@ -75,14 +116,79 @@ mkdir -p "${LOGDIR}" "${STATE_DIR}"
 CHECKSUM_binutils="binutils-${BINUTILS_VERSION}.tar.xz=d75a94f4d73e7a4086f7513e67e439e8fcdcbb726ffe63f4661744e6256b2cf2"
 CHECKSUM_gcc="gcc-${GCC_VERSION}.tar.xz=50efb4d94c3397aff3b0d61a5abd748b4dd31d9d3f2ab7be05b171d36a510f79"
 CHECKSUM_uclibc="v${UCLIBC_NG_VERSION}.tar.gz=f49704e0affc75fde9ee4e870c20e53c1d807eca2a4683377b359b8361e84312"
+CHECKSUM_musl="musl-${MUSL_VERSION}.tar.gz=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"
 CHECKSUM_busybox="busybox-${BUSYBOX_VERSION}.tar.bz2=3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
 CHECKSUM_linux="linux-${LINUX_VERSION}.tar.xz=bb7f6d80b387c757b7d14bb93028fcb90f793c5c0d367736ee815a100b3891f0"
 
+assert_supported_libc() {
+    case "${LIBC_IMPL}" in
+    uclibc-ng)
+        return 0
+        ;;
+    musl)
+        return 0
+        ;;
+    *)
+        echo "ERROR: unsupported LIBC_IMPL='${LIBC_IMPL}' (expected 'uclibc-ng' or 'musl')" >&2
+        exit 1
+        ;;
+    esac
+}
+
+libc_config_glob() {
+    case "${LIBC_IMPL}" in
+    uclibc-ng) echo "configs/uClibc-ng-*" ;;
+    musl) echo "configs/musl-*" ;;
+    *)
+        echo "ERROR: unsupported LIBC_IMPL='${LIBC_IMPL}' (expected 'uclibc-ng' or 'musl')" >&2
+        exit 1
+        ;;
+    esac
+}
+
 toolchain_fingerprint() {
+    LIBC_CONFIGS=$(libc_config_glob)
     {
         sha256sum build.sh
         sha256sum patches/0001-* 2>/dev/null || true
-        sha256sum configs/uClibc-ng-* 2>/dev/null || true
+        sha256sum ${LIBC_CONFIGS} 2>/dev/null || true
+        printf 'EXPERIMENTAL_MUSL_DEFAULT=%s\n' "${EXPERIMENTAL_MUSL_DEFAULT}"
+        printf 'LIBC_IMPL=%s\n' "${LIBC_IMPL}"
+        if [ "${LIBC_IMPL}" = "musl" ]; then
+            sha256sum \
+                patches/0024-musl-* \
+                patches/0025-musl-* \
+                patches/0026-musl-* \
+                patches/0027-musl-* \
+                patches/0028-musl-* \
+                patches/0029-musl-* \
+                patches/0030-musl-* \
+                patches/0031-musl-* \
+                patches/0033-musl-* \
+                patches/0034-musl-* \
+                patches/0035-musl-* \
+                patches/0036-musl-* \
+                patches/0037-musl-* \
+                patches/0038-musl-* \
+                patches/0039-musl-* \
+                patches/0040-musl-* \
+                support/arm-fdpic-crtreloc.c \
+                2>/dev/null || true
+            printf 'MUSL_MALLOC_DIR=%s\n' "${MUSL_MALLOC_DIR}"
+            printf 'MUSL_DISABLE_COMPAT_TIME32=%s\n' "${MUSL_DISABLE_COMPAT_TIME32}"
+            printf 'MUSL_EXTRA_CFLAGS=%s\n' "${MUSL_EXTRA_CFLAGS}"
+            printf 'MUSL_EXTRA_LDFLAGS=%s\n' "${MUSL_EXTRA_LDFLAGS}"
+            printf 'MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL=%s\n' "${MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL}"
+            printf 'MUSL_BUSYBOX_ONLY_NO_TZFILE=%s\n' "${MUSL_BUSYBOX_ONLY_NO_TZFILE}"
+            printf 'MUSL_BUSYBOX_ONLY_EXPORT_MAP=%s\n' "${MUSL_BUSYBOX_ONLY_EXPORT_MAP}"
+            printf 'MUSL_PRUNE_UNUSED_MATH=%s\n' "${MUSL_PRUNE_UNUSED_MATH}"
+            printf 'MUSL_KEEP_MATH_SRCS=%s\n' "${MUSL_KEEP_MATH_SRCS}"
+            printf 'MUSL_OMIT_SRCS_GLOBS=%s\n' "${MUSL_OMIT_SRCS_GLOBS}"
+            printf 'BUSYBOX_ONLY_NO_PRINTF_FLOAT=%s\n' "${BUSYBOX_ONLY_NO_PRINTF_FLOAT}"
+            if [ -f "${MUSL_BUSYBOX_EXPORT_MAP_PATH}" ]; then
+                sha256sum "${MUSL_BUSYBOX_EXPORT_MAP_PATH}"
+            fi
+        fi
     } | sha256sum | cut -d' ' -f1
 }
 
@@ -109,12 +215,16 @@ image_fingerprint() {
     } | sha256sum | cut -d' ' -f1
 }
 
-TOOLCHAIN_FP=$(toolchain_fingerprint)
-IMAGE_FP=$(image_fingerprint "${TOOLCHAIN_FP}")
+refresh_build_fingerprints() {
+    TOOLCHAIN_FP=$(toolchain_fingerprint)
+    IMAGE_FP=$(image_fingerprint "${TOOLCHAIN_FP}")
+}
+
+refresh_build_fingerprints
 
 stage_fingerprint() {
     case "$1" in
-    binutils|gcc|linux_headers|uClibc)
+    binutils|gcc|linux_headers|libc)
         printf '%s' "${TOOLCHAIN_FP}" ;;
     *)
         printf '%s' "${IMAGE_FP}" ;;
@@ -180,7 +290,7 @@ stage_verify_linux_headers() {
     [ -f "${TOOLCHAIN}/${TARGET}/include/linux/types.h" ]
 }
 
-stage_verify_uClibc() {
+stage_verify_libc() {
     [ -f "${TOOLCHAIN}/${TARGET}/lib/libc.a" ] || [ -f "${TOOLCHAIN}/${TARGET}/lib/libc.so" ]
 }
 
@@ -198,12 +308,13 @@ stage_verify_finalize_rootfs() {
 
     INTERP=$(LC_ALL=C "${READELF}" -l "${ROOTFS}/bin/busybox" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
     [ -z "${INTERP}" ] && return 0
-    [ -e "${ROOTFS}${INTERP}" ] || return 1
+    [ -e "${ROOTFS}${INTERP}" ] || [ -L "${ROOTFS}${INTERP}" ] || return 1
 
     _needed_libs=$(LC_ALL=C "${READELF}" -d "${ROOTFS}/bin/busybox" 2>/dev/null |
         sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
     for needed in ${_needed_libs}; do
-        [ -e "${ROOTFS}/lib/${needed}" ] || [ -e "${ROOTFS}/usr/lib/${needed}" ] || return 1
+        [ -e "${ROOTFS}/lib/${needed}" ] || [ -L "${ROOTFS}/lib/${needed}" ] ||
+            [ -e "${ROOTFS}/usr/lib/${needed}" ] || [ -L "${ROOTFS}/usr/lib/${needed}" ] || return 1
     done
 }
 
@@ -251,7 +362,7 @@ stage_clean() {
     binutils)       rm -rf "binutils-${BINUTILS_VERSION}" ;;
     gcc)            rm -rf "gcc-${GCC_VERSION}" ;;
     linux_headers)  rm -rf "linux-${LINUX_VERSION}" ;;  # shared with linux; both extract fresh
-    uClibc)         rm -rf "uClibc-ng-${UCLIBC_NG_VERSION}" ;;
+    libc)           rm -rf "uClibc-ng-${UCLIBC_NG_VERSION}" "musl-${MUSL_VERSION}" ;;
     busybox)        rm -rf "busybox-${BUSYBOX_VERSION}" "${ROOTFS}" ;;
     finalize_rootfs) ;; # idempotent; overwrites its outputs
     linux)          rm -rf "linux-${LINUX_VERSION}" ;;
@@ -427,7 +538,7 @@ build_linux_headers() {
     cd ../
 }
 
-build_uClibc() {
+build_uclibc_ng() {
     echo "BUILD: building uClibc-${UCLIBC_NG_VERSION}"
     fetch_file "${UCLIBC_NG_URL}" "${CHECKSUM_uclibc}"
 
@@ -463,6 +574,307 @@ build_uClibc() {
     cd ../
 }
 
+build_musl() {
+    echo "BUILD: building musl-${MUSL_VERSION}"
+    fetch_file "${MUSL_URL}" "${CHECKSUM_musl}"
+
+    extract_source "musl-${MUSL_VERSION}.tar.gz" "musl-${MUSL_VERSION}" -xzf
+    cd musl-${MUSL_VERSION}
+
+    apply_patch_once ../patches/0024-musl-arm-fdpic-dynamic-linking.patch
+    apply_patch_once ../patches/0025-musl-tiny-iconv.patch
+    apply_patch_once ../patches/0026-musl-allow-omitting-source-globs.patch
+    apply_patch_once ../patches/0027-musl-busybox-only-c-locale-and-ascii-multibyte.patch
+    apply_patch_once ../patches/0028-musl-busybox-only-c-locale.patch
+    apply_patch_once ../patches/0029-musl-busybox-only-disable-runtime-dlfcn.patch
+    apply_patch_once ../patches/0030-musl-busybox-only-minimal-dlfcn-stubs.patch
+    apply_patch_once ../patches/0031-musl-busybox-only-no-tzfile.patch
+    apply_patch_once ../patches/0033-musl-fdpic-dlstart-direct-dls2.patch
+    apply_patch_once ../patches/0034-musl-arm-fdpic-soft-tp.patch
+    apply_patch_once ../patches/0035-musl-fdpic-local-funcdesc-got.patch
+    apply_patch_once ../patches/0036-musl-fdpic-dlstart-handle-rel.patch
+    apply_patch_once ../patches/0037-musl-fdpic-init-array-fpaddr.patch
+    apply_patch_once ../patches/0038-musl-fdpic-runtime-relative-laddr.patch
+    apply_patch_once ../patches/0039-musl-arm-fdpic-xip-aware-loadmap-and-textrel.patch
+    apply_patch_once ../patches/0040-musl-fdpic-laddr-idempotent.patch
+    # musl's ARM TLS fast paths assume CP15/kuser helper conventions that
+    # do not hold on this Cortex-M FDPIC target. Force direct TP reads
+    # through the working Thumb syscall ABI instead of function-pointer
+    # or CP15-based helpers.
+    cat > arch/arm/pthread_arch.h <<'EOF'
+#ifdef __FDPIC__
+static inline uintptr_t __get_tp()
+{
+	extern hidden uintptr_t __aeabi_read_tp(void);
+	return __aeabi_read_tp();
+}
+#elif ((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
+ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7
+
+static inline uintptr_t __get_tp()
+{
+	uintptr_t tp;
+	__asm__ ( "mrc p15,0,%0,c13,c0,3" : "=r"(tp) );
+	return tp;
+}
+
+#else
+
+#if __ARM_ARCH_4__ || __ARM_ARCH_4T__ || __ARM_ARCH == 4
+#define BLX "mov lr,pc\n\tbx"
+#else
+#define BLX "blx"
+#endif
+
+static inline uintptr_t __get_tp()
+{
+	extern hidden uintptr_t __a_gettp_ptr;
+	register uintptr_t tp __asm__("r0");
+	__asm__ ( BLX " %1" : "=r"(tp) : "r"(__a_gettp_ptr) : "cc", "lr" );
+	return tp;
+}
+
+#endif
+
+#define TLS_ABOVE_TP
+#define GAP_ABOVE_TP 8
+
+#define MC_PC arm_pc
+
+#ifdef __FDPIC__
+#define MC_GOT arm_r9
+#define CANCEL_GOT (*(uintptr_t *)((char *)__syscall_cp_asm+sizeof(uintptr_t)))
+#endif
+EOF
+    cat > src/thread/arm/__aeabi_read_tp.s <<'EOF'
+.syntax unified
+.global __aeabi_read_tp
+.type __aeabi_read_tp,%function
+__aeabi_read_tp:
+#if __FDPIC__
+	push {r7}
+	mov r7, #0x0f0000
+	orr r7, r7, #6
+	svc #0
+	pop {r7}
+	bx lr
+#else
+	ldr r0,1f
+	add r0,r0,pc
+	ldr r0,[r0]
+2:	bx r0
+	.align 2
+1:	.word __a_gettp_ptr - 2b
+#endif
+EOF
+    cat > src/ldso/arm/tlsdesc.S <<'EOF'
+.syntax unified
+
+.text
+.global __tlsdesc_static
+.hidden __tlsdesc_static
+.type __tlsdesc_static,%function
+__tlsdesc_static:
+	ldr r0,[r0]
+	bx lr
+
+.global __tlsdesc_dynamic
+.hidden __tlsdesc_dynamic
+.type __tlsdesc_dynamic,%function
+__tlsdesc_dynamic:
+	push {r2,r3,ip,lr}
+	ldr r1,[r0]
+	ldr r2,[r1,#4]
+	ldr r1,[r1]
+
+#if __FDPIC__
+	push {r7}
+	mov r7, #0x0f0000
+	orr r7, r7, #6
+	svc #0
+	pop {r7}
+#elif ((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
+ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7
+	mrc p15,0,r0,c13,c0,3
+#else
+	ldr r0,1f
+	add r0,r0,pc
+	ldr r0,[r0]
+2:
+#if __ARM_ARCH >= 5
+	blx r0
+#else
+#if __thumb__
+	add lr,pc,#1
+#else
+	mov lr,pc
+#endif
+	bx r0
+#endif
+#endif
+	ldr r3,[r0,#-4]
+	ldr ip,[r3,r1,LSL #2]
+	sub r0,ip,r0
+	add r0,r0,r2
+#if __ARM_ARCH >= 5
+	pop {r2,r3,ip,pc}
+#else
+	pop {r2,r3,ip,lr}
+	bx lr
+#endif
+
+#if __FDPIC__ || (((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
+ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7)
+#else
+	.align 2
+1:	.word __a_gettp_ptr - 2b
+#endif
+EOF
+    MUSL_EFFECTIVE_CFLAGS=${MUSL_EXTRA_CFLAGS}
+    MUSL_EFFECTIVE_LDFLAGS=${MUSL_EXTRA_LDFLAGS}
+    if [ "${MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL}" = "1" ]; then
+        MUSL_EFFECTIVE_CFLAGS="${MUSL_EFFECTIVE_CFLAGS} -DMUSL_BUSYBOX_ONLY_NO_RUNTIME_DL=1"
+    fi
+    if [ "${MUSL_BUSYBOX_ONLY_NO_TZFILE}" = "1" ]; then
+        MUSL_EFFECTIVE_CFLAGS="${MUSL_EFFECTIVE_CFLAGS} -DMUSL_BUSYBOX_ONLY_NO_TZFILE=1"
+    fi
+    if [ "${MUSL_BUSYBOX_ONLY_EXPORT_MAP}" = "1" ] &&
+       [ "${MUSL_BUSYBOX_EXPORT_MAP_PASS:-0}" -gt 0 ] &&
+       [ -f "${MUSL_BUSYBOX_EXPORT_MAP_PATH}" ]; then
+        MUSL_EFFECTIVE_LDFLAGS="${MUSL_EFFECTIVE_LDFLAGS} -Wl,--version-script=${MUSL_BUSYBOX_EXPORT_MAP_PATH}"
+    fi
+    MUSL_EFFECTIVE_OMIT_SRCS_GLOBS=${MUSL_OMIT_SRCS_GLOBS}
+    if [ "${MUSL_PRUNE_UNUSED_MATH}" = "1" ]; then
+        for math_src in src/math/*.c; do
+            math_keep=0
+            for keep_src in ${MUSL_KEEP_MATH_SRCS}; do
+                if [ "$(basename "${math_src}")" = "${keep_src}" ]; then
+                    math_keep=1
+                    break
+                fi
+            done
+            if [ "${math_keep}" = "0" ]; then
+                MUSL_EFFECTIVE_OMIT_SRCS_GLOBS="${MUSL_EFFECTIVE_OMIT_SRCS_GLOBS} ./${math_src}"
+            fi
+        done
+        for math_src in src/math/arm/*.c; do
+            MUSL_EFFECTIVE_OMIT_SRCS_GLOBS="${MUSL_EFFECTIVE_OMIT_SRCS_GLOBS} ./${math_src}"
+        done
+    fi
+
+    run_logged "configure" env \
+        CC=${TOOLCHAIN}/bin/${TARGET}-gcc \
+        AR=${TOOLCHAIN}/bin/${TARGET}-ar \
+        RANLIB=${TOOLCHAIN}/bin/${TARGET}-ranlib \
+        ./configure --prefix=/ --syslibdir=/lib
+    if [ "${MUSL_DISABLE_COMPAT_TIME32}" = "1" ]; then
+        # This build only targets our bundled BusyBox on a modern kernel,
+        # so we can drop the 32-bit time ABI compatibility shims to save
+        # space in the shared libc.
+        run_logged "build" make -j${MAKE_JOBS} \
+            MALLOC_DIR=${MUSL_MALLOC_DIR} \
+            STARTFILE_CRT=rcrt1.o \
+            LDSO_ABI_SUFFIX=-fdpic \
+            COMPAT_SRC_DIRS= \
+            "OMIT_SRCS_GLOBS=${MUSL_EFFECTIVE_OMIT_SRCS_GLOBS}" \
+            "CFLAGS=${MUSL_EFFECTIVE_CFLAGS}" \
+            "LDFLAGS=${MUSL_EFFECTIVE_LDFLAGS}"
+    else
+        run_logged "build" make -j${MAKE_JOBS} \
+            MALLOC_DIR=${MUSL_MALLOC_DIR} \
+            STARTFILE_CRT=rcrt1.o \
+            LDSO_ABI_SUFFIX=-fdpic \
+            "OMIT_SRCS_GLOBS=${MUSL_EFFECTIVE_OMIT_SRCS_GLOBS}" \
+            "CFLAGS=${MUSL_EFFECTIVE_CFLAGS}" \
+            "LDFLAGS=${MUSL_EFFECTIVE_LDFLAGS}"
+    fi
+
+    MUSL_KERNEL_HEADERS_BACKUP=${ROOTDIR}/.musl-kernel-headers
+    rm -rf "${MUSL_KERNEL_HEADERS_BACKUP}"
+    mkdir -p "${MUSL_KERNEL_HEADERS_BACKUP}"
+    for hdr_dir in asm asm-generic drm linux misc mtd rdma scsi sound video xen; do
+        [ -e "${TOOLCHAIN}/${TARGET}/include/${hdr_dir}" ] || continue
+        cp -a "${TOOLCHAIN}/${TARGET}/include/${hdr_dir}" "${MUSL_KERNEL_HEADERS_BACKUP}/"
+    done
+
+    rm -rf "${TOOLCHAIN}/${TARGET}/lib"
+    rm -rf "${TOOLCHAIN}/${TARGET}/include"
+    if [ "${MUSL_DISABLE_COMPAT_TIME32}" = "1" ]; then
+        run_logged "install" make \
+            MALLOC_DIR=${MUSL_MALLOC_DIR} \
+            STARTFILE_CRT=rcrt1.o \
+            LDSO_ABI_SUFFIX=-fdpic \
+            COMPAT_SRC_DIRS= \
+            "OMIT_SRCS_GLOBS=${MUSL_EFFECTIVE_OMIT_SRCS_GLOBS}" \
+            "CFLAGS=${MUSL_EFFECTIVE_CFLAGS}" \
+            "LDFLAGS=${MUSL_EFFECTIVE_LDFLAGS}" \
+            install DESTDIR="${TOOLCHAIN}/${TARGET}"
+    else
+        run_logged "install" make \
+            MALLOC_DIR=${MUSL_MALLOC_DIR} \
+            STARTFILE_CRT=rcrt1.o \
+            LDSO_ABI_SUFFIX=-fdpic \
+            "OMIT_SRCS_GLOBS=${MUSL_EFFECTIVE_OMIT_SRCS_GLOBS}" \
+            "CFLAGS=${MUSL_EFFECTIVE_CFLAGS}" \
+            "LDFLAGS=${MUSL_EFFECTIVE_LDFLAGS}" \
+            install DESTDIR="${TOOLCHAIN}/${TARGET}"
+    fi
+    for hdr_dir in asm asm-generic drm linux misc mtd rdma scsi sound video xen; do
+        [ -e "${MUSL_KERNEL_HEADERS_BACKUP}/${hdr_dir}" ] || continue
+        cp -a "${MUSL_KERNEL_HEADERS_BACKUP}/${hdr_dir}" "${TOOLCHAIN}/${TARGET}/include/"
+    done
+    rm -rf "${MUSL_KERNEL_HEADERS_BACKUP}"
+
+    # GCC's arm-uclinuxfdpiceabi FDPIC PIE specs expect musl's shared
+    # startup object plus a real __self_reloc implementation. Keep
+    # musl's Scrt1.o and provide an ARM FDPIC crtreloc.o instead of a
+    # placeholder.
+    cp lib/Scrt1.o "${TOOLCHAIN}/${TARGET}/lib/Scrt1.o"
+    ln -sf /lib/libc.so "${TOOLCHAIN}/${TARGET}/lib/ld-musl-arm-fdpic.so.1"
+    run_logged "build crtreloc" \
+        "${TOOLCHAIN}/bin/${TARGET}-gcc" -c -fPIE \
+        -I"${TOOLCHAIN}/${TARGET}/include" \
+        "${ROOTDIR}/support/arm-fdpic-crtreloc.c" \
+        -o "${TOOLCHAIN}/${TARGET}/lib/crtreloc.o"
+    cd ../
+}
+
+build_libc() {
+    assert_supported_libc
+
+    case "${LIBC_IMPL}" in
+    uclibc-ng)
+        build_uclibc_ng
+        ;;
+    musl)
+        build_musl
+        ;;
+    esac
+}
+
+refresh_musl_busybox_export_map() {
+    MAP_TMP=${STATE_DIR}/musl-busybox-exports.map.new
+
+    [ "${LIBC_IMPL}" = "musl" ] || return 0
+    [ "${MUSL_BUSYBOX_ONLY_EXPORT_MAP}" = "1" ] || return 0
+    [ -x "${ROOTDIR}/scripts/generate-musl-export-map.sh" ] || return 0
+    [ -f "${ROOTFS}/bin/busybox" ] || return 0
+
+    "${ROOTDIR}/scripts/generate-musl-export-map.sh" \
+        "${ROOTFS}/bin/busybox" \
+        "${TOOLCHAIN}/${TARGET}/lib/libc.so" \
+        "${MAP_TMP}"
+
+    if [ -f "${MUSL_BUSYBOX_EXPORT_MAP_PATH}" ] && \
+       cmp -s "${MAP_TMP}" "${MUSL_BUSYBOX_EXPORT_MAP_PATH}"; then
+        rm -f "${MAP_TMP}"
+        return 0
+    fi
+
+    mv "${MAP_TMP}" "${MUSL_BUSYBOX_EXPORT_MAP_PATH}"
+    MUSL_BUSYBOX_EXPORT_MAP_UPDATED=1
+}
+
 build_busybox() {
     echo "BUILD: building busybox-${BUSYBOX_VERSION}"
     fetch_file "${BUSYBOX_URL}" "${CHECKSUM_busybox}"
@@ -470,13 +882,32 @@ build_busybox() {
     extract_source "busybox-${BUSYBOX_VERSION}.tar.bz2" "busybox-${BUSYBOX_VERSION}" -xjf
     cp configs/busybox-${BUSYBOX_VERSION}.config busybox-${BUSYBOX_VERSION}/.config
     cd busybox-${BUSYBOX_VERSION}
+    if [ "${LIBC_IMPL}" = "musl" ]; then
+        apply_patch_once ../patches/0032-busybox-only-disable-float-printf.patch
+    fi
 
     sed -i 's/# CONFIG_NOMMU is not set/CONFIG_NOMMU=y/' .config
     sed -i 's/# CONFIG_PIE is not set/CONFIG_PIE=y/' .config
-    sed -i "s|CONFIG_EXTRA_CFLAGS=\"\"|CONFIG_EXTRA_CFLAGS=\"--sysroot=${TOOLCHAIN}/${TARGET} -mthumb -march=armv7e-m -ffunction-sections -fdata-sections -fipa-icf -Os\"|" .config
+    case "${LIBC_IMPL}" in
+    uclibc-ng)
+        BUSYBOX_EXTRA_CFLAGS="--sysroot=${TOOLCHAIN}/${TARGET} -mthumb -march=armv7e-m -ffunction-sections -fdata-sections -fipa-icf -Os"
+        BUSYBOX_EXTRA_LDFLAGS="-Wl,--gc-sections"
+        BUSYBOX_EXTRA_LDLIBS=""
+        ;;
+    musl)
+        BUSYBOX_EXTRA_CFLAGS="--sysroot=${TOOLCHAIN}/${TARGET} -isystem ${TOOLCHAIN}/${TARGET}/include -mthumb -march=armv7e-m -ffunction-sections -fdata-sections -fipa-icf -Os"
+        if [ "${BUSYBOX_ONLY_NO_PRINTF_FLOAT}" = "1" ]; then
+            BUSYBOX_EXTRA_CFLAGS="${BUSYBOX_EXTRA_CFLAGS} -DBUSYBOX_ONLY_NO_PRINTF_FLOAT=1"
+        fi
+        BUSYBOX_EXTRA_LDFLAGS="-Wl,--gc-sections -Wl,-dynamic-linker,/lib/ld-musl-arm-fdpic.so.1 -Wl,-rpath-link,${TOOLCHAIN}/${TARGET}/lib -L${TOOLCHAIN}/${TARGET}/lib -B${TOOLCHAIN}/${TARGET}/lib"
+        BUSYBOX_EXTRA_LDLIBS=""
+        ;;
+    esac
+    sed -i "s|CONFIG_EXTRA_CFLAGS=\"\"|CONFIG_EXTRA_CFLAGS=\"${BUSYBOX_EXTRA_CFLAGS}\"|" .config
     # With FDPIC PIE userspace, gc-sections strips dead ELF sections before
     # the final link while preserving shared-library dynamic linking.
-    sed -i 's/CONFIG_EXTRA_LDFLAGS=""/CONFIG_EXTRA_LDFLAGS="-Wl,--gc-sections"/' .config
+    sed -i "s|CONFIG_EXTRA_LDFLAGS=\"\"|CONFIG_EXTRA_LDFLAGS=\"${BUSYBOX_EXTRA_LDFLAGS}\"|" .config
+    sed -i "s|CONFIG_EXTRA_LDLIBS=\"\"|CONFIG_EXTRA_LDLIBS=\"${BUSYBOX_EXTRA_LDLIBS}\"|" .config
 
     # Reinstall into a clean rootfs so disabled applets do not leave stale links.
     rm -rf "${ROOTFS}"
@@ -484,6 +915,25 @@ build_busybox() {
     run_logged "oldconfig" make oldconfig
     run_logged "build and install" make -j${MAKE_JOBS} CROSS_COMPILE=${TARGET}- CONFIG_PREFIX=${ROOTFS} install SKIP_STRIP=y
     cd ../
+
+    MUSL_BUSYBOX_EXPORT_MAP_UPDATED=0
+    refresh_musl_busybox_export_map
+    if [ "${MUSL_BUSYBOX_EXPORT_MAP_UPDATED}" = "1" ]; then
+        MUSL_BUSYBOX_EXPORT_MAP_PASS=${MUSL_BUSYBOX_EXPORT_MAP_PASS:-0}
+        MUSL_BUSYBOX_EXPORT_MAP_PASS=$((MUSL_BUSYBOX_EXPORT_MAP_PASS + 1))
+        if [ "${MUSL_BUSYBOX_EXPORT_MAP_PASS}" -gt "${MUSL_BUSYBOX_EXPORT_MAP_MAX_PASSES}" ]; then
+            echo "ERROR: musl BusyBox export map did not converge after ${MUSL_BUSYBOX_EXPORT_MAP_MAX_PASSES} passes" >&2
+            exit 1
+        fi
+
+        echo "BUILD: musl export map refreshed from BusyBox (pass ${MUSL_BUSYBOX_EXPORT_MAP_PASS})"
+        refresh_build_fingerprints
+        rm -rf "musl-${MUSL_VERSION}" "busybox-${BUSYBOX_VERSION}" "${ROOTFS}"
+        build_musl
+        build_busybox
+        mark_stage_complete libc
+        return 0
+    fi
 }
 
 copy_runtime_src() {
@@ -504,8 +954,13 @@ copy_runtime_src() {
 
     rel=${SRC#${TOOLCHAIN}/${TARGET}/}
     dst_dir=${ROOTFS}/$(dirname "${rel}")
+    dst=${dst_dir}/$(basename "${SRC}")
     mkdir -p "${dst_dir}"
     cp -a "${SRC}" "${dst_dir}/"
+
+    if [ ! -L "${dst}" ] && [ -x "${TOOLCHAIN}/bin/${TARGET}-strip" ]; then
+        "${TOOLCHAIN}/bin/${TARGET}-strip" --strip-unneeded "${dst}" >/dev/null 2>&1 || true
+    fi
 
     if [ -L "${SRC}" ]; then
         TARGET_NAME=$(readlink "${SRC}")
@@ -536,7 +991,7 @@ copy_runtime_entry() {
     NAME=$1
     for libdir in "${TOOLCHAIN}/${TARGET}/lib" "${TOOLCHAIN}/${TARGET}/usr/lib"; do
         SRC=${libdir}/${NAME}
-        [ -e "${SRC}" ] || continue
+        [ -e "${SRC}" ] || [ -L "${SRC}" ] || continue
         copy_runtime_src "${SRC}"
         return 0
     done
@@ -2307,6 +2762,7 @@ if [ "${1:-}" = "clean" ]; then
     rm -rf gcc-${GCC_VERSION}
     rm -rf linux-${LINUX_VERSION}
     rm -rf uClibc-ng-${UCLIBC_NG_VERSION}
+    rm -rf musl-${MUSL_VERSION}
     rm -rf busybox-${BUSYBOX_VERSION}
     rm -rf bootwrapper
     rm -rf "${TOOLCHAIN}"
@@ -2316,7 +2772,7 @@ if [ "${1:-}" = "clean" ]; then
     exit 0
 fi
 
-DEFAULT_STAGES="binutils gcc linux_headers uClibc busybox finalize_rootfs linux bootwrapper"
+DEFAULT_STAGES="binutils gcc linux_headers libc busybox finalize_rootfs linux bootwrapper"
 ALL_STAGES="${DEFAULT_STAGES} kernel_pgo_cycle kernel_syscall_prune_cycle kernel_lto_sweep"
 
 if [ "$#" = 0 ]; then
@@ -2325,7 +2781,10 @@ else
     STAGES=""
     for arg in "$@"; do
         case "${arg}" in
-        binutils | gcc | linux_headers | uClibc | busybox | finalize_rootfs | linux | bootwrapper | kernel_pgo_cycle | kernel_syscall_prune_cycle | kernel_lto_sweep)
+        uClibc)
+            STAGES="${STAGES} libc"
+            ;;
+        binutils | gcc | linux_headers | libc | busybox | finalize_rootfs | linux | bootwrapper | kernel_pgo_cycle | kernel_syscall_prune_cycle | kernel_lto_sweep)
             STAGES="${STAGES} ${arg}"
             ;;
         *)
@@ -2334,10 +2793,18 @@ else
             echo ""
             echo "default stages: ${DEFAULT_STAGES}"
             echo "all stages: ${ALL_STAGES}"
+            echo "default libc: ${LIBC_IMPL}"
+            echo "experimental musl default gate: EXPERIMENTAL_MUSL_DEFAULT=1"
             exit 1
             ;;
         esac
     done
+fi
+
+if [ "${EXPERIMENTAL_MUSL_DEFAULT}" = "1" ] && [ "${LIBC_IMPL_EXPLICIT}" = "0" ]; then
+    echo "BUILD: selected libc ${LIBC_IMPL} via EXPERIMENTAL_MUSL_DEFAULT=1"
+else
+    echo "BUILD: selected libc ${LIBC_IMPL}"
 fi
 
 for stage in ${STAGES}; do
@@ -2356,6 +2823,7 @@ for stage in ${STAGES}; do
     # does not leave the working directory inside a source tree.
     BUILD_FUNC=build_${stage}
     ( "${BUILD_FUNC}" )
+    refresh_build_fingerprints
     mark_stage_complete "${stage}"
 done
 

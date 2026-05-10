@@ -1,0 +1,89 @@
+diff -uNr musl-patch-old/ldso/dlstart.c musl-patch-new/ldso/dlstart.c
+--- musl-patch-old/ldso/dlstart.c
++++ musl-patch-new/ldso/dlstart.c
+@@ -35,11 +35,12 @@
+ 
+ #if DL_FDPIC
+ 	struct fdpic_loadseg *segs, fakeseg;
+-	size_t j;
++	size_t j, nsegs;
+ 	if (dynv) {
+ 		/* crt_arch.h entry point asm is responsible for reserving
+ 		 * space and moving the extra fdpic arguments to the stack
+ 		 * vector where they are easily accessible from C. */
+ 		segs = ((struct fdpic_loadmap *)(sp[-1] ? sp[-1] : sp[-2]))->segs;
++		nsegs = ((struct fdpic_loadmap *)(sp[-1] ? sp[-1] : sp[-2]))->nsegs;
+ 	} else {
+ 		/* If dynv is null, the entry point was started from loader
+@@ -50,6 +51,7 @@
+ 		base = aux[AT_BASE];
+ 		if (!base) base = aux[AT_PHDR] & -4096;
+ 		segs = &fakeseg;
++		nsegs = 1;
+ 		segs[0].addr = base;
+ 		segs[0].p_vaddr = 0;
+ 		segs[0].p_memsz = -1;
+@@ -78,6 +80,35 @@
+ 
+ 	const Sym *syms = (void *)dyn[DT_SYMTAB];
+ 
++	rel = (void *)dyn[DT_REL];
++	rel_size = dyn[DT_RELSZ];
++	for (; rel_size; rel+=2, rel_size-=2*sizeof(size_t)) {
++		if (!IS_RELATIVE(rel[1], syms)) continue;
++		for (j=0; j<nsegs && rel[0]-segs[j].p_vaddr >= segs[j].p_memsz; j++);
++		if (j == nsegs) __builtin_trap();
++		size_t *rel_addr = (void *)
++			(rel[0] + segs[j].addr - segs[j].p_vaddr);
++		size_t sym_val = syms[R_SYM(rel[1])].st_value;
++		if (R_SYM(rel[1])) {
++			for (j=0; j<nsegs && sym_val-segs[j].p_vaddr >= segs[j].p_memsz; j++);
++			if (j == nsegs) __builtin_trap();
++			sym_val += segs[j].addr - segs[j].p_vaddr;
++		}
++		if (R_TYPE(rel[1]) == REL_RELATIVE) {
++			size_t val = *rel_addr;
++			for (j=0; j<nsegs && val-segs[j].p_vaddr >= segs[j].p_memsz; j++);
++			if (j == nsegs) __builtin_trap();
++			*rel_addr = val + segs[j].addr - segs[j].p_vaddr;
++		} else if (R_TYPE(rel[1]) == REL_FUNCDESC_VAL) {
++			if ((syms[R_SYM(rel[1])].st_info & 0xf) == STT_SECTION)
++				*rel_addr += sym_val;
++			else
++				*rel_addr = sym_val;
++			rel_addr[1] = dyn[DT_PLTGOT];
++		} else {
++			*rel_addr += sym_val;
++		}
++	}
+ 	rel = (void *)dyn[DT_RELA];
+ 	rel_size = dyn[DT_RELASZ];
+ 	for (; rel_size; rel+=3, rel_size-=3*sizeof(size_t)) {
+@@ -85,14 +116,21 @@
+ 		for (j=0; rel[0]-segs[j].p_vaddr >= segs[j].p_memsz; j++);
+ 		size_t *rel_addr = (void *)
+ 			(rel[0] + segs[j].addr - segs[j].p_vaddr);
++		size_t sym_val = syms[R_SYM(rel[1])].st_value;
++		if (R_SYM(rel[1])) {
++			for (j=0; j<nsegs && sym_val-segs[j].p_vaddr >= segs[j].p_memsz; j++);
++			if (j == nsegs) __builtin_trap();
++			sym_val += segs[j].addr - segs[j].p_vaddr;
++		}
+ 		if (R_TYPE(rel[1]) == REL_FUNCDESC_VAL) {
+-			*rel_addr += segs[rel_addr[1]].addr
+-				- segs[rel_addr[1]].p_vaddr
+-				+ syms[R_SYM(rel[1])].st_value;
++			*rel_addr += sym_val;
+ 			rel_addr[1] = dyn[DT_PLTGOT];
++		} else if (R_TYPE(rel[1]) == REL_RELATIVE) {
++			size_t val = rel[2];
++			for (j=0; j<nsegs && val-segs[j].p_vaddr >= segs[j].p_memsz; j++);
++			if (j == nsegs) __builtin_trap();
++			*rel_addr = val + segs[j].addr - segs[j].p_vaddr;
+ 		} else {
+-			size_t val = syms[R_SYM(rel[1])].st_value;
+-			for (j=0; val-segs[j].p_vaddr >= segs[j].p_memsz; j++);
+-			*rel_addr = rel[2] + segs[j].addr - segs[j].p_vaddr + val;
++			*rel_addr = rel[2] + sym_val;
+ 		}
+ 	}

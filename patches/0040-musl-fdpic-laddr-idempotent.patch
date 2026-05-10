@@ -1,0 +1,21 @@
+diff -uNr musl-patch-old/ldso/dynlink.c musl-patch-new/ldso/dynlink.c
+--- musl-patch-old/ldso/dynlink.c
++++ musl-patch-new/ldso/dynlink.c
+@@ -205,8 +205,17 @@
+ static void *laddr(const struct dso *p, size_t v)
+ {
+ 	size_t j=0;
+ 	if (!p->loadmap) return p->base + v;
++	/* Idempotence: if v lies within a segment's runtime range, treat
++	 * it as already translated and pass through. This avoids double
++	 * translation of function pointers that R_ARM_RELATIVE has already
++	 * resolved to runtime addresses (e.g., init_array slots). */
++	for (j=0; j < p->loadmap->nsegs; j++) {
++		size_t a = p->loadmap->segs[j].addr;
++		if (v >= a && v < a + p->loadmap->segs[j].p_memsz)
++			return (void *)v;
++	}
+ 	for (j=0; !fdpic_loadseg_contains_vaddr(&p->loadmap->segs[j], v,
+ 		j+1 == p->loadmap->nsegs); j++);
+ 	return (void *)(v - p->loadmap->segs[j].p_vaddr + p->loadmap->segs[j].addr);
+ }

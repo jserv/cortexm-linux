@@ -1,0 +1,98 @@
+diff -uNr musl-patch-old/arch/arm/pthread_arch.h musl-patch-new/arch/arm/pthread_arch.h
+--- musl-patch-old/arch/arm/pthread_arch.h	2026-05-10 03:00:12.907347137 +0800
++++ musl-patch-new/arch/arm/pthread_arch.h	2026-05-10 03:00:12.907821595 +0800
+@@ -1,5 +1,5 @@
+-#if ((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
+- || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7
++#if !defined(__FDPIC__) && (((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
++ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7)
+ 
+ static inline uintptr_t __get_tp()
+ {
+diff -uNr musl-patch-old/src/ldso/arm/tlsdesc.S musl-patch-new/src/ldso/arm/tlsdesc.S
+--- musl-patch-old/src/ldso/arm/tlsdesc.S	2026-05-10 03:00:12.907595304 +0800
++++ musl-patch-new/src/ldso/arm/tlsdesc.S	2026-05-10 03:00:12.908054428 +0800
+@@ -13,7 +13,7 @@
+ 	ldr r2,[r1,#4]  // r2 = offset
+ 	ldr r1,[r1]     // r1 = modid
+ 
+-#if ((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
+- || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7
++#if !defined(__FDPIC__) && (((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
++ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7)
+ 	mrc p15,0,r0,c13,c0,3
+ #else
+@@ -39,8 +39,8 @@
+ 	pop {r2,r3,ip,lr}
+ 	bx lr
+ #endif
+ 
+-#if ((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
+- || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7
++#if !defined(__FDPIC__) && (((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
++ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7)
+ #else
+ 	.align 2
+diff -uNr musl-patch-old/src/thread/arm/__set_thread_area.c musl-patch-new/src/thread/arm/__set_thread_area.c
+--- musl-patch-old/src/thread/arm/__set_thread_area.c	2026-05-10 03:00:12.907595304 +0800
++++ musl-patch-new/src/thread/arm/__set_thread_area.c	2026-05-10 03:00:12.908054428 +0800
+@@ -7,7 +7,7 @@
+ extern hidden const unsigned char
+ 	__a_barrier_oldkuser[], __a_barrier_v6[], __a_barrier_v7[],
+ 	__a_cas_v6[], __a_cas_v7[],
+-	__a_gettp_cp15[];
++	__a_gettp_cp15[], __a_gettp_soft[];
+ 
+ #define __a_barrier_kuser 0xffff0fa0
+ #define __a_barrier_oldkuser (uintptr_t)__a_barrier_oldkuser
+@@ -18,10 +18,18 @@
+ #define __a_cas_v7 (uintptr_t)__a_cas_v7
+ 
+ #define __a_gettp_kuser 0xffff0fe0
++#define __a_gettp_soft (uintptr_t)__a_gettp_soft
+ #define __a_gettp_cp15 (uintptr_t)__a_gettp_cp15
+ 
+ extern hidden uintptr_t __a_barrier_ptr, __a_cas_ptr, __a_gettp_ptr;
+ 
+ int __set_thread_area(void *p)
+ {
++#if __FDPIC__
++	__a_barrier_ptr = __a_barrier_v7;
++	__a_cas_ptr = __a_cas_v7;
++	__a_gettp_ptr = __a_gettp_soft;
++	return __syscall(0xf0005, p);
++#endif
++
+ #if !__ARM_ARCH_7A__ && !__ARM_ARCH_7R__ && __ARM_ARCH < 7
+ 	if (__hwcap & HWCAP_TLS) {
+ 		size_t *aux;
+diff -uNr musl-patch-old/src/thread/arm/atomics.s musl-patch-new/src/thread/arm/atomics.s
+--- musl-patch-old/src/thread/arm/atomics.s	2026-05-10 03:00:12.907595304 +0800
++++ musl-patch-new/src/thread/arm/atomics.s	2026-05-10 03:00:12.908054428 +0800
+@@ -81,6 +81,17 @@
+ 	mrc p15,0,r0,c13,c0,3
+ 	bx lr
+ 
++.global __a_gettp_soft
++.hidden __a_gettp_soft
++.type __a_gettp_soft,%function
++__a_gettp_soft:
++	push {r7}
++	mov r7, #0x0f0000
++	orr r7, r7, #6
++	svc #0
++	pop {r7}
++	bx lr
++
+ /* Tag this file with minimum ISA level so as not to affect linking. */
+ .object_arch armv4t
+ .eabi_attribute 6,2
+@@ -103,4 +116,8 @@
+ .global __a_gettp_ptr
+ .hidden __a_gettp_ptr
+ __a_gettp_ptr:
++#if __FDPIC__
++	.word __a_gettp_soft
++#else
+ 	.word __a_gettp_cp15
++#endif

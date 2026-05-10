@@ -1,0 +1,130 @@
+diff -ruN orig/src/ldso/__dlsym.c new/src/ldso/__dlsym.c
+--- a/src/ldso/__dlsym.c	2026-05-10 00:25:35.797548649 +0800
++++ b/src/ldso/__dlsym.c	2026-05-10 00:25:35.802624237 +0800
+@@ -1,11 +1,21 @@
+ #include <dlfcn.h>
+ #include "dynlink.h"
+ 
++#ifdef MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL
++static void *stub_dlsym(void *restrict p, const char *restrict s, void *restrict ra)
++{
++	(void)p;
++	(void)s;
++	(void)ra;
++	return 0;
++}
++#else
+ static void *stub_dlsym(void *restrict p, const char *restrict s, void *restrict ra)
+ {
+ 	__dl_seterr("Symbol not found: %s", s);
+ 	return 0;
+ }
++#endif
+ 
+ weak_alias(stub_dlsym, __dlsym);
+ 
+diff -ruN orig/src/ldso/dlclose.c new/src/ldso/dlclose.c
+--- a/src/ldso/dlclose.c	2026-05-10 00:25:35.806932517 +0800
++++ b/src/ldso/dlclose.c	2026-05-10 00:25:35.810635524 +0800
+@@ -1,7 +1,15 @@
+ #include <dlfcn.h>
+ #include "dynlink.h"
+ 
++#ifdef MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL
++int dlclose(void *p)
++{
++	(void)p;
++	return -1;
++}
++#else
+ int dlclose(void *p)
+ {
+ 	return __dl_invalid_handle(p);
+ }
++#endif
+diff -ruN orig/src/ldso/dlerror.c new/src/ldso/dlerror.c
+--- a/src/ldso/dlerror.c	2026-05-10 00:25:35.814381447 +0800
++++ b/src/ldso/dlerror.c	2026-05-10 00:25:35.817564637 +0800
+@@ -1,3 +1,4 @@
++#ifndef MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL
+ #include <dlfcn.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
+@@ -87,3 +88,30 @@
+ }
+ 
+ weak_alias(stub_invalid_handle, __dl_invalid_handle);
++#else
++#include <dlfcn.h>
++#include <stdarg.h>
++#include "dynlink.h"
++
++char *dlerror()
++{
++	return 0;
++}
++
++hidden void __dl_vseterr(const char *fmt, va_list ap)
++{
++	(void)fmt;
++	(void)ap;
++}
++
++hidden void __dl_seterr(const char *fmt, ...)
++{
++	(void)fmt;
++}
++
++hidden int __dl_invalid_handle(void *h)
++{
++	(void)h;
++	return 1;
++}
++#endif
+diff -ruN orig/src/ldso/dlinfo.c new/src/ldso/dlinfo.c
+--- a/src/ldso/dlinfo.c	2026-05-10 00:25:35.821284394 +0800
++++ b/src/ldso/dlinfo.c	2026-05-10 00:25:35.824962652 +0800
+@@ -1,3 +1,4 @@
++#ifndef MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL
+ #define _GNU_SOURCE
+ #include <dlfcn.h>
+ #include "dynlink.h"
+@@ -12,3 +13,15 @@
+ 	*(struct link_map **)res = dso;
+ 	return 0;
+ }
++#else
++#define _GNU_SOURCE
++#include <dlfcn.h>
++
++int dlinfo(void *dso, int req, void *res)
++{
++	(void)dso;
++	(void)req;
++	(void)res;
++	return -1;
++}
++#endif
+diff -ruN orig/src/ldso/dlopen.c new/src/ldso/dlopen.c
+--- a/src/ldso/dlopen.c	2026-05-10 00:25:35.828244756 +0800
++++ b/src/ldso/dlopen.c	2026-05-10 00:25:35.831609857 +0800
+@@ -1,10 +1,19 @@
+ #include <dlfcn.h>
+ #include "dynlink.h"
+ 
++#ifdef MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL
++static void *stub_dlopen(const char *file, int mode)
++{
++	(void)file;
++	(void)mode;
++	return 0;
++}
++#else
+ static void *stub_dlopen(const char *file, int mode)
+ {
+ 	__dl_seterr("Dynamic loading not supported");
+ 	return 0;
+ }
++#endif
+ 
+ weak_alias(stub_dlopen, dlopen);

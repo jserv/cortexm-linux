@@ -1,0 +1,128 @@
+diff -uNr musl-patch-old/src/internal/dynlink.h musl-patch-new/src/internal/dynlink.h
+--- musl-patch-old/src/internal/dynlink.h
++++ musl-patch-new/src/internal/dynlink.h
+@@ -94,7 +94,7 @@
+ #define DT_DEBUG_INDIRECT_REL 0
+ #endif
+ 
+-#define AUX_CNT 32
++#define AUX_CNT 45
+ #define DYN_CNT 37
+ 
+ typedef void (*stage2_func)(unsigned char *, size_t *);
+diff -uNr musl-patch-old/arch/arm/reloc.h musl-patch-new/arch/arm/reloc.h
+--- musl-patch-old/arch/arm/reloc.h
++++ musl-patch-new/arch/arm/reloc.h
+@@ -43,4 +43,12 @@
+ #define REL_FUNCDESC    R_ARM_FUNCDESC
+ #define REL_FUNCDESC_VAL R_ARM_FUNCDESC_VALUE
+ #define DL_FDPIC 1
++#ifndef DL_FDPIC_STRICT_XIP
++/* This Cortex-M FDPIC target is always XIP-oriented, so keep strict
++ * DT_TEXTREL rejection enabled by default. Must remain a preprocessor
++ * constant so FDPIC/XIP policy can be consumed from both runtime code
++ * and preprocessor gates. */
++#define DL_FDPIC_STRICT_XIP 1
++#endif
++
+ #define DL_NOMMU_SUPPORT 1
+diff -uNr musl-patch-old/ldso/dynlink.c musl-patch-new/ldso/dynlink.c
+--- musl-patch-old/ldso/dynlink.c
++++ musl-patch-new/ldso/dynlink.c
+@@ -197,26 +197,45 @@
+ 
+ /* Compute load address for a virtual address in a given dso. */
+ #if DL_FDPIC
++static int fdpic_loadseg_contains_vaddr(const struct fdpic_loadseg *seg,
++	size_t v, int last)
++{
++	size_t off;
++
++	if (v < seg->p_vaddr) return 0;
++	off = v - seg->p_vaddr;
++	return off < seg->p_memsz || (last && off == seg->p_memsz);
++}
++
++static int fdpic_loadseg_contains_page(const struct fdpic_loadseg *seg,
++	size_t v, size_t pgsz)
++{
++	size_t a = seg->p_vaddr & -pgsz;
++	size_t bias = seg->p_vaddr - a;
++	size_t span = seg->p_memsz;
++
++	if (v < a) return 0;
++	if (span > (size_t)-1 - bias) span = (size_t)-1;
++	else span += bias;
++	if (span > (size_t)-1 - (pgsz-1)) span = (size_t)-1;
++	else span = (span + pgsz-1) & -pgsz;
++	return v-a < span;
++}
++
+ static void *laddr(const struct dso *p, size_t v)
+ {
+ 	size_t j=0;
+ 	if (!p->loadmap) return p->base + v;
+-	for (j=0; v-p->loadmap->segs[j].p_vaddr >= p->loadmap->segs[j].p_memsz; j++);
++	for (j=0; !fdpic_loadseg_contains_vaddr(&p->loadmap->segs[j], v,
++		j+1 == p->loadmap->nsegs); j++);
+ 	return (void *)(v - p->loadmap->segs[j].p_vaddr + p->loadmap->segs[j].addr);
+ }
+ static void *laddr_pg(const struct dso *p, size_t v)
+ {
+ 	size_t j=0;
+ 	size_t pgsz = PAGE_SIZE;
+ 	if (!p->loadmap) return p->base + v;
+-	for (j=0; ; j++) {
+-		size_t a = p->loadmap->segs[j].p_vaddr;
+-		size_t b = a + p->loadmap->segs[j].p_memsz;
+-		a &= -pgsz;
+-		b += pgsz-1;
+-		b &= -pgsz;
+-		if (v-a<b-a) break;
+-	}
++	for (j=0; !fdpic_loadseg_contains_page(&p->loadmap->segs[j], v, pgsz); j++);
+ 	return (void *)(v - p->loadmap->segs[j].p_vaddr + p->loadmap->segs[j].addr);
+ }
+ static void (*fdbarrier(void *p))()
+@@ -875,11 +893,37 @@
+ 				goto error;
+ 		}
+ 	}
+-	for (i=0; ((size_t *)(base+dyn))[i]; i+=2)
++	for (i=0; ((size_t *)(base+dyn))[i]; i+=2)
+ 		if (((size_t *)(base+dyn))[i]==DT_TEXTREL) {
+-			if (mprotect(map, map_len, PROT_READ|PROT_WRITE|PROT_EXEC)
+-			    && errno != ENOSYS)
+-				goto error;
++			if (DL_FDPIC && dso->loadmap) {
++				size_t seg = 0;
++
++				if (DL_FDPIC_STRICT_XIP) {
++					errno = ENOTSUP;
++					goto error;
++				}
++				for (ph=ph0, i=eh->e_phnum; i; i--,
++					ph=(void *)((char *)ph+eh->e_phentsize)) {
++					size_t seg_start, seg_len, bias;
++
++					if (ph->p_type != PT_LOAD) continue;
++					if ((ph->p_flags & PF_X) && !(ph->p_flags & PF_W)) {
++						seg_start = dso->loadmap->segs[seg].addr & -PAGE_SIZE;
++						bias = dso->loadmap->segs[seg].addr - seg_start;
++						seg_len = bias + dso->loadmap->segs[seg].p_memsz;
++						if (seg_len > (size_t)-1 - (PAGE_SIZE-1))
++							seg_len = (size_t)-1;
++						else
++							seg_len = (seg_len + PAGE_SIZE-1) & -PAGE_SIZE;
++						if (mprotect((void *)seg_start, seg_len,
++							PROT_READ|PROT_WRITE|PROT_EXEC)
++						    && errno != ENOSYS)
++							goto error;
++					}
++					seg++;
++				}
++			} else if (mprotect(map, map_len, PROT_READ|PROT_WRITE|PROT_EXEC)
++				   && errno != ENOSYS) goto error;
+ 			break;
+ 		}
+ done_mapping:

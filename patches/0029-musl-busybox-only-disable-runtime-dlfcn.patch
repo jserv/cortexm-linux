@@ -1,0 +1,19 @@
+diff --git a/ldso/dynlink.c b/ldso/dynlink.c
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -2098,6 +2098,7 @@ static void prepare_lazy(struct dso *p)
+ 	}
+ }
+ 
++#ifndef MUSL_BUSYBOX_ONLY_NO_RUNTIME_DL
+ void *dlopen(const char *file, int mode)
+ {
+ 	struct dso *volatile p, *orig_tail, *orig_syms_tail, *orig_lazy_head, *next;
+@@ -2415,6 +2416,7 @@ int dl_iterate_phdr(int(*callback)(struct dl_phdr_info *info, size_t size, void
+ 	}
+ 	return ret;
+ }
++#endif
+ 
+ static void error_impl(const char *fmt, ...)
+ {
