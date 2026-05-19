@@ -39,7 +39,7 @@ The build runs in a fixed order, downloading sources automatically:
 | Step | Component | Version | Purpose |
 |------|-----------|---------|---------|
 | 1 | binutils | 2.46.0 | Assembler, linker (with Thumb-only patch) |
-| 2 | GCC | 15.2.0 | C-only cross-compiler, first-pass |
+| 2 | GCC | 16.1.0 | C-only cross-compiler, first-pass |
 | 3 | Linux headers | 7.0 | Kernel headers for C library build |
 | 4 | uClibc-ng | 1.0.57 | Shared FDPIC C library and dynamic loader for nommu targets |
 | 5 | BusyBox | 1.37.0 | Minimal userspace (shell, coreutils) |
